@@ -34,6 +34,8 @@ def get_config() -> ConfigDict:
     cfg.model.noise_dim = 0
     cfg.model.noise_scale = 1.0
     cfg.model.action_limit = 1.0
+    cfg.model.use_context_actions = True
+    cfg.model.particles = 8
 
     cfg.train = ConfigDict()
     cfg.train.epochs = 12
@@ -50,11 +52,20 @@ def get_config() -> ConfigDict:
     cfg.loss.bridge_weight = 0.03
     cfg.loss.jerk_weight = 0.0
     cfg.loss.phi_final = 1.4
+    cfg.loss.sinkhorn_weight = 1.0
+    cfg.loss.sinkhorn_epsilon = 0.05
+    cfg.loss.sinkhorn_iterations = 40
+    cfg.loss.sinkhorn_context_weight = 0.05
+    cfg.loss.sinkhorn_intermediate_weight = 1.0
+    cfg.loss.sinkhorn_endpoint_weight = 1.0
+    cfg.loss.mean_action_weight = 0.0
+    cfg.loss.diversity_weight = 0.0
 
     cfg.eval = ConfigDict()
     cfg.eval.rollout_episodes = 96
     cfg.eval.replan_every = 4
     cfg.eval.deterministic = True
+    cfg.eval.policy_sample = "mean"
     cfg.eval.plot_examples = 8
 
     return cfg

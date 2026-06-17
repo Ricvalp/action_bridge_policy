@@ -27,8 +27,11 @@ from .losses import (
     action_batch_metrics,
     action_jerk_loss,
     bridge_path_energy,
+    particle_diversity,
+    sinkhorn_bridge_energy,
+    sinkhorn_marginal_matching,
 )
-from .models import ChunkMLPPolicy, ResidualActionBridgePolicy
+from .models import ChunkMLPPolicy, ResidualActionBridgePolicy, SinkhornActionBridgePolicy
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "bridge_prev.py"
@@ -148,6 +151,7 @@ def make_model(cfg: config_dict.ConfigDict) -> torch.nn.Module:
         noise_dim=cfg.model.noise_dim,
         noise_scale=cfg.model.noise_scale,
         action_limit=cfg.model.action_limit,
+        use_context_actions=cfg.model.get("use_context_actions", True),
     )
     if cfg.model.type == "chunk":
         return ChunkMLPPolicy(**common)
@@ -158,6 +162,21 @@ def make_model(cfg: config_dict.ConfigDict) -> torch.nn.Module:
             init_type=cfg.model.init_type,
             init_noise_scale=cfg.model.init_noise_scale,
         )
+    if cfg.model.type == "sinkhorn_bridge":
+        return SinkhornActionBridgePolicy(
+            context=cfg.data.context,
+            horizon=cfg.data.horizon,
+            state_dim=cfg.model.state_dim,
+            action_dim=cfg.model.action_dim,
+            history_dim=cfg.model.history_dim,
+            hidden_dim=cfg.model.hidden_dim,
+            tau=cfg.model.tau,
+            init_type=cfg.model.init_type,
+            init_noise_scale=cfg.model.init_noise_scale,
+            particles=cfg.model.get("particles", 8),
+            action_limit=cfg.model.action_limit,
+            use_context_actions=cfg.model.get("use_context_actions", True),
+        )
     raise ValueError(f"Unknown model type: {cfg.model.type}")
 
 
@@ -165,6 +184,52 @@ def compute_loss(batch: dict[str, torch.Tensor], model: torch.nn.Module, cfg: co
     out = model(batch, deterministic=False)
     pred = out["actions"]
     target = batch["future_actions"]
+    if cfg.model.type == "sinkhorn_bridge":
+        mean_action_loss = F.mse_loss(pred, target)
+        endpoint_loss = F.mse_loss(pred[:, -1], target[:, -1])
+        first_loss = F.mse_loss(pred[:, 0], target[:, 0])
+        sinkhorn = sinkhorn_marginal_matching(
+            out["particles"],
+            target,
+            out["history"],
+            epsilon=cfg.loss.sinkhorn_epsilon,
+            iterations=cfg.loss.sinkhorn_iterations,
+            context_weight=cfg.loss.sinkhorn_context_weight,
+            intermediate_weight=cfg.loss.sinkhorn_intermediate_weight,
+            endpoint_weight=cfg.loss.sinkhorn_endpoint_weight,
+        )
+        bridge = sinkhorn_bridge_energy(
+            out["init_particles"],
+            out["particles"],
+            out["history"],
+            phi_final=cfg.loss.phi_final,
+            epsilon=cfg.loss.sinkhorn_epsilon,
+            iterations=cfg.loss.sinkhorn_iterations,
+            context_weight=cfg.loss.sinkhorn_context_weight,
+        )
+        jerk = action_jerk_loss(pred, batch["context_actions"])
+        diversity = particle_diversity(out["particles"])
+        total = (
+            cfg.loss.sinkhorn_weight * sinkhorn
+            + cfg.loss.bridge_weight * bridge
+            + cfg.loss.mean_action_weight * mean_action_loss
+            + cfg.loss.endpoint_weight * endpoint_loss
+            + cfg.loss.first_action_weight * first_loss
+            + cfg.loss.jerk_weight * jerk
+            - cfg.loss.diversity_weight * diversity
+        )
+        parts = {
+            "loss": total.detach(),
+            "sinkhorn": sinkhorn.detach(),
+            "action": mean_action_loss.detach(),
+            "endpoint": endpoint_loss.detach(),
+            "first": first_loss.detach(),
+            "bridge": bridge.detach(),
+            "jerk": jerk.detach(),
+            "diversity": diversity.detach(),
+        }
+        return total, parts
+
     action_loss = F.mse_loss(pred, target)
     endpoint_loss = F.mse_loss(pred[:, -1], target[:, -1])
     first_loss = F.mse_loss(pred[:, 0], target[:, 0])
@@ -207,7 +272,19 @@ def evaluate_actions(
             out["init_action"],
             batch["context_actions"],
         )
-        metrics["bridge_energy"] = bridge_path_energy(out["init_action"], out["actions"], cfg.loss.phi_final)
+        if "particles" in out:
+            metrics["bridge_energy"] = sinkhorn_bridge_energy(
+                out["init_particles"],
+                out["particles"],
+                out["history"],
+                phi_final=cfg.loss.phi_final,
+                epsilon=cfg.loss.sinkhorn_epsilon,
+                iterations=cfg.loss.sinkhorn_iterations,
+                context_weight=cfg.loss.sinkhorn_context_weight,
+            )
+            metrics["particle_diversity"] = particle_diversity(out["particles"])
+        else:
+            metrics["bridge_energy"] = bridge_path_energy(out["init_action"], out["actions"], cfg.loss.phi_final)
         metrics["network_evals"] = torch.tensor(float(model.network_evals), device=device)
         batch_size = batch["future_actions"].shape[0]
         total += batch_size
@@ -253,12 +330,16 @@ def predict_chunk(
     context_actions: np.ndarray,
     device: torch.device,
     deterministic: bool,
+    sample_strategy: str = "mean",
 ) -> np.ndarray:
     batch = {
         "context_states": torch.from_numpy(context_states[None]).to(device=device, dtype=torch.float32),
         "context_actions": torch.from_numpy(context_actions[None]).to(device=device, dtype=torch.float32),
     }
     out = model(batch, deterministic=deterministic)
+    if sample_strategy == "sample" and "particles" in out:
+        particle_idx = torch.randint(out["particles"].shape[1], (1,), device=device).item()
+        return out["particles"][0, particle_idx].detach().cpu().numpy()
     return out["actions"][0].detach().cpu().numpy()
 
 
@@ -299,7 +380,14 @@ def rollout_policy(
 
         t = 0
         while t < max_steps:
-            chunk = predict_chunk(model, context_states, context_actions, device, cfg.eval.deterministic)
+            chunk = predict_chunk(
+                model,
+                context_states,
+                context_actions,
+                device,
+                cfg.eval.deterministic,
+                sample_strategy=cfg.eval.get("policy_sample", "mean"),
+            )
             steps = min(cfg.eval.replan_every, len(chunk), max_steps - t)
             for local_idx in range(steps):
                 raw_action = chunk[local_idx]

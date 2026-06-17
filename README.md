@@ -23,8 +23,12 @@ Here bridge time is execution time, so the intermediate outputs are the future a
 - `bridge_no_energy`: previous-action initialized residual action bridge with no path-energy term.
 - `bridge_prev`: previous-action initialized residual action bridge with path energy.
 - `bridge_gaussian`: Gaussian-initialized residual bridge with path energy.
+- `sinkhorn_bridge`: probabilistic particle bridge with Sinkhorn marginal matching.
+- `sinkhorn_bridge_state_only`: more ambiguous Sinkhorn ablation without action-history conditioning.
 
 `bridge_no_energy` is the most important sanity baseline: if `bridge_prev` does not beat it, the path/bridge objective is probably not adding much.
+
+The Sinkhorn variants are closer to the Contact Wasserstein Geodesic code: a cloud of source particles is pushed through a stack of residual maps, each block gives an action marginal, and Sinkhorn divergence matches generated marginals to expert action marginals.
 
 ## Quick Smoke Run
 
@@ -62,6 +66,19 @@ uv run python -m action_bridge.run_all \
   --horizon=16
 ```
 
+Run the probabilistic Sinkhorn bridge:
+
+```bash
+uv run python -m action_bridge.train \
+  --config=action_bridge/configs/sinkhorn_bridge.py \
+  --config.train.epochs=12 \
+  --config.data.num_trajectories=1000 \
+  --config.data.horizon=16 \
+  --config.train.batch_size=64 \
+  --config.model.particles=8 \
+  --config.device=cuda
+```
+
 Outputs are written to:
 
 ```text
@@ -85,5 +102,6 @@ Primary metrics:
 - `rollout_chunk_discontinuity`
 - `rollout_jerk`
 - `action_mse`
+- `particle_diversity` for probabilistic variants
 
 The idea is weak if `bridge_prev` only improves smoothness while hurting success, or if `bridge_no_energy` matches it.
