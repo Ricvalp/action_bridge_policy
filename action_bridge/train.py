@@ -497,12 +497,26 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
     best_score = float("inf")
     best_state = None
     best_epoch = -1
-    epoch_iter = tqdm(range(cfg.train.epochs), desc="epochs", dynamic_ncols=True)
+    use_batch_bar = cfg.model.type == "sinkhorn_bridge"
+    epoch_iter = range(cfg.train.epochs) if use_batch_bar else tqdm(
+        range(cfg.train.epochs),
+        desc="epochs",
+        dynamic_ncols=True,
+    )
     for epoch in epoch_iter:
         model.train()
         sums: dict[str, float] = {}
         count = 0
-        for batch in train_loader:
+        batch_iter = train_loader
+        if use_batch_bar:
+            batch_iter = tqdm(
+                train_loader,
+                desc=f"epoch {epoch + 1}/{cfg.train.epochs}",
+                dynamic_ncols=True,
+                leave=True,
+                mininterval=1.0,
+            )
+        for batch in batch_iter:
             batch = move_batch(batch, device)
             opt.zero_grad(set_to_none=True)
             loss, parts = compute_loss(batch, model, cfg)
@@ -512,6 +526,14 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
             count += 1
             for key, value in parts.items():
                 sums[key] = sums.get(key, 0.0) + float(value.item())
+            if use_batch_bar:
+                batch_iter.set_postfix(
+                    loss=f"{sums.get('loss', 0.0) / max(1, count):.4f}",
+                    sinkhorn=f"{sums.get('sinkhorn', 0.0) / max(1, count):.4f}",
+                    bridge=f"{sums.get('bridge', 0.0) / max(1, count):.4f}",
+                    div=f"{sums.get('diversity', 0.0) / max(1, count):.4f}",
+                    refresh=False,
+                )
 
         row = {key: value / max(1, count) for key, value in sums.items()}
         eval_metrics = evaluate_actions(model, test_loader, device, cfg)
@@ -524,12 +546,20 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
             best_score = score
             best_epoch = epoch
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-        epoch_iter.set_postfix(
-            loss=f"{row['loss']:.4f}",
-            action_mse=f"{eval_metrics['action_mse']:.4f}",
-            disc=f"{eval_metrics['action_chunk_discontinuity']:.4f}",
-            jerk=f"{eval_metrics['action_jerk']:.4f}",
-        )
+        if use_batch_bar:
+            tqdm.write(
+                f"epoch={epoch:03d} loss={row['loss']:.4f} "
+                f"action_mse={eval_metrics['action_mse']:.4f} "
+                f"disc={eval_metrics['action_chunk_discontinuity']:.4f} "
+                f"jerk={eval_metrics['action_jerk']:.4f}"
+            )
+        else:
+            epoch_iter.set_postfix(
+                loss=f"{row['loss']:.4f}",
+                action_mse=f"{eval_metrics['action_mse']:.4f}",
+                disc=f"{eval_metrics['action_chunk_discontinuity']:.4f}",
+                jerk=f"{eval_metrics['action_jerk']:.4f}",
+            )
 
     if best_state is not None:
         model.load_state_dict(best_state)
