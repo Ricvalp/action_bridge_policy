@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from .data import (
     ActionChunkDataset,
@@ -496,7 +497,8 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
     best_score = float("inf")
     best_state = None
     best_epoch = -1
-    for epoch in range(cfg.train.epochs):
+    epoch_iter = tqdm(range(cfg.train.epochs), desc="epochs", dynamic_ncols=True)
+    for epoch in epoch_iter:
         model.train()
         sums: dict[str, float] = {}
         count = 0
@@ -522,11 +524,11 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
             best_score = score
             best_epoch = epoch
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-        print(
-            f"epoch={epoch:03d} loss={row['loss']:.4f} "
-            f"action_mse={eval_metrics['action_mse']:.4f} "
-            f"disc={eval_metrics['action_chunk_discontinuity']:.4f} "
-            f"jerk={eval_metrics['action_jerk']:.4f}"
+        epoch_iter.set_postfix(
+            loss=f"{row['loss']:.4f}",
+            action_mse=f"{eval_metrics['action_mse']:.4f}",
+            disc=f"{eval_metrics['action_chunk_discontinuity']:.4f}",
+            jerk=f"{eval_metrics['action_jerk']:.4f}",
         )
 
     if best_state is not None:
