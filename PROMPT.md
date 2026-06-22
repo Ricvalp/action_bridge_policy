@@ -1,80 +1,84 @@
 # PROMPT: Action Bridge Policy Sandbox
 
-You are helping debug and extend a small research sandbox in:
+You are helping debug and extend the research sandbox in:
 
 ```text
 sandbox/action_bridge_policy/
 ```
 
-The project is part of a personal LLM research wiki. Follow the repository-level `AGENTS.md`: keep raw sources immutable, keep sandbox notes/code separate from polished wiki pages, avoid unrelated refactors, and preserve existing user changes.
+This is exploratory code inside a personal research wiki. Follow repository-level `AGENTS.md`: keep `raw/` immutable, keep sandbox code/notes separate from polished wiki pages, avoid unrelated refactors, preserve user changes, and prefer small readable edits.
 
 ## Research Context
 
-The broader research question is whether robot generative policies can avoid always sampling action chunks "from scratch" by pushing forward Gaussian noise.
+The motivating question is whether robot generative policies can avoid sampling each action chunk "from scratch" by pushing forward uninformed Gaussian noise.
 
-Diffusion and flow policies often generate a full action chunk by transporting Gaussian noise:
+Diffusion and standard flow policies often generate a full action chunk by transporting Gaussian noise:
 
 ```text
 epsilon ~ N(0, I)
-A = (a_t, ..., a_{t+H}) = T_theta(epsilon, h_t)
+A = (a_t, ..., a_{t+H-1}) = T_theta(epsilon, h_t)
 ```
 
 This works, but it has an awkward robotics interpretation:
 
-- the sampler starts from uninformed noise;
-- denoising/flow time is artificial sampler time;
+- sampler time is artificial denoising/flow time;
 - intermediate sampler states are not executed;
-- receding-horizon chunks can have discontinuities;
+- the sampler usually starts from uninformed noise;
+- receding-horizon chunks can be discontinuous with previously executed actions;
 - iterative sampling can add latency.
 
-The idea tested here is different:
+The core idea tested here is:
 
 ```text
 bridge time = robot execution time
 ```
 
-The bridge path itself is the executable action chunk:
+So the generated bridge path itself is the executable action chunk:
 
 ```text
-a_t -> a_{t+1} -> ... -> a_{t+H}
+a_t -> a_{t+1} -> ... -> a_{t+H-1}
 ```
 
-The main model is a residual execution-time action bridge:
+The current strongest version of the idea is **not** just a smooth residual policy. It is a probabilistic path model:
 
 ```text
-a_{k+1} = tanh(a_k + tau * v_theta(a_k, h_t, k))
+y_k = (a_k, z_k)
+a_k = executable action
+z_k = latent mode / intent memory
 ```
 
-where:
-
-- `h_t` is encoded recent state/action context;
-- `a_k` is the current generated action in the chunk;
-- `k` is the future execution step;
-- the outputs are actual future actions, not denoising intermediates.
-
-The strongest hypothesis is:
-
-> A state-conditional action bridge initialized from recent action/proprioceptive history can improve temporal coherence and receding-horizon behavior compared with Gaussian-to-chunk generation.
-
-The weak hypothesis is:
-
-> Add smoothness to an action predictor and call it a bridge.
-
-The code is designed to distinguish those by including sanity baselines.
+The latent variable lets multiple particles represent different futures from the same ambiguous state/history. The action coordinate is what gets supervised, plotted, and executed.
 
 ## Important Caveat
 
 This is **not canonical Push-T** yet.
 
-The original intended Experiment 1 was state-based Push-T. Since no local Push-T dataset/environment was available in the repository, this sandbox implements a cheap "Experiment 0.5" surrogate:
+The intended first real experiment was state-based Push-T, but no local Push-T dataset/environment was available when this sandbox was started. This code implements a cheap state-based surrogate:
 
 - a 2D point agent starts on the left;
 - a goal is on the right;
 - a circular obstacle sits in the center;
-- expert demonstrations go either above or below the obstacle;
-- the policy sees state/action history and predicts future action chunks.
+- expert demonstrations go above or below the obstacle;
+- the policy sees recent state/action history and predicts future action chunks.
 
-This is useful for debugging the action-bridge mechanics, metrics, and training loop. It does not answer whether the method works on real Push-T.
+This is useful for debugging the modeling idea, multimodality diagnostics, metrics, and training loop. It does not yet answer whether the method works on real Push-T.
+
+## Current Main Experiment
+
+The latest experiment is:
+
+```text
+latent_path_sinkhorn_delayed_modes.py
+```
+
+It tests multimodality in a delayed-branch dataset:
+
+- paired demonstrations share the same start and goal;
+- top and bottom trajectories execute the same first `K` horizontal approach actions;
+- at the fork, the state and previous actions are identical across the two modes;
+- only future actions reveal whether the agent goes above or below the obstacle.
+
+This matters because previous-action conditioning is useful for continuity, but in this dataset it does **not** leak the top/bottom mode before the branch. A good probabilistic model should sample both top and bottom futures from the same pre-fork context, while individual sampled chunks should remain coherent.
 
 ## Directory Layout
 
@@ -93,6 +97,9 @@ sandbox/action_bridge_policy/
     train.py
     run_all.py
     visualize_data.py
+    visualize_metric_geodesic.py
+    visualize_sb_action_distributions.py
+    visualize_sb_push_t_intuition.py
     configs/
       base.py
       regression.py
@@ -102,6 +109,7 @@ sandbox/action_bridge_policy/
       bridge_gaussian.py
       sinkhorn_bridge.py
       sinkhorn_bridge_state_only.py
+      latent_path_sinkhorn_delayed_modes.py
   data/       # generated, gitignored
   runs/       # generated, gitignored
   .venv/      # generated by uv, gitignored
@@ -111,31 +119,32 @@ sandbox/action_bridge_policy/
 
 Use `uv` from inside `sandbox/action_bridge_policy`.
 
-Creating the environment:
-
 ```bash
 cd sandbox/action_bridge_policy
 uv sync
 ```
 
-You can also just run a command with `uv run`; `uv` will create `.venv` if needed:
+You can also just run commands with `uv run`; `uv` creates `.venv` if needed:
 
 ```bash
 uv run python -m action_bridge.train --help
 ```
 
-On Linux x86_64, `pyproject.toml` points Torch to the CUDA 12.6 wheel index. To check GPU support:
+On Linux x86_64, `pyproject.toml` points Torch to the CUDA 12.6 wheel index. Check GPU support with:
 
 ```bash
-uv run python - <<'PY'
-import torch
-print(torch.__version__)
-print("cuda:", torch.cuda.is_available())
-print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no gpu")
-PY
+uv run python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no gpu')"
 ```
 
-If `.venv` was copied from another machine or has the wrong architecture/Torch build:
+If `uv` warns that `VIRTUAL_ENV` points to another project, it means your shell has another virtualenv activated. Usually this is harmless because `uv run` ignores it and uses this project environment. To be explicit:
+
+```bash
+deactivate  # if available
+cd sandbox/action_bridge_policy
+uv run python -m action_bridge.train --help
+```
+
+If `.venv` has the wrong architecture/Torch build:
 
 ```bash
 rm -rf .venv
@@ -144,9 +153,13 @@ uv sync
 
 ## Dataset
 
-The synthetic dataset is generated by `action_bridge/data.py`.
+Implemented in:
 
-Main class:
+```text
+action_bridge/data.py
+```
+
+Main config:
 
 ```python
 PointObstacleConfig
@@ -154,19 +167,77 @@ PointObstacleConfig
 
 Default geometry:
 
-- square world: `[0, 1] x [0, 1]`;
-- obstacle center: `(0.5, 0.5)`;
-- obstacle radius: `0.16`;
-- start: roughly `(0.12, 0.5)` with jitter;
-- goal: roughly `(0.88, 0.5)` with y-jitter;
-- state dimension: 4, `[x_agent, y_agent, x_goal, y_goal]`;
-- action dimension: 2, `[vx, vy]`.
+```text
+world:           [0, 1] x [0, 1]
+obstacle center: (0.5, 0.5)
+obstacle radius: 0.16
+start:           about (0.12, 0.5), with jitter
+goal:            about (0.88, 0.5), with y-jitter
+state dim:       4, [x_agent, y_agent, x_goal, y_goal]
+action dim:      2, [vx, vy]
+```
 
-Expert generation:
+There are two dataset regimes:
+
+### Immediate-Branch Dataset
+
+This is the original toy dataset:
 
 - top mode uses waypoints above the obstacle;
 - bottom mode uses waypoints below the obstacle;
-- `paired_modes=True` generates paired top/bottom demonstrations from similar starts/goals.
+- action history usually reveals the mode quickly.
+
+Default file pattern:
+
+```text
+data/point_modes_n{num_trajectories}_t{trajectory_length}_s{seed}.npz
+```
+
+### Delayed-Branch Dataset
+
+This is the current multimodality test:
+
+```text
+data.shared_prefix_steps > 0
+```
+
+For the first `shared_prefix_steps`, both modes use:
+
+```python
+shared_prefix_action(state, cfg)
+```
+
+This action moves horizontally toward:
+
+```text
+x = data.shared_prefix_target_x
+```
+
+without adding mode-specific vertical motion. After the prefix, the normal top/bottom waypoint expert takes over.
+
+Default file pattern:
+
+```text
+data/point_modes_prefix{shared_prefix_steps}_n{num_trajectories}_t{trajectory_length}_s{seed}.npz
+```
+
+For the current debug config:
+
+```text
+data/point_modes_prefix6_n128_t36_s7.npz
+```
+
+For the full default latent path-Sinkhorn config:
+
+```text
+data/point_modes_prefix6_n1000_t72_s7.npz
+```
+
+Set this if generation logic changes or you want to force replacement:
+
+```bash
+--config.data.force_regenerate=True
+```
 
 Saved arrays in `.npz`:
 
@@ -177,10 +248,14 @@ contacts: (num_trajectories, trajectory_length, 2)
 modes:    (num_trajectories,)
 ```
 
-`contacts[..., 0]` is wall contact.
-`contacts[..., 1]` is obstacle contact/crossing.
+Contact channels:
 
-Training examples are sliding chunks from full trajectories:
+```text
+contacts[..., 0] = wall contact
+contacts[..., 1] = obstacle contact/crossing
+```
+
+Training examples are sliding chunks:
 
 ```text
 context_states:  (context, 4)
@@ -189,26 +264,29 @@ future_actions:  (horizon, 2)
 future_states:   (horizon, 4)
 future_contacts: (horizon, 2)
 mode:            scalar, +1 top / -1 bottom
+traj_id:         trajectory id
+time_index:      chunk start index
 ```
-
-The dataset file path is usually:
-
-```text
-data/point_modes_n{num_trajectories}_t{trajectory_length}_s{seed}.npz
-```
-
-Set `--config.data.force_regenerate=True` if you change generation logic and want to rebuild an existing dataset.
 
 ## Visualizing Dataset Trajectories
 
-Use:
+Dataset visualization code exists:
+
+```text
+action_bridge/visualize_data.py
+```
+
+Run:
 
 ```bash
+cd sandbox/action_bridge_policy
+
 uv run python -m action_bridge.visualize_data \
-  --dataset=data/point_modes_n256_t48_s7.npz \
-  --split=all \
+  --dataset=data/point_modes_prefix6_n128_t36_s7.npz \
+  --out_dir=runs/dataset_viz \
   --max_trajectories=96 \
-  --grid_examples=12
+  --grid_examples=12 \
+  --split=all
 ```
 
 Outputs:
@@ -226,9 +304,23 @@ Plot semantics:
 - small left dots: starts;
 - green stars: goals.
 
+For the delayed-prefix dataset, the early blue/orange segments should overlap horizontally before splitting.
+
+There is also a VS Code debug config:
+
+```text
+Visualize Delayed Action Bridge Dataset
+```
+
+It assumes the delayed debug dataset exists. Running the delayed training debug config first will generate it.
+
 ## Models
 
-Implemented in `action_bridge/models.py`.
+Implemented in:
+
+```text
+action_bridge/models.py
+```
 
 ### `ActionContextEncoder`
 
@@ -239,16 +331,24 @@ context_states  -> (B, context * state_dim)
 context_actions -> (B, context * action_dim)
 ```
 
-Concatenates them and maps to a history vector `h_t` via an MLP.
+Concatenates them and maps to a history vector:
+
+```text
+h_t: (B, history_dim)
+```
+
+If `use_context_actions=False`, action history is zeroed before encoding.
 
 ### `ChunkMLPPolicy`
 
-One-shot chunk predictor.
+One-shot action chunk predictor.
 
-Used for:
+Used by:
 
-- `regression.py`: deterministic chunk regression;
-- `gaussian_chunk.py`: same model with extra Gaussian noise input.
+```text
+regression.py
+gaussian_chunk.py
+```
 
 Output:
 
@@ -267,47 +367,39 @@ a_0 = previous action, zero, or Gaussian sample
 a_{k+1} = tanh(a_k + tau * f_theta(a_k, h_t, noise, k))
 ```
 
-The model has one MLP block per future action step.
-
 Important fields:
 
-- `init_type`: `"prev_action"`, `"gaussian"`, or `"zero"`;
-- `tau`: residual step size;
-- `noise_dim`: optional latent noise dimension;
-- `action_limit`: action range after `tanh`.
+```text
+init_type:        "prev_action", "gaussian", or "zero"
+tau:              residual step size
+noise_dim:        optional noise dimension
+action_limit:     action range after tanh
+network_evals:    horizon
+```
 
-The model property `network_evals` is:
-
-- `1` for chunk MLP;
-- `horizon` for residual bridge.
-
-This is a rough compute proxy.
+This is a deterministic or weakly stochastic residual chunk generator, not the main probabilistic SB experiment.
 
 ### `SinkhornActionBridgePolicy`
 
-This is the probabilistic CWG-style variant.
+Probabilistic action-space particle bridge.
 
-It samples a cloud of source action particles:
+Initial particles:
 
 ```text
 z_0^{(j)} ~ source distribution
 ```
 
-For `init_type="prev_action"`, the source distribution is centered on the previous action:
+For `init_type="prev_action"`:
 
 ```text
 z_0^{(j)} = a_{t-1} + sigma * epsilon_j
 ```
 
-For `init_type="gaussian"`, it starts from Gaussian action particles.
-
-Then each residual block pushes the particle cloud forward:
+Each residual block pushes action particles forward:
 
 ```text
 z_{k+1}^{(j)} = tanh(z_k^{(j)} + tau * f_k(z_k^{(j)}, h_t))
 ```
-
-where each block `f_k` is a separate MLP, similar in spirit to the CWG `VectorResNet` where each block defines one transport step. The difference is that this version is conditional, so each block receives both the current particle and the encoded context `h_t`.
 
 Outputs:
 
@@ -318,13 +410,80 @@ init_particles: (B, particles, action_dim)
 history:        (B, history_dim)
 ```
 
-The particle cloud is the learned conditional action distribution along execution time.
+This variant supports CWG-style Sinkhorn marginal matching:
+
+```text
+Sinkhorn(rho_theta,k, rho_expert,k)
+```
+
+and optional bridge energy:
+
+```text
+Sinkhorn(rho_theta,k, rho_theta,k-1)
+```
+
+### `LatentSinkhornActionBridgePolicy`
+
+This is the current main probabilistic model.
+
+Each particle evolves in:
+
+```text
+y_k^{(j)} = (a_k^{(j)}, z_k^{(j)})
+```
+
+where:
+
+```text
+a_k = executable action coordinate
+z_k = latent mode / memory coordinate
+```
+
+Initialization:
+
+```text
+a_0^{(j)} = previous action + small noise   # current config
+z_0^{(j)} ~ N(0, latent_init_scale^2 I)
+```
+
+Residual update:
+
+```text
+[Delta a_k, Delta z_k] = f_k(a_k, z_k, h_t, k)
+a_{k+1} = tanh(a_k + tau * Delta a_k)
+z_{k+1} = latent_limit * tanh((z_k + tau * Delta z_k) / latent_limit)
+```
+
+Outputs:
+
+```text
+particles:         (B, particles, horizon, action_dim)
+latent_particles:  (B, particles, horizon, latent_dim)
+actions:           (B, horizon, action_dim), mean over particles
+init_particles:    (B, particles, action_dim)
+init_latents:      (B, particles, latent_dim)
+history:           (B, history_dim)
+```
+
+Important: only the action coordinate is supervised/executed. The latent coordinate is not directly supervised; it is useful only if the path-level distributional objective makes it carry unresolved mode information.
 
 ## Losses
 
-Implemented in `action_bridge/losses.py`.
+Implemented in:
 
-Main training loss in `train.py`:
+```text
+action_bridge/losses.py
+```
+
+Training wiring is in:
+
+```text
+action_bridge/train.py: compute_loss
+```
+
+### Standard Regression/Bridge Loss
+
+For non-Sinkhorn models:
 
 ```text
 total =
@@ -341,53 +500,139 @@ Bridge path energy:
 sum_k Phi_k ||a_{k+1} - a_k||^2
 ```
 
-where the path includes the initialization action before the predicted chunk:
+where the path includes:
 
 ```text
 [init_action, pred_action_0, ..., pred_action_{H-1}]
 ```
 
-`Phi_k` is a simple linear schedule from `1.0` to `loss.phi_final`.
+`Phi_k` is a linear schedule from `1.0` to `loss.phi_final`.
 
-For `model.type="sinkhorn_bridge"`, the main objective is different and closer to the Contact Wasserstein Geodesic code.
+### Sinkhorn Divergence
 
-The loss uses a local PyTorch implementation of log-domain Sinkhorn scaling, analogous in role to:
-
-```python
-SamplesLoss("sinkhorn", p=2, blur=params.entropy)
-```
-
-from the CWG codebase.
-
-The Sinkhorn bridge loss has two pieces:
-
-1. Marginal matching:
+`losses.py` contains a small local log-domain Sinkhorn implementation:
 
 ```text
-sum_k Sinkhorn( generated action marginal at k, expert action marginal at k )
+sinkhorn_divergence(x, y)
 ```
 
-2. Bridge energy between consecutive generated marginals:
+It plays the same practical role as `geomloss.SamplesLoss("sinkhorn", p=2, blur=...)` in the Contact Wasserstein Geodesic codebase, but it is implemented directly in PyTorch here.
+
+### Marginal Sinkhorn Matching
+
+Used by `sinkhorn_bridge.py`:
 
 ```text
-sum_k Phi_k Sinkhorn( rho_k, rho_{k-1} )
+sum_k Sinkhorn(generated action marginal at k, expert action marginal at k)
 ```
 
-The implementation can optionally compare joint `(context, action)` points rather than only action points. This is controlled by:
+Implemented as:
+
+```text
+sinkhorn_marginal_matching(...)
+```
+
+It can compare joint `(context, action)` points using:
 
 ```text
 loss.sinkhorn_context_weight
 ```
 
-If `sinkhorn_context_weight = 0`, matching is global across the batch. If it is positive, predictions are encouraged to match expert actions from similar encoded contexts.
+### Sinkhorn Bridge Energy
 
-Important caveat: this is still not the full non-conservative/contact-Hamiltonian CWG formulation. It is a conditional particle ResNet with Sinkhorn marginal losses and CWG-style bridge energy.
+Optional CWG-style energy between consecutive generated marginals:
 
-Jerk loss penalizes second differences in action space.
+```text
+sum_k Phi_k Sinkhorn(rho_k, rho_{k-1})
+```
+
+Implemented as:
+
+```text
+sinkhorn_bridge_energy(...)
+```
+
+For the current latent path-Sinkhorn config, this is off by default:
+
+```text
+loss.bridge_weight = 0.0
+```
+
+This isolates the path-level multimodality objective first.
+
+### Path-Level Sinkhorn Matching
+
+This is the key loss for the latest experiment.
+
+Generated particles:
+
+```text
+particles: (B, P, H, A)
+```
+
+Expert chunks:
+
+```text
+target_actions: (B, H, A)
+```
+
+The loss flattens full action paths and builds joint context-path points:
+
+```text
+generated point = [sqrt(lambda) * phi(h_i), flat(A_hat_i^j)]
+expert point    = [sqrt(lambda) * phi(h_i), flat(A_i^*)]
+```
+
+Implemented as:
+
+```text
+joint_context_path_points(...)
+sinkhorn_path_matching(...)
+```
+
+Config fields:
+
+```text
+loss.path_sinkhorn_weight
+loss.path_sinkhorn_epsilon
+loss.path_sinkhorn_iterations
+loss.path_context
+loss.path_context_weight
+```
+
+Current default:
+
+```text
+loss.path_context = "state"
+```
+
+so `phi(h_i)` is the raw current state:
+
+```text
+[x_agent, y_agent, x_goal, y_goal]
+```
+
+Other options in code:
+
+```text
+"state_action"  # flattened context states and actions
+"history"       # learned encoder output
+"none"          # no context coordinate
+```
+
+### Jerk Loss
+
+The jerk loss penalizes second differences in action space:
+
+```text
+a_{k+2} - 2 a_{k+1} + a_k
+```
+
+It is a heuristic smoothness penalty, not from the CWG paper.
 
 ## Configs
 
-Base config is:
+Base config:
 
 ```text
 action_bridge/configs/base.py
@@ -396,13 +641,14 @@ action_bridge/configs/base.py
 Variant configs:
 
 ```text
-regression.py        # deterministic one-shot action chunk regression
-gaussian_chunk.py    # one-shot chunk model with Gaussian noise input
-bridge_no_energy.py  # previous-action residual bridge, no bridge penalty
-bridge_prev.py       # previous-action residual bridge with path energy
-bridge_gaussian.py   # Gaussian-initialized residual bridge with path energy
-sinkhorn_bridge.py   # probabilistic particle bridge with Sinkhorn marginal matching
-sinkhorn_bridge_state_only.py # more ambiguous state-only Sinkhorn ablation
+regression.py                         # deterministic one-shot action chunk regression
+gaussian_chunk.py                     # one-shot chunk model with Gaussian noise input
+bridge_no_energy.py                   # previous-action residual bridge, no bridge penalty
+bridge_prev.py                        # previous-action residual bridge with path energy
+bridge_gaussian.py                    # Gaussian-initialized residual bridge with path energy
+sinkhorn_bridge.py                    # probabilistic particle bridge with Sinkhorn marginal matching
+sinkhorn_bridge_state_only.py         # older ambiguous ablation without action-history conditioning
+latent_path_sinkhorn_delayed_modes.py # current delayed-branch latent path-Sinkhorn experiment
 ```
 
 Important fields:
@@ -416,6 +662,9 @@ data.train_fraction
 data.force_regenerate
 data.path
 data.paired_modes
+data.shared_prefix_steps
+data.shared_prefix_speed
+data.shared_prefix_target_x
 
 model.type
 model.history_dim
@@ -426,6 +675,11 @@ model.init_noise_scale
 model.noise_dim
 model.noise_scale
 model.action_limit
+model.use_context_actions
+model.particles
+model.latent_dim
+model.latent_init_scale
+model.latent_limit
 
 train.epochs
 train.batch_size
@@ -445,6 +699,11 @@ loss.sinkhorn_iterations
 loss.sinkhorn_context_weight
 loss.sinkhorn_intermediate_weight
 loss.sinkhorn_endpoint_weight
+loss.path_sinkhorn_weight
+loss.path_sinkhorn_epsilon
+loss.path_sinkhorn_iterations
+loss.path_context
+loss.path_context_weight
 loss.mean_action_weight
 loss.diversity_weight
 
@@ -453,43 +712,66 @@ eval.replan_every
 eval.deterministic
 eval.policy_sample
 eval.plot_examples
+eval.multimodal_examples
+eval.multimodal_samples
 ```
 
 ## Running Training
 
-Smoke run:
+Use commands from:
+
+```text
+sandbox/action_bridge_policy/
+```
+
+### Main GPU Run
 
 ```bash
 uv run python -m action_bridge.train \
-  --config=action_bridge/configs/bridge_prev.py \
-  --config.train.epochs=1 \
-  --config.data.num_trajectories=256 \
-  --config.data.trajectory_length=48 \
-  --config.data.horizon=8 \
+  --config=action_bridge/configs/latent_path_sinkhorn_delayed_modes.py \
+  --config.train.epochs=12 \
+  --config.data.num_trajectories=1000 \
   --config.train.batch_size=64 \
-  --config.eval.rollout_episodes=24 \
-  --config.run_name=smoke_bridge_prev \
+  --config.model.particles=24 \
   --config.device=cuda
 ```
 
-Use `--config.device=cpu` if no GPU is available.
-
-First comparison:
+### Fast GPU Smoke Run
 
 ```bash
-uv run python -m action_bridge.run_all \
-  --epochs=12 \
-  --num_trajectories=1000 \
-  --trajectory_length=72 \
-  --context=6 \
-  --horizon=16 \
-  --batch_size=128 \
-  --rollout_episodes=96 \
-  --replan_every=4 \
-  --device=cuda
+uv run python -m action_bridge.train \
+  --config=action_bridge/configs/latent_path_sinkhorn_delayed_modes.py \
+  --config.train.epochs=1 \
+  --config.data.num_trajectories=256 \
+  --config.train.batch_size=32 \
+  --config.model.particles=8 \
+  --config.loss.path_sinkhorn_iterations=10 \
+  --config.device=cuda \
+  --config.run_name=gpu_smoke_latent_path
 ```
 
-Probabilistic Sinkhorn bridge:
+### CPU Debug Run
+
+```bash
+uv run python -m action_bridge.train \
+  --config=action_bridge/configs/latent_path_sinkhorn_delayed_modes.py \
+  --config.train.epochs=1 \
+  --config.data.num_trajectories=64 \
+  --config.data.trajectory_length=32 \
+  --config.data.horizon=8 \
+  --config.model.particles=6 \
+  --config.train.batch_size=8 \
+  --config.loss.path_sinkhorn_iterations=8 \
+  --config.loss.path_sinkhorn_epsilon=0.2 \
+  --config.eval.rollout_episodes=4 \
+  --config.eval.multimodal_examples=2 \
+  --config.eval.multimodal_samples=6 \
+  --config.run_name=debug_latent_path_prefix \
+  --config.device=cpu \
+  --config.data.force_regenerate=True
+```
+
+### Older Probabilistic Sinkhorn Baseline
 
 ```bash
 uv run python -m action_bridge.train \
@@ -501,19 +783,6 @@ uv run python -m action_bridge.train \
   --config.data.horizon=16 \
   --config.train.batch_size=64 \
   --config.model.particles=8 \
-  --config.device=cuda
-```
-
-More ambiguous state-only Sinkhorn ablation:
-
-```bash
-uv run python -m action_bridge.train \
-  --config=action_bridge/configs/sinkhorn_bridge_state_only.py \
-  --config.train.epochs=12 \
-  --config.data.num_trajectories=1000 \
-  --config.data.trajectory_length=72 \
-  --config.train.batch_size=64 \
-  --config.model.particles=16 \
   --config.device=cuda
 ```
 
@@ -531,11 +800,36 @@ losses.csv
 metrics.json
 model.pt
 rollouts.png
+multimodal_samples.png  # when eval.multimodal_examples > 0
+```
+
+## VS Code Debug Configs
+
+`.vscode/launch.json` includes:
+
+```text
+Train Action Bridge Debug
+Train Sinkhorn Action Bridge Debug
+Train Latent Path Sinkhorn Delayed Modes Debug
+Visualize Delayed Action Bridge Dataset
+```
+
+The latent debug config uses:
+
+```text
+config: latent_path_sinkhorn_delayed_modes.py
+epochs: 2
+num_trajectories: 128
+trajectory_length: 36
+horizon: 8
+particles: 6
+device: cpu
+run_name: debug_latent_path_sinkhorn_delayed_modes
 ```
 
 ## Evaluation
 
-There are two evaluation layers.
+There are three evaluation layers.
 
 ### Offline Action-Chunk Metrics
 
@@ -550,14 +844,16 @@ action_jerk
 action_chunk_discontinuity
 bridge_energy
 network_evals
-particle_diversity  # Sinkhorn/probabilistic models only
+particle_diversity       # probabilistic models only
+particle_path_diversity  # probabilistic models only
+path_sinkhorn            # path-level Sinkhorn configs only
 ```
 
-These compare predicted future action chunks to expert future chunks.
+Important warning: for a truly multimodal target, mean-action MSE can be misleading because the mean of top and bottom futures may be an invalid middle trajectory. For path-Sinkhorn configs, checkpoint selection uses `path_sinkhorn` when available.
 
 ### Closed-Loop Rollout Metrics
 
-Computed by running the learned policy in the synthetic point environment:
+The policy is rolled out in the synthetic point environment:
 
 ```text
 rollout_success_rate
@@ -572,7 +868,7 @@ rollout_mode_switches
 rollout_wrong_side_fraction
 ```
 
-Closed-loop evaluation logic:
+Closed-loop logic:
 
 1. Start from a test trajectory state after the context window.
 2. Predict an action chunk.
@@ -580,18 +876,42 @@ Closed-loop evaluation logic:
 4. Update context with executed state/actions.
 5. Replan until episode end.
 
-`rollouts.png` shows these closed-loop policy rollouts, not expert trajectories.
+`rollouts.png` shows model-controlled rollouts, not expert trajectories.
 
-Plot semantics:
+### Multimodality Metrics
 
-- black circle: obstacle;
-- line with dots: model-controlled agent trajectory;
-- blue start dot: rollout start;
-- green star: goal;
-- title `top / ok`, `bottom / fail`, etc.:
-  - `top` or `bottom` is the expert mode label for that test trajectory;
-  - `ok` means final distance to goal is within `success_radius`;
-  - `fail` means it missed the goal.
+For delayed-prefix configs, `evaluate_multimodality` samples many chunks from a pre-fork context:
+
+```text
+t = max(data.context, data.shared_prefix_steps)
+```
+
+It open-loop rolls each sampled chunk and classifies it as top, bottom, or unresolved.
+
+Metrics:
+
+```text
+multimodal_top_fraction
+multimodal_bottom_fraction
+multimodal_unresolved_fraction
+multimodal_mode_entropy
+multimodal_mode_switch_rate
+multimodal_obstacle_contact_rate
+multimodal_sample_path_diversity
+```
+
+Plot:
+
+```text
+multimodal_samples.png
+```
+
+What to look for:
+
+- high `multimodal_mode_entropy` means particles cover both top and bottom modes;
+- low `multimodal_mode_switch_rate` means individual sampled paths are coherent;
+- low obstacle contact means paths are physically sensible in the toy environment;
+- high diversity alone is not enough if samples crash or switch modes.
 
 ## Known Issues / Research Caveats
 
@@ -606,94 +926,99 @@ goal  x = 0.88
 goal  y = 0.50 +/- 0.055
 ```
 
-So the current task tests mechanics and smoothness more than broad generalization.
+So the task tests mechanics and mode behavior more than broad generalization.
 
-3. The top/bottom mode label is not given to the policy.
+3. Previous-action conditioning can either help or hurt multimodality tests.
 
-The policy only sees state/action history. Since the context actions already point into one mode, the bridge can often infer the mode from action history.
+In the old immediate-branch dataset, action history reveals mode early. In the delayed-prefix dataset, the first `K` previous actions are shared, so previous-action conditioning is compatible with genuine pre-fork ambiguity.
 
-4. `bridge_no_energy` is the key sanity baseline.
+4. `bridge_no_energy` remains the key sanity baseline for deterministic residual bridge claims.
 
-If `bridge_prev` does not beat `bridge_no_energy`, then the bridge/path energy may not be adding anything beyond the residual warm-start architecture.
+If `bridge_prev` does not beat `bridge_no_energy`, then bridge path energy may only be a smoothness regularizer.
 
 5. `gaussian_chunk` is not a full diffusion/flow policy.
 
-It is only a cheap Gaussian-conditioned one-shot baseline. It does not replace a proper diffusion policy baseline.
+It is only a cheap Gaussian-conditioned one-shot baseline.
 
-6. `bridge_gaussian` is an ablation, not the preferred method.
+6. The current latent path-Sinkhorn model is not the full non-conservative/contact-Hamiltonian CWG formulation.
 
-The preferred research idea is previous-action or previous-chunk initialized bridge, because that addresses the "starting from scratch" concern.
+It is a conditional particle ResNet with local PyTorch Sinkhorn losses. It borrows the particle-cloud / transport-step / Sinkhorn-matching style, but it is not a faithful reproduction of the whole Contact Wasserstein Geodesics method.
 
-7. The path energy can make actions smoother while hurting task success.
+7. Path-level Sinkhorn can be batch-sensitive.
 
-Always compare success/final distance and smoothness together.
+The target empirical distribution is built from the minibatch. Large enough batches help the model see nearby contexts and both modes. If mode coverage looks unstable, try:
 
-8. Generated `.venv`, `data/`, and `runs/` are gitignored.
+```text
+larger batch_size
+more particles
+smaller/larger path_context_weight
+more trajectories
+```
+
+8. `loss.bridge_weight = 0.0` in the current latent config on purpose.
+
+The first goal is to test whether path-level Sinkhorn learns multimodal coherent action chunks. Add CWG-style consecutive-marginal bridge energy only after the path-level experiment is understood.
+
+9. Generated `.venv`, `data/`, and `runs/` are gitignored.
 
 Do not treat them as source files.
 
-9. A probabilistic model needs a distributional objective.
-
-Plain MSE with noise usually collapses to a conditional mean. The Sinkhorn bridge configs avoid direct per-sample MSE by default and instead match generated particle marginals to expert action marginals.
-
-10. Conditioning can destroy apparent multimodality.
-
-If the context contains action history, the top/bottom mode is often already revealed. To stress multimodality, use `sinkhorn_bridge_state_only.py`, which hides action history and uses a shorter context.
-
 ## Suggested Debugging Workflow
 
-When debugging a training issue:
-
-1. Run a tiny smoke command on CPU:
+1. Verify CUDA if training remotely:
 
 ```bash
-uv run python -m action_bridge.train \
-  --config=action_bridge/configs/bridge_prev.py \
-  --config.train.epochs=1 \
-  --config.data.num_trajectories=64 \
-  --config.data.trajectory_length=32 \
-  --config.data.horizon=8 \
-  --config.train.batch_size=32 \
-  --config.eval.rollout_episodes=8 \
-  --config.run_name=debug_tiny \
-  --config.device=cpu
+uv run python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no gpu')"
 ```
 
-2. Check `metrics.json`.
+2. Run a tiny CPU smoke command.
 
-3. Open `rollouts.png`.
+3. Check:
+
+```text
+runs/<run-name>/metrics.json
+runs/<run-name>/losses.csv
+runs/<run-name>/rollouts.png
+runs/<run-name>/multimodal_samples.png
+```
 
 4. Visualize the dataset:
 
 ```bash
 uv run python -m action_bridge.visualize_data \
-  --dataset=data/point_modes_n64_t32_s7.npz \
+  --dataset=data/point_modes_prefix6_n128_t36_s7.npz \
   --split=all
 ```
 
 5. Put breakpoints in:
 
 ```text
+data.py: shared_prefix_action
+data.py: simulate_expert_trajectory
 data.py: ActionChunkDataset.__getitem__
-models.py: ResidualActionBridgePolicy.forward
-losses.py: bridge_path_energy
-train.py: compute_loss
-train.py: rollout_policy
+models.py: LatentSinkhornActionBridgePolicy.forward
 losses.py: sinkhorn_divergence
-losses.py: sinkhorn_marginal_matching
-losses.py: sinkhorn_bridge_energy
+losses.py: sinkhorn_path_matching
+losses.py: joint_context_path_points
+train.py: path_context_features
+train.py: compute_loss
+train.py: evaluate_multimodality
+train.py: rollout_policy
 ```
 
 6. Inspect tensor shapes:
 
 ```text
-context_states:  (B, context, 4)
-context_actions: (B, context, 2)
-future_actions:  (B, horizon, 2)
-pred actions:    (B, horizon, 2)
-init_action:     (B, 2)
-particles:       (B, particles, horizon, 2)
-init_particles:  (B, particles, 2)
+context_states:    (B, context, 4)
+context_actions:   (B, context, 2)
+future_actions:    (B, horizon, 2)
+pred actions:      (B, horizon, 2)
+init_action:       (B, 2)
+particles:         (B, particles, horizon, 2)
+latent_particles:  (B, particles, horizon, latent_dim)
+init_particles:    (B, particles, 2)
+init_latents:      (B, particles, latent_dim)
+history:           (B, history_dim)
 ```
 
 7. If behavior looks bizarre, regenerate the dataset:
@@ -706,10 +1031,19 @@ init_particles:  (B, particles, 2)
 
 Positive evidence in this sandbox would look like:
 
-- `bridge_prev` improves closed-loop smoothness over `bridge_no_energy`;
-- `bridge_prev` keeps or improves `rollout_success_rate`;
-- chunk discontinuity decreases without final distance getting worse;
-- top/bottom mode commitment is stable;
-- performance does not rely solely on hand-tuned smoothness penalties.
+- from the same pre-fork context, particles cover both top and bottom futures;
+- each sampled path commits coherently to one side;
+- mode entropy is high but mode-switch rate is low;
+- obstacle contact/crossing is not excessive;
+- closed-loop rollouts improve when replanning every 1-2 actions;
+- results are not explained only by hand-tuned smoothness penalties.
 
-But even if this works, it is only a sanity check. The next real research step is to replace this synthetic surrogate with a state-based Push-T dataset/environment while keeping the same policy/model interface.
+Negative evidence would also be useful:
+
+- all particles collapse to one mode;
+- particles are diverse but physically invalid;
+- samples switch top/bottom within a single chunk;
+- path Sinkhorn improves offline metrics but rollouts still fail;
+- the method is no better than a warm-started residual or A2A-style baseline.
+
+Even if this works, it is only a sanity check. The next research step is to replace the synthetic surrogate with state-based Push-T or another real robotics dataset/environment while preserving the same policy/model interface.
