@@ -358,6 +358,17 @@ def evaluate_actions(
             batch["context_actions"],
         )
         if "particles" in out:
+            if cfg.loss.get("sinkhorn_weight", 0.0) != 0.0:
+                metrics["marginal_sinkhorn"] = sinkhorn_marginal_matching(
+                    out["particles"],
+                    batch["future_actions"],
+                    out["history"],
+                    epsilon=cfg.loss.sinkhorn_epsilon,
+                    iterations=cfg.loss.sinkhorn_iterations,
+                    context_weight=cfg.loss.sinkhorn_context_weight,
+                    intermediate_weight=cfg.loss.sinkhorn_intermediate_weight,
+                    endpoint_weight=cfg.loss.sinkhorn_endpoint_weight,
+                )
             if cfg.loss.get("bridge_weight", 0.0) != 0.0:
                 metrics["bridge_energy"] = sinkhorn_bridge_energy(
                     out["init_particles"],
@@ -788,9 +799,179 @@ def evaluate_multimodality(
     }
 
 
+def paired_partner_id(
+    traj_id: int,
+    states: np.ndarray,
+    modes: np.ndarray,
+    t: int,
+) -> int | None:
+    candidates = []
+    adjacent = traj_id + 1 if traj_id % 2 == 0 else traj_id - 1
+    if 0 <= adjacent < len(states):
+        candidates.append(adjacent)
+    same_context = np.max(np.abs(states[:, t] - states[traj_id, t]), axis=1) < 1e-5
+    candidates.extend(np.flatnonzero(same_context).tolist())
+    for candidate in candidates:
+        if candidate == traj_id:
+            continue
+        if int(modes[candidate]) != -int(modes[traj_id]):
+            continue
+        if np.max(np.abs(states[candidate, t] - states[traj_id, t])) < 1e-5:
+            return int(candidate)
+    return None
+
+
+def plot_position_marginals(
+    examples: list[dict],
+    env_cfg: PointObstacleConfig,
+    path: Path,
+    time_indices: np.ndarray,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    if not examples:
+        return
+    rows = len(examples)
+    cols = len(time_indices)
+    fig, axes = plt.subplots(rows, cols, figsize=(2.45 * cols, 2.45 * rows), squeeze=False)
+    theta = np.linspace(0.0, 2.0 * np.pi, 120)
+    ox = env_cfg.obstacle_center_x + env_cfg.obstacle_radius * np.cos(theta)
+    oy = env_cfg.obstacle_center_y + env_cfg.obstacle_radius * np.sin(theta)
+    for row_idx, ex in enumerate(examples):
+        generated = ex["generated_positions"]
+        expert = ex["expert_positions"]
+        for col_idx, step in enumerate(time_indices):
+            ax = axes[row_idx, col_idx]
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_aspect("equal")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.plot(ox, oy, color="black", linewidth=0.8)
+            gen_pos = generated[:, step]
+            ax.scatter(gen_pos[:, 0], gen_pos[:, 1], color="0.35", alpha=0.55, s=10)
+            ax.scatter(expert[0, step, 0], expert[0, step, 1], color="tab:blue", marker="x", s=45)
+            ax.scatter(expert[1, step, 0], expert[1, step, 1], color="tab:orange", marker="x", s=45)
+            ax.scatter(ex["start"][0], ex["start"][1], color="black", s=12)
+            if row_idx == 0:
+                ax.set_title(f"k={int(step)}", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def evaluate_position_marginals(
+    model: torch.nn.Module,
+    data_file: Path,
+    device: torch.device,
+    cfg: config_dict.ConfigDict,
+    env_cfg: PointObstacleConfig,
+    run_dir: Path,
+) -> dict[str, float]:
+    examples_to_plot = int(cfg.eval.get("marginal_examples", 0))
+    if examples_to_plot <= 0:
+        return {}
+
+    arrays = load_npz_arrays(data_file)
+    states = arrays["states"]
+    actions = arrays["actions"]
+    modes = arrays["modes"]
+    n_train = int(cfg.data.train_fraction * len(states))
+    test_ids = list(range(n_train, len(states)))
+    t = max(int(cfg.data.context), int(cfg.data.get("shared_prefix_steps", cfg.data.context)))
+    horizon = int(cfg.data.horizon)
+    if t + horizon >= states.shape[1]:
+        return {}
+
+    model.eval()
+    rows = []
+    plotted = []
+    seen_contexts = set()
+    sample_limit = int(cfg.eval.get("marginal_samples", cfg.model.get("particles", 16)))
+    time_slices = int(cfg.eval.get("marginal_time_slices", 6))
+    time_indices = np.unique(np.linspace(0, horizon, min(horizon + 1, time_slices), dtype=np.int64))
+    for traj_id in test_ids:
+        if len(plotted) >= examples_to_plot:
+            break
+        partner = paired_partner_id(traj_id, states, modes, t)
+        if partner is None:
+            continue
+        context_key = tuple(np.round(states[traj_id, t], 4))
+        if context_key in seen_contexts:
+            continue
+        seen_contexts.add(context_key)
+        top_id = traj_id if int(modes[traj_id]) > 0 else partner
+        bottom_id = partner if top_id == traj_id else traj_id
+        c = cfg.data.context
+        context_states = states[traj_id, t - c + 1 : t + 1].copy()
+        context_actions = actions[traj_id, t - c : t].copy()
+        chunks = predict_particle_chunks(
+            model,
+            context_states,
+            context_actions,
+            device,
+            deterministic=False,
+            fallback_samples=sample_limit,
+        )[:sample_limit]
+
+        generated_positions = []
+        for chunk in chunks:
+            positions, _ = rollout_open_loop(states[traj_id, t], chunk, env_cfg)
+            generated_positions.append(positions)
+        generated_positions = np.asarray(generated_positions, dtype=np.float32)
+        expert_positions = np.stack(
+            [
+                states[top_id, t : t + horizon + 1, :2],
+                states[bottom_id, t : t + horizon + 1, :2],
+            ],
+            axis=0,
+        )
+
+        nearest_distances = []
+        entropies = []
+        unresolved = []
+        for step in range(horizon + 1):
+            gen = generated_positions[:, step]
+            gt = expert_positions[:, step]
+            dist = np.linalg.norm(gen[:, None, :] - gt[None, :, :], axis=-1)
+            nearest_distances.append(float(dist.min(axis=1).mean()))
+            signs = np.sign(gen[:, 1] - env_cfg.obstacle_center_y)
+            top = int(np.sum(signs > 0))
+            bottom = int(np.sum(signs < 0))
+            zero = int(np.sum(signs == 0))
+            entropies.append(mode_entropy(top, bottom))
+            unresolved.append(zero / max(1, len(signs)))
+
+        rows.append(
+            {
+                "nearest_gt_distance": float(np.mean(nearest_distances)),
+                "mode_entropy": float(np.mean(entropies)),
+                "unresolved_fraction": float(np.mean(unresolved)),
+            }
+        )
+        plotted.append(
+            {
+                "generated_positions": generated_positions,
+                "expert_positions": expert_positions,
+                "start": states[traj_id, t, :2].copy(),
+            }
+        )
+
+    plot_position_marginals(plotted, env_cfg, run_dir / "position_marginals.png", time_indices)
+    if not rows:
+        return {}
+    return {
+        f"position_marginal_{key}": float(np.mean([row[key] for row in rows]))
+        for key in rows[0].keys()
+    }
+
+
 def selection_score(metrics: dict[str, float]) -> float:
     if "path_sinkhorn" in metrics:
         return metrics["path_sinkhorn"]
+    if "marginal_sinkhorn" in metrics:
+        return metrics["marginal_sinkhorn"]
     return metrics["action_mse"] + 0.15 * metrics["action_endpoint_mse"]
 
 
@@ -881,10 +1062,12 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
     action_metrics = evaluate_actions(model, test_loader, device, cfg)
     rollout_metrics = rollout_policy(model, data_file, device, cfg, env_cfg, run_dir)
     multimodal_metrics = evaluate_multimodality(model, data_file, device, cfg, env_cfg, run_dir)
+    position_marginal_metrics = evaluate_position_marginals(model, data_file, device, cfg, env_cfg, run_dir)
     metrics = {
         **action_metrics,
         **rollout_metrics,
         **multimodal_metrics,
+        **position_marginal_metrics,
         "run_name": run_name,
         "model_type": cfg.model.type,
         "init_type": cfg.model.get("init_type", "none"),

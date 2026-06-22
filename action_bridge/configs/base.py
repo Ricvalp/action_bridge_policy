@@ -80,5 +80,8 @@ def get_config() -> ConfigDict:
     cfg.eval.plot_examples = 8
     cfg.eval.multimodal_examples = 0
     cfg.eval.multimodal_samples = 32
+    cfg.eval.marginal_examples = 0
+    cfg.eval.marginal_samples = 32
+    cfg.eval.marginal_time_slices = 6
 
     return cfg

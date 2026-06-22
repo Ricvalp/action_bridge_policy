@@ -28,6 +28,7 @@ Here bridge time is execution time, so the intermediate outputs are the future a
 - `sinkhorn_bridge`: probabilistic particle bridge with Sinkhorn marginal matching.
 - `sinkhorn_bridge_state_only`: more ambiguous Sinkhorn ablation without action-history conditioning.
 - `latent_path_sinkhorn_delayed_modes`: latent particle bridge trained with path-level Sinkhorn matching on the delayed-branch dataset.
+- `latent_marginal_sinkhorn_delayed_modes`: latent particle bridge trained only with per-timestep Sinkhorn marginal matching on the delayed-branch dataset.
 
 `bridge_no_energy` is the most important sanity baseline: if `bridge_prev` does not beat it, the path/bridge objective is probably not adding much.
 
@@ -96,6 +97,18 @@ uv run python -m action_bridge.train \
   --config.device=cuda
 ```
 
+Run the delayed-branch latent marginal-only Sinkhorn ablation:
+
+```bash
+uv run python -m action_bridge.train \
+  --config=action_bridge/configs/latent_marginal_sinkhorn_delayed_modes.py \
+  --config.train.epochs=12 \
+  --config.data.num_trajectories=1000 \
+  --config.train.batch_size=64 \
+  --config.model.particles=24 \
+  --config.device=cuda
+```
+
 Outputs are written to:
 
 ```text
@@ -109,6 +122,7 @@ Each run contains:
 - `model.pt`
 - `rollouts.png`
 - `multimodal_samples.png` for configs with `eval.multimodal_examples > 0`
+- `position_marginals.png` for configs with `eval.marginal_examples > 0`
 
 ## Readout
 
@@ -122,7 +136,9 @@ Primary metrics:
 - `action_mse`
 - `particle_diversity` for probabilistic variants
 - `particle_path_diversity` for probabilistic variants
+- `marginal_sinkhorn` for marginal Sinkhorn variants
 - `path_sinkhorn` for path-level Sinkhorn variants
 - `multimodal_mode_entropy`, `multimodal_top_fraction`, and `multimodal_bottom_fraction` for delayed-branch multimodality tests
+- `position_marginal_nearest_gt_distance` and `position_marginal_mode_entropy` for marginal-distribution diagnostics
 
 The idea is weak if `bridge_prev` only improves smoothness while hurting success, or if `bridge_no_energy` matches it.

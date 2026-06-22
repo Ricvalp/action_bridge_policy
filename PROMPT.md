@@ -649,6 +649,7 @@ bridge_gaussian.py                    # Gaussian-initialized residual bridge wit
 sinkhorn_bridge.py                    # probabilistic particle bridge with Sinkhorn marginal matching
 sinkhorn_bridge_state_only.py         # older ambiguous ablation without action-history conditioning
 latent_path_sinkhorn_delayed_modes.py # current delayed-branch latent path-Sinkhorn experiment
+latent_marginal_sinkhorn_delayed_modes.py # delayed-branch marginal-only Sinkhorn ablation
 ```
 
 Important fields:
@@ -714,6 +715,9 @@ eval.policy_sample
 eval.plot_examples
 eval.multimodal_examples
 eval.multimodal_samples
+eval.marginal_examples
+eval.marginal_samples
+eval.marginal_time_slices
 ```
 
 ## Running Training
@@ -748,6 +752,20 @@ uv run python -m action_bridge.train \
   --config.loss.path_sinkhorn_iterations=10 \
   --config.device=cuda \
   --config.run_name=gpu_smoke_latent_path
+```
+
+### Marginal-Only GPU Run
+
+This ablation supervises only per-timestep action marginals. It intentionally removes path-level supervision and bridge-energy regularization, so it is useful for testing whether matching marginals can still produce incoherent top/bottom path switching.
+
+```bash
+uv run python -m action_bridge.train \
+  --config=action_bridge/configs/latent_marginal_sinkhorn_delayed_modes.py \
+  --config.train.epochs=12 \
+  --config.data.num_trajectories=1000 \
+  --config.train.batch_size=64 \
+  --config.model.particles=24 \
+  --config.device=cuda
 ```
 
 ### CPU Debug Run
@@ -801,6 +819,7 @@ metrics.json
 model.pt
 rollouts.png
 multimodal_samples.png  # when eval.multimodal_examples > 0
+position_marginals.png  # when eval.marginal_examples > 0
 ```
 
 ## VS Code Debug Configs
@@ -811,6 +830,7 @@ multimodal_samples.png  # when eval.multimodal_examples > 0
 Train Action Bridge Debug
 Train Sinkhorn Action Bridge Debug
 Train Latent Path Sinkhorn Delayed Modes Debug
+Train Latent Marginal Sinkhorn Delayed Modes Debug
 Visualize Delayed Action Bridge Dataset
 ```
 
@@ -847,9 +867,10 @@ network_evals
 particle_diversity       # probabilistic models only
 particle_path_diversity  # probabilistic models only
 path_sinkhorn            # path-level Sinkhorn configs only
+marginal_sinkhorn        # marginal Sinkhorn configs only
 ```
 
-Important warning: for a truly multimodal target, mean-action MSE can be misleading because the mean of top and bottom futures may be an invalid middle trajectory. For path-Sinkhorn configs, checkpoint selection uses `path_sinkhorn` when available.
+Important warning: for a truly multimodal target, mean-action MSE can be misleading because the mean of top and bottom futures may be an invalid middle trajectory. For path-Sinkhorn configs, checkpoint selection uses `path_sinkhorn` when available. For marginal-only Sinkhorn configs, checkpoint selection uses `marginal_sinkhorn` when available.
 
 ### Closed-Loop Rollout Metrics
 
@@ -912,6 +933,35 @@ What to look for:
 - low `multimodal_mode_switch_rate` means individual sampled paths are coherent;
 - low obstacle contact means paths are physically sensible in the toy environment;
 - high diversity alone is not enough if samples crash or switch modes.
+
+### Position Marginal Diagnostics
+
+For marginal-only experiments, `evaluate_position_marginals` samples chunks from pre-fork contexts, rolls each particle open-loop, and plots generated particle position clouds at selected future timesteps against the two expert top/bottom marginal positions.
+
+Plot:
+
+```text
+position_marginals.png
+```
+
+In the plot:
+
+- gray dots are generated particle positions at one future timestep;
+- blue/orange Xs are the expert top/bottom positions at that same timestep;
+- each column is a different future timestep `k`.
+
+Metrics:
+
+```text
+position_marginal_nearest_gt_distance
+position_marginal_mode_entropy
+position_marginal_unresolved_fraction
+```
+
+This diagnostic is meant to separate two questions:
+
+- do the generated **marginals** put mass near both expert branches at each timestep?
+- do individual sampled **paths** stay mode-coherent across timesteps?
 
 ## Known Issues / Research Caveats
 
