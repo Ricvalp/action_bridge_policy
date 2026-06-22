@@ -21,6 +21,9 @@ def get_config() -> ConfigDict:
     cfg.data.force_regenerate = False
     cfg.data.path = ""
     cfg.data.paired_modes = True
+    cfg.data.shared_prefix_steps = 0
+    cfg.data.shared_prefix_speed = 0.55
+    cfg.data.shared_prefix_target_x = 0.30
 
     cfg.model = ConfigDict()
     cfg.model.type = "bridge"
@@ -36,6 +39,9 @@ def get_config() -> ConfigDict:
     cfg.model.action_limit = 1.0
     cfg.model.use_context_actions = True
     cfg.model.particles = 8
+    cfg.model.latent_dim = 8
+    cfg.model.latent_init_scale = 1.0
+    cfg.model.latent_limit = 2.0
 
     cfg.train = ConfigDict()
     cfg.train.epochs = 12
@@ -58,6 +64,11 @@ def get_config() -> ConfigDict:
     cfg.loss.sinkhorn_context_weight = 0.05
     cfg.loss.sinkhorn_intermediate_weight = 1.0
     cfg.loss.sinkhorn_endpoint_weight = 1.0
+    cfg.loss.path_sinkhorn_weight = 0.0
+    cfg.loss.path_sinkhorn_epsilon = 0.10
+    cfg.loss.path_sinkhorn_iterations = 35
+    cfg.loss.path_context = "state"
+    cfg.loss.path_context_weight = 1.0
     cfg.loss.mean_action_weight = 0.0
     cfg.loss.diversity_weight = 0.0
 
@@ -67,5 +78,7 @@ def get_config() -> ConfigDict:
     cfg.eval.deterministic = True
     cfg.eval.policy_sample = "mean"
     cfg.eval.plot_examples = 8
+    cfg.eval.multimodal_examples = 0
+    cfg.eval.multimodal_samples = 32
 
     return cfg

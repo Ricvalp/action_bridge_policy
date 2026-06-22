@@ -168,6 +168,47 @@ def sinkhorn_marginal_matching(
     return total / max(1.0, normalizer)
 
 
+def joint_context_path_points(
+    paths: torch.Tensor,
+    context: torch.Tensor,
+    context_weight: float = 1.0,
+) -> torch.Tensor:
+    """Build joint `(context, full_action_path)` points for path-level OT.
+
+    `paths` can be either `(B, H, A)` expert chunks or `(B, P, H, A)`
+    generated particle chunks. The raw context coordinates are used directly
+    because the synthetic state lives in a stable `[0, 1]` geometry.
+    """
+
+    if paths.ndim not in (3, 4):
+        raise ValueError("paths must have shape (B, H, A) or (B, P, H, A).")
+    if context.ndim != 2:
+        raise ValueError("context must have shape (B, C).")
+    flat_paths = paths.reshape(-1, paths.shape[-2] * paths.shape[-1])
+    if context_weight <= 0:
+        return flat_paths
+
+    scaled_context = context.detach() * (float(context_weight) ** 0.5)
+    if paths.ndim == 4:
+        scaled_context = scaled_context[:, None, :].expand(paths.shape[0], paths.shape[1], -1)
+    return torch.cat([scaled_context.reshape(flat_paths.shape[0], -1), flat_paths], dim=-1)
+
+
+def sinkhorn_path_matching(
+    particles: torch.Tensor,
+    target_actions: torch.Tensor,
+    context: torch.Tensor,
+    epsilon: float = 0.05,
+    iterations: int = 40,
+    context_weight: float = 1.0,
+) -> torch.Tensor:
+    """Match generated full action paths to expert full action paths."""
+
+    pred_points = joint_context_path_points(particles, context, context_weight)
+    target_points = joint_context_path_points(target_actions, context, context_weight)
+    return sinkhorn_divergence(pred_points, target_points, epsilon=epsilon, iterations=iterations)
+
+
 def sinkhorn_bridge_energy(
     init_particles: torch.Tensor,
     particles: torch.Tensor,
@@ -202,3 +243,12 @@ def particle_diversity(particles: torch.Tensor) -> torch.Tensor:
     if particles.shape[1] <= 1:
         return particles.new_zeros(())
     return particles.std(dim=1).norm(dim=-1).mean()
+
+
+def particle_path_diversity(particles: torch.Tensor) -> torch.Tensor:
+    """Mean standard deviation of whole action paths across particles."""
+
+    if particles.shape[1] <= 1:
+        return particles.new_zeros(())
+    flat = particles.reshape(particles.shape[0], particles.shape[1], -1)
+    return flat.std(dim=1).norm(dim=-1).mean()

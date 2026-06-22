@@ -38,6 +38,9 @@ class PointObstacleConfig:
     start_jitter_x: float = 0.035
     start_jitter_y: float = 0.08
     success_radius: float = 0.075
+    shared_prefix_steps: int = 0
+    shared_prefix_speed: float = 0.55
+    shared_prefix_target_x: float = 0.30
 
     @property
     def obstacle_center(self) -> np.ndarray:
@@ -157,6 +160,25 @@ def expert_action(
     return clip_action(action, cfg), waypoint_idx
 
 
+def shared_prefix_action(state: np.ndarray, cfg: PointObstacleConfig) -> np.ndarray:
+    """Mode-independent approach action used before the top/bottom fork.
+
+    This makes paired demonstrations genuinely ambiguous for the first few
+    steps: the state and previous actions are the same, but the future path
+    can still branch above or below the obstacle.
+    """
+
+    pos = state[:2]
+    target = np.array([cfg.shared_prefix_target_x, pos[1]], dtype=np.float32)
+    delta = target - pos
+    distance = float(np.linalg.norm(delta))
+    if distance < 1e-4:
+        return np.zeros(2, dtype=np.float32)
+    direction = delta / (distance + 1e-8)
+    speed = min(cfg.shared_prefix_speed, distance / max(cfg.dt, 1e-8))
+    return clip_action(speed * direction, cfg)
+
+
 def simulate_expert_trajectory(
     length: int,
     start: np.ndarray,
@@ -172,7 +194,10 @@ def simulate_expert_trajectory(
     waypoints = expert_waypoints(goal, mode, cfg)
     waypoint_idx = 0
     for t in range(length):
-        actions[t], waypoint_idx = expert_action(states[t], waypoints, waypoint_idx, rng, cfg)
+        if t < cfg.shared_prefix_steps:
+            actions[t] = shared_prefix_action(states[t], cfg)
+        else:
+            actions[t], waypoint_idx = expert_action(states[t], waypoints, waypoint_idx, rng, cfg)
         states[t + 1], contacts[t] = step_state(states[t], actions[t], cfg)
     return states, actions, contacts
 

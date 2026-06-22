@@ -29,10 +29,17 @@ from .losses import (
     action_jerk_loss,
     bridge_path_energy,
     particle_diversity,
+    particle_path_diversity,
     sinkhorn_bridge_energy,
     sinkhorn_marginal_matching,
+    sinkhorn_path_matching,
 )
-from .models import ChunkMLPPolicy, ResidualActionBridgePolicy, SinkhornActionBridgePolicy
+from .models import (
+    ChunkMLPPolicy,
+    LatentSinkhornActionBridgePolicy,
+    ResidualActionBridgePolicy,
+    SinkhornActionBridgePolicy,
+)
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "bridge_prev.py"
@@ -87,10 +94,28 @@ def resolve_path(root: Path, value: str) -> Path:
 def dataset_path(root: Path, cfg: config_dict.ConfigDict) -> Path:
     if cfg.data.path:
         return resolve_path(root, cfg.data.path)
+    prefix_steps = int(cfg.data.get("shared_prefix_steps", 0))
+    if prefix_steps > 0:
+        return (
+            root
+            / "data"
+            / (
+                f"point_modes_prefix{prefix_steps}_"
+                f"n{cfg.data.num_trajectories}_t{cfg.data.trajectory_length}_s{cfg.seed}.npz"
+            )
+        )
     return (
         root
         / "data"
         / f"point_modes_n{cfg.data.num_trajectories}_t{cfg.data.trajectory_length}_s{cfg.seed}.npz"
+    )
+
+
+def make_env_config(cfg: config_dict.ConfigDict) -> PointObstacleConfig:
+    return PointObstacleConfig(
+        shared_prefix_steps=int(cfg.data.get("shared_prefix_steps", 0)),
+        shared_prefix_speed=float(cfg.data.get("shared_prefix_speed", 0.55)),
+        shared_prefix_target_x=float(cfg.data.get("shared_prefix_target_x", 0.30)),
     )
 
 
@@ -178,40 +203,97 @@ def make_model(cfg: config_dict.ConfigDict) -> torch.nn.Module:
             action_limit=cfg.model.action_limit,
             use_context_actions=cfg.model.get("use_context_actions", True),
         )
+    if cfg.model.type == "latent_sinkhorn_bridge":
+        return LatentSinkhornActionBridgePolicy(
+            context=cfg.data.context,
+            horizon=cfg.data.horizon,
+            state_dim=cfg.model.state_dim,
+            action_dim=cfg.model.action_dim,
+            history_dim=cfg.model.history_dim,
+            hidden_dim=cfg.model.hidden_dim,
+            tau=cfg.model.tau,
+            init_type=cfg.model.init_type,
+            init_noise_scale=cfg.model.init_noise_scale,
+            particles=cfg.model.get("particles", 16),
+            latent_dim=cfg.model.get("latent_dim", 8),
+            latent_init_scale=cfg.model.get("latent_init_scale", 1.0),
+            latent_limit=cfg.model.get("latent_limit", 2.0),
+            action_limit=cfg.model.action_limit,
+            use_context_actions=cfg.model.get("use_context_actions", True),
+        )
     raise ValueError(f"Unknown model type: {cfg.model.type}")
+
+
+def path_context_features(
+    batch: dict[str, torch.Tensor],
+    out: dict[str, torch.Tensor],
+    cfg: config_dict.ConfigDict,
+) -> torch.Tensor:
+    mode = cfg.loss.get("path_context", "state")
+    if mode == "state":
+        return batch["context_states"][:, -1]
+    if mode == "state_action":
+        return torch.cat(
+            [
+                batch["context_states"].reshape(batch["context_states"].shape[0], -1),
+                batch["context_actions"].reshape(batch["context_actions"].shape[0], -1),
+            ],
+            dim=-1,
+        )
+    if mode == "history":
+        return out["history"]
+    if mode == "none":
+        return batch["context_states"].new_zeros((batch["context_states"].shape[0], 1))
+    raise ValueError(f"Unknown path_context: {mode}")
 
 
 def compute_loss(batch: dict[str, torch.Tensor], model: torch.nn.Module, cfg: config_dict.ConfigDict):
     out = model(batch, deterministic=False)
     pred = out["actions"]
     target = batch["future_actions"]
-    if cfg.model.type == "sinkhorn_bridge":
+    if cfg.model.type in ("sinkhorn_bridge", "latent_sinkhorn_bridge"):
         mean_action_loss = F.mse_loss(pred, target)
         endpoint_loss = F.mse_loss(pred[:, -1], target[:, -1])
         first_loss = F.mse_loss(pred[:, 0], target[:, 0])
-        sinkhorn = sinkhorn_marginal_matching(
-            out["particles"],
-            target,
-            out["history"],
-            epsilon=cfg.loss.sinkhorn_epsilon,
-            iterations=cfg.loss.sinkhorn_iterations,
-            context_weight=cfg.loss.sinkhorn_context_weight,
-            intermediate_weight=cfg.loss.sinkhorn_intermediate_weight,
-            endpoint_weight=cfg.loss.sinkhorn_endpoint_weight,
-        )
-        bridge = sinkhorn_bridge_energy(
-            out["init_particles"],
-            out["particles"],
-            out["history"],
-            phi_final=cfg.loss.phi_final,
-            epsilon=cfg.loss.sinkhorn_epsilon,
-            iterations=cfg.loss.sinkhorn_iterations,
-            context_weight=cfg.loss.sinkhorn_context_weight,
-        )
+        sinkhorn = target.new_zeros(())
+        if cfg.loss.get("sinkhorn_weight", 0.0) != 0.0:
+            sinkhorn = sinkhorn_marginal_matching(
+                out["particles"],
+                target,
+                out["history"],
+                epsilon=cfg.loss.sinkhorn_epsilon,
+                iterations=cfg.loss.sinkhorn_iterations,
+                context_weight=cfg.loss.sinkhorn_context_weight,
+                intermediate_weight=cfg.loss.sinkhorn_intermediate_weight,
+                endpoint_weight=cfg.loss.sinkhorn_endpoint_weight,
+            )
+        path_sinkhorn = target.new_zeros(())
+        if cfg.loss.get("path_sinkhorn_weight", 0.0) != 0.0:
+            path_sinkhorn = sinkhorn_path_matching(
+                out["particles"],
+                target,
+                path_context_features(batch, out, cfg),
+                epsilon=cfg.loss.get("path_sinkhorn_epsilon", cfg.loss.sinkhorn_epsilon),
+                iterations=cfg.loss.get("path_sinkhorn_iterations", cfg.loss.sinkhorn_iterations),
+                context_weight=cfg.loss.get("path_context_weight", 1.0),
+            )
+        bridge = target.new_zeros(())
+        if cfg.loss.get("bridge_weight", 0.0) != 0.0:
+            bridge = sinkhorn_bridge_energy(
+                out["init_particles"],
+                out["particles"],
+                out["history"],
+                phi_final=cfg.loss.phi_final,
+                epsilon=cfg.loss.sinkhorn_epsilon,
+                iterations=cfg.loss.sinkhorn_iterations,
+                context_weight=cfg.loss.sinkhorn_context_weight,
+            )
         jerk = action_jerk_loss(pred, batch["context_actions"])
         diversity = particle_diversity(out["particles"])
+        path_diversity = particle_path_diversity(out["particles"])
         total = (
             cfg.loss.sinkhorn_weight * sinkhorn
+            + cfg.loss.get("path_sinkhorn_weight", 0.0) * path_sinkhorn
             + cfg.loss.bridge_weight * bridge
             + cfg.loss.mean_action_weight * mean_action_loss
             + cfg.loss.endpoint_weight * endpoint_loss
@@ -222,12 +304,14 @@ def compute_loss(batch: dict[str, torch.Tensor], model: torch.nn.Module, cfg: co
         parts = {
             "loss": total.detach(),
             "sinkhorn": sinkhorn.detach(),
+            "path_sinkhorn": path_sinkhorn.detach(),
             "action": mean_action_loss.detach(),
             "endpoint": endpoint_loss.detach(),
             "first": first_loss.detach(),
             "bridge": bridge.detach(),
             "jerk": jerk.detach(),
             "diversity": diversity.detach(),
+            "path_diversity": path_diversity.detach(),
         }
         return total, parts
 
@@ -274,16 +358,29 @@ def evaluate_actions(
             batch["context_actions"],
         )
         if "particles" in out:
-            metrics["bridge_energy"] = sinkhorn_bridge_energy(
-                out["init_particles"],
-                out["particles"],
-                out["history"],
-                phi_final=cfg.loss.phi_final,
-                epsilon=cfg.loss.sinkhorn_epsilon,
-                iterations=cfg.loss.sinkhorn_iterations,
-                context_weight=cfg.loss.sinkhorn_context_weight,
-            )
+            if cfg.loss.get("bridge_weight", 0.0) != 0.0:
+                metrics["bridge_energy"] = sinkhorn_bridge_energy(
+                    out["init_particles"],
+                    out["particles"],
+                    out["history"],
+                    phi_final=cfg.loss.phi_final,
+                    epsilon=cfg.loss.sinkhorn_epsilon,
+                    iterations=cfg.loss.sinkhorn_iterations,
+                    context_weight=cfg.loss.sinkhorn_context_weight,
+                )
+            else:
+                metrics["bridge_energy"] = torch.zeros((), device=device)
             metrics["particle_diversity"] = particle_diversity(out["particles"])
+            metrics["particle_path_diversity"] = particle_path_diversity(out["particles"])
+            if cfg.loss.get("path_sinkhorn_weight", 0.0) != 0.0:
+                metrics["path_sinkhorn"] = sinkhorn_path_matching(
+                    out["particles"],
+                    batch["future_actions"],
+                    path_context_features(batch, out, cfg),
+                    epsilon=cfg.loss.get("path_sinkhorn_epsilon", cfg.loss.sinkhorn_epsilon),
+                    iterations=cfg.loss.get("path_sinkhorn_iterations", cfg.loss.sinkhorn_iterations),
+                    context_weight=cfg.loss.get("path_context_weight", 1.0),
+                )
         else:
             metrics["bridge_energy"] = bridge_path_energy(out["init_action"], out["actions"], cfg.loss.phi_final)
         metrics["network_evals"] = torch.tensor(float(model.network_evals), device=device)
@@ -459,10 +556,10 @@ def plot_rollouts(examples: list[dict], env_cfg: PointObstacleConfig, path: Path
         ax.set_aspect("equal")
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.plot(ox, oy, color="black", linewidth=1)
         if idx >= len(examples):
             ax.axis("off")
             continue
+        ax.plot(ox, oy, color="black", linewidth=1)
         ex = examples[idx]
         pos = ex["positions"]
         ax.plot(pos[:, 0], pos[:, 1], "-o", markersize=2, linewidth=1.5)
@@ -476,7 +573,224 @@ def plot_rollouts(examples: list[dict], env_cfg: PointObstacleConfig, path: Path
     plt.close(fig)
 
 
+def path_side(positions: np.ndarray, env_cfg: PointObstacleConfig) -> int:
+    """Classify a rolled-out path as top (+1), bottom (-1), or unresolved (0)."""
+
+    center_y = env_cfg.obstacle_center_y
+    band = np.abs(positions[:, 0] - env_cfg.obstacle_center_x) < 0.26
+    signs = np.sign(positions[band, 1] - center_y)
+    signs = signs[signs != 0]
+    if signs.size == 0:
+        final_sign = float(np.sign(positions[-1, 1] - center_y))
+        return int(final_sign) if final_sign != 0 else 0
+    vote = float(np.sign(np.mean(signs)))
+    return int(vote) if vote != 0 else 0
+
+
+def path_has_side_switch(positions: np.ndarray, env_cfg: PointObstacleConfig) -> bool:
+    center_y = env_cfg.obstacle_center_y
+    relevant = (positions[:, 0] > env_cfg.shared_prefix_target_x) & (np.abs(positions[:, 1] - center_y) > 0.03)
+    signs = np.sign(positions[relevant, 1] - center_y)
+    signs = signs[np.abs(signs) > 0]
+    if signs.size < 2:
+        return False
+    return bool(np.any(signs[1:] * signs[:-1] < 0))
+
+
+@torch.no_grad()
+def predict_particle_chunks(
+    model: torch.nn.Module,
+    context_states: np.ndarray,
+    context_actions: np.ndarray,
+    device: torch.device,
+    deterministic: bool,
+    fallback_samples: int,
+) -> np.ndarray:
+    batch = {
+        "context_states": torch.from_numpy(context_states[None]).to(device=device, dtype=torch.float32),
+        "context_actions": torch.from_numpy(context_actions[None]).to(device=device, dtype=torch.float32),
+    }
+    out = model(batch, deterministic=deterministic)
+    if "particles" in out:
+        return out["particles"][0].detach().cpu().numpy()
+    samples = []
+    for _ in range(fallback_samples):
+        out = model(batch, deterministic=deterministic)
+        samples.append(out["actions"][0].detach().cpu().numpy())
+    return np.stack(samples, axis=0)
+
+
+def rollout_open_loop(
+    state: np.ndarray,
+    chunk: np.ndarray,
+    env_cfg: PointObstacleConfig,
+) -> tuple[np.ndarray, float]:
+    current = state.copy()
+    positions = [current[:2].copy()]
+    contacts = []
+    for raw_action in chunk:
+        current, contact = step_state(current, clip_action(raw_action, env_cfg), env_cfg)
+        positions.append(current[:2].copy())
+        contacts.append(float(contact[1]))
+    return np.asarray(positions, dtype=np.float32), float(np.mean(contacts)) if contacts else 0.0
+
+
+def mode_entropy(top_count: int, bottom_count: int) -> float:
+    total = top_count + bottom_count
+    if total == 0:
+        return 0.0
+    probs = np.array([top_count / total, bottom_count / total], dtype=np.float64)
+    probs = probs[probs > 0]
+    return float(-(probs * np.log2(probs)).sum())
+
+
+def plot_multimodal_samples(
+    examples: list[dict],
+    env_cfg: PointObstacleConfig,
+    path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    if not examples:
+        return
+    cols = 4
+    rows = int(np.ceil(len(examples) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(3.2 * cols, 3.2 * rows))
+    axes = np.asarray(axes).reshape(-1)
+    theta = np.linspace(0.0, 2.0 * np.pi, 160)
+    ox = env_cfg.obstacle_center_x + env_cfg.obstacle_radius * np.cos(theta)
+    oy = env_cfg.obstacle_center_y + env_cfg.obstacle_radius * np.sin(theta)
+    for idx, ax in enumerate(axes):
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if idx >= len(examples):
+            ax.axis("off")
+            continue
+        ax.plot(ox, oy, color="black", linewidth=1)
+        ex = examples[idx]
+        for positions, side in zip(ex["positions"], ex["sides"], strict=True):
+            color = "tab:blue" if side > 0 else "tab:orange" if side < 0 else "0.55"
+            ax.plot(positions[:, 0], positions[:, 1], color=color, alpha=0.35, linewidth=1.0)
+        start = ex["current_state"][:2]
+        goal = ex["current_state"][2:]
+        ax.scatter([start[0]], [start[1]], color="black", s=18)
+        ax.scatter([goal[0]], [goal[1]], color="tab:green", marker="*", s=60)
+        ax.set_title(
+            f"top {ex['top']} / bottom {ex['bottom']} / H {ex['entropy']:.2f}",
+            fontsize=8,
+        )
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+@torch.no_grad()
+def evaluate_multimodality(
+    model: torch.nn.Module,
+    data_file: Path,
+    device: torch.device,
+    cfg: config_dict.ConfigDict,
+    env_cfg: PointObstacleConfig,
+    run_dir: Path,
+) -> dict[str, float]:
+    examples_to_plot = int(cfg.eval.get("multimodal_examples", 0))
+    if examples_to_plot <= 0:
+        return {}
+
+    arrays = load_npz_arrays(data_file)
+    states = arrays["states"]
+    actions = arrays["actions"]
+    n_train = int(cfg.data.train_fraction * len(states))
+    test_ids = list(range(n_train, len(states)))
+    t = max(int(cfg.data.context), int(cfg.data.get("shared_prefix_steps", cfg.data.context)))
+    if t >= actions.shape[1]:
+        return {}
+
+    model.eval()
+    seen_contexts = set()
+    rows = []
+    plotted = []
+    fallback_samples = int(cfg.eval.get("multimodal_samples", cfg.model.get("particles", 16)))
+    for traj_id in test_ids:
+        if len(plotted) >= examples_to_plot:
+            break
+        c = cfg.data.context
+        context_key = tuple(np.round(states[traj_id, t], 3))
+        if context_key in seen_contexts:
+            continue
+        seen_contexts.add(context_key)
+        context_states = states[traj_id, t - c + 1 : t + 1].copy()
+        context_actions = actions[traj_id, t - c : t].copy()
+        chunks = predict_particle_chunks(
+            model,
+            context_states,
+            context_actions,
+            device,
+            deterministic=False,
+            fallback_samples=fallback_samples,
+        )
+        sample_limit = int(cfg.eval.get("multimodal_samples", chunks.shape[0]))
+        chunks = chunks[:sample_limit]
+
+        positions = []
+        sides = []
+        switch_flags = []
+        contact_rates = []
+        for chunk in chunks:
+            pos, contact_rate = rollout_open_loop(states[traj_id, t], chunk, env_cfg)
+            side = path_side(pos, env_cfg)
+            positions.append(pos)
+            sides.append(side)
+            switch_flags.append(float(path_has_side_switch(pos, env_cfg)))
+            contact_rates.append(contact_rate)
+
+        top = int(np.sum(np.asarray(sides) > 0))
+        bottom = int(np.sum(np.asarray(sides) < 0))
+        unresolved = int(np.sum(np.asarray(sides) == 0))
+        flat_chunks = chunks.reshape(chunks.shape[0], -1)
+        if len(flat_chunks) > 1:
+            diffs = flat_chunks[:, None, :] - flat_chunks[None, :, :]
+            pairwise = np.sqrt(np.maximum((diffs * diffs).sum(axis=-1), 0.0))
+            diversity = float(pairwise[np.triu_indices(len(flat_chunks), k=1)].mean())
+        else:
+            diversity = 0.0
+        entropy = mode_entropy(top, bottom)
+        row = {
+            "top_fraction": top / max(1, top + bottom + unresolved),
+            "bottom_fraction": bottom / max(1, top + bottom + unresolved),
+            "unresolved_fraction": unresolved / max(1, top + bottom + unresolved),
+            "mode_entropy": entropy,
+            "mode_switch_rate": float(np.mean(switch_flags)) if switch_flags else 0.0,
+            "obstacle_contact_rate": float(np.mean(contact_rates)) if contact_rates else 0.0,
+            "sample_path_diversity": diversity,
+        }
+        rows.append(row)
+        plotted.append(
+            {
+                "positions": positions,
+                "sides": sides,
+                "current_state": states[traj_id, t].copy(),
+                "top": top,
+                "bottom": bottom,
+                "entropy": entropy,
+            }
+        )
+
+    plot_multimodal_samples(plotted, env_cfg, run_dir / "multimodal_samples.png")
+    if not rows:
+        return {}
+    return {
+        f"multimodal_{key}": float(np.mean([row[key] for row in rows]))
+        for key in rows[0].keys()
+    }
+
+
 def selection_score(metrics: dict[str, float]) -> float:
+    if "path_sinkhorn" in metrics:
+        return metrics["path_sinkhorn"]
     return metrics["action_mse"] + 0.15 * metrics["action_endpoint_mse"]
 
 
@@ -487,7 +801,7 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
     run_dir = root / "runs" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    env_cfg = PointObstacleConfig()
+    env_cfg = make_env_config(cfg)
     train_loader, test_loader, data_file = make_loaders(root, cfg, env_cfg)
     device = get_device(cfg.device)
     model = make_model(cfg).to(device)
@@ -497,7 +811,7 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
     best_score = float("inf")
     best_state = None
     best_epoch = -1
-    use_batch_bar = cfg.model.type == "sinkhorn_bridge"
+    use_batch_bar = cfg.model.type in ("sinkhorn_bridge", "latent_sinkhorn_bridge")
     epoch_iter = range(cfg.train.epochs) if use_batch_bar else tqdm(
         range(cfg.train.epochs),
         desc="epochs",
@@ -530,6 +844,7 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
                 batch_iter.set_postfix(
                     loss=f"{sums.get('loss', 0.0) / max(1, count):.4f}",
                     sinkhorn=f"{sums.get('sinkhorn', 0.0) / max(1, count):.4f}",
+                    path=f"{sums.get('path_sinkhorn', 0.0) / max(1, count):.4f}",
                     bridge=f"{sums.get('bridge', 0.0) / max(1, count):.4f}",
                     div=f"{sums.get('diversity', 0.0) / max(1, count):.4f}",
                     refresh=False,
@@ -565,9 +880,11 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
         model.load_state_dict(best_state)
     action_metrics = evaluate_actions(model, test_loader, device, cfg)
     rollout_metrics = rollout_policy(model, data_file, device, cfg, env_cfg, run_dir)
+    multimodal_metrics = evaluate_multimodality(model, data_file, device, cfg, env_cfg, run_dir)
     metrics = {
         **action_metrics,
         **rollout_metrics,
+        **multimodal_metrics,
         "run_name": run_name,
         "model_type": cfg.model.type,
         "init_type": cfg.model.get("init_type", "none"),

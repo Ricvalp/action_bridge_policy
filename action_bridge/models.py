@@ -283,3 +283,130 @@ class SinkhornActionBridgePolicy(nn.Module):
     @property
     def network_evals(self) -> int:
         return self.horizon
+
+
+class LatentSinkhornActionBridgePolicy(nn.Module):
+    """Particle bridge with latent mode memory and decoded action paths.
+
+    Each particle evolves in a small latent execution state `y_k = (a_k, z_k)`.
+    Only the action coordinate is supervised and executed; the latent coordinate
+    gives the particle a place to store unresolved intent, such as "go above" vs
+    "go below", before the generated action path branches.
+    """
+
+    def __init__(
+        self,
+        context: int,
+        horizon: int,
+        state_dim: int = 4,
+        action_dim: int = 2,
+        history_dim: int = 96,
+        hidden_dim: int = 192,
+        tau: float = 0.35,
+        init_type: str = "prev_action",
+        init_noise_scale: float = 0.05,
+        particles: int = 16,
+        latent_dim: int = 8,
+        latent_init_scale: float = 1.0,
+        latent_limit: float = 2.0,
+        action_limit: float = 1.0,
+        use_context_actions: bool = True,
+    ):
+        super().__init__()
+        if init_type not in ("prev_action", "zero", "gaussian"):
+            raise ValueError(f"Unknown init_type: {init_type}")
+        self.horizon = horizon
+        self.action_dim = action_dim
+        self.tau = tau
+        self.init_type = init_type
+        self.init_noise_scale = init_noise_scale
+        self.particles = particles
+        self.latent_dim = latent_dim
+        self.latent_init_scale = latent_init_scale
+        self.latent_limit = latent_limit
+        self.action_limit = action_limit
+        self.encoder = ActionContextEncoder(
+            context, state_dim, action_dim, history_dim, hidden_dim, use_context_actions
+        )
+        block_dim = action_dim + latent_dim + history_dim + 1
+        self.blocks = nn.ModuleList(
+            [mlp([block_dim, hidden_dim, hidden_dim, action_dim + latent_dim]) for _ in range(horizon)]
+        )
+
+    def initial_action_particles(self, context_actions: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+        batch_size = context_actions.shape[0]
+        device = context_actions.device
+        dtype = context_actions.dtype
+        if self.init_type == "prev_action":
+            base = context_actions[:, -1, None, :].expand(batch_size, self.particles, self.action_dim)
+            noise = torch.zeros_like(base) if deterministic else self.init_noise_scale * torch.randn_like(base)
+            return self.action_limit * torch.tanh(base + noise)
+        if self.init_type == "zero":
+            base = torch.zeros(batch_size, self.particles, self.action_dim, device=device, dtype=dtype)
+            noise = torch.zeros_like(base) if deterministic else self.init_noise_scale * torch.randn_like(base)
+            return self.action_limit * torch.tanh(base + noise)
+        if deterministic:
+            return torch.zeros(batch_size, self.particles, self.action_dim, device=device, dtype=dtype)
+        return self.action_limit * torch.tanh(
+            self.init_noise_scale * torch.randn(batch_size, self.particles, self.action_dim, device=device, dtype=dtype)
+        )
+
+    def initial_latents(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        deterministic: bool = False,
+    ) -> torch.Tensor:
+        if deterministic:
+            return torch.zeros(batch_size, self.particles, self.latent_dim, device=device, dtype=dtype)
+        return self.latent_init_scale * torch.randn(
+            batch_size, self.particles, self.latent_dim, device=device, dtype=dtype
+        )
+
+    def squash_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        if self.latent_limit <= 0:
+            return latent
+        return self.latent_limit * torch.tanh(latent / self.latent_limit)
+
+    def forward(self, batch: dict[str, torch.Tensor], deterministic: bool = False) -> dict[str, torch.Tensor]:
+        context_states = batch["context_states"]
+        context_actions = batch["context_actions"]
+        h = self.encoder(context_states, context_actions)
+        action = self.initial_action_particles(context_actions, deterministic=deterministic)
+        latent = self.initial_latents(action.shape[0], action.device, action.dtype, deterministic=deterministic)
+        init_particles = action
+        init_latents = latent
+        h_particles = h[:, None, :].expand(-1, self.particles, -1)
+        actions = []
+        latents = []
+        for k, block in enumerate(self.blocks):
+            time = torch.full(
+                (action.shape[0], self.particles, 1),
+                k / max(1, self.horizon - 1),
+                device=action.device,
+                dtype=action.dtype,
+            )
+            flat = torch.cat([action, latent, h_particles, time], dim=-1).reshape(action.shape[0] * self.particles, -1)
+            delta = block(flat).reshape(action.shape[0], self.particles, self.action_dim + self.latent_dim)
+            action_delta = delta[..., : self.action_dim]
+            latent_delta = delta[..., self.action_dim :]
+            action = self.action_limit * torch.tanh(action + self.tau * action_delta)
+            latent = self.squash_latent(latent + self.tau * latent_delta)
+            actions.append(action)
+            latents.append(latent)
+        particles = torch.stack(actions, dim=2)
+        latent_particles = torch.stack(latents, dim=2)
+        return {
+            "actions": particles.mean(dim=1),
+            "particles": particles,
+            "latent_particles": latent_particles,
+            "init_particles": init_particles,
+            "init_latents": init_latents,
+            "init_action": init_particles.mean(dim=1),
+            "history": h,
+        }
+
+    @property
+    def network_evals(self) -> int:
+        return self.horizon
