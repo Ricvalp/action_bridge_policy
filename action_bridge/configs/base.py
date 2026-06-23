@@ -42,6 +42,11 @@ def get_config() -> ConfigDict:
     cfg.model.latent_dim = 8
     cfg.model.latent_init_scale = 1.0
     cfg.model.latent_limit = 2.0
+    cfg.model.diffusion_steps = 50
+    cfg.model.diffusion_beta_start = 1e-4
+    cfg.model.diffusion_beta_end = 0.02
+    cfg.model.diffusion_time_dim = 32
+    cfg.model.diffusion_eval_samples = 24
 
     cfg.train = ConfigDict()
     cfg.train.epochs = 12
@@ -83,6 +88,7 @@ def get_config() -> ConfigDict:
     cfg.loss.path_context_weight = 1.0
     cfg.loss.mean_action_weight = 0.0
     cfg.loss.diversity_weight = 0.0
+    cfg.loss.diffusion_weight = 1.0
 
     cfg.eval = ConfigDict()
     cfg.eval.rollout_episodes = 96

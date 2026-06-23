@@ -9,8 +9,8 @@ from pathlib import Path
 from ml_collections import config_dict
 import torch
 
-from .data import generate_dataset
-from .train import (
+from ..data import generate_dataset
+from ..train import (
     dataset_path,
     evaluate_position_marginals,
     experiment_root,

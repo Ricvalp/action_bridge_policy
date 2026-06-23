@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 def mlp(dims: list[int], activation: type[nn.Module] = nn.SiLU) -> nn.Sequential:
@@ -46,6 +49,172 @@ class ActionContextEncoder(nn.Module):
             dim=-1,
         )
         return self.net(flat)
+
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """Embed integer diffusion timesteps with fixed sinusoidal features."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        half_dim = self.dim // 2
+        if half_dim <= 0:
+            return timesteps[:, None].float()
+        scale = math.log(10000.0) / max(1, half_dim - 1)
+        freqs = torch.exp(
+            -scale * torch.arange(half_dim, device=timesteps.device, dtype=torch.float32)
+        )
+        args = timesteps.float()[:, None] * freqs[None]
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        if emb.shape[-1] < self.dim:
+            emb = F.pad(emb, (0, self.dim - emb.shape[-1]))
+        return emb.to(dtype=torch.float32)
+
+
+class DiffusionActionPolicy(nn.Module):
+    """Context-conditioned DDPM baseline over full action chunks."""
+
+    def __init__(
+        self,
+        context: int,
+        horizon: int,
+        state_dim: int = 4,
+        action_dim: int = 2,
+        history_dim: int = 96,
+        hidden_dim: int = 192,
+        diffusion_steps: int = 50,
+        beta_start: float = 1e-4,
+        beta_end: float = 0.02,
+        time_dim: int = 32,
+        eval_samples: int = 24,
+        action_limit: float = 1.0,
+        use_context_actions: bool = True,
+    ):
+        super().__init__()
+        if diffusion_steps <= 0:
+            raise ValueError("diffusion_steps must be positive.")
+        self.horizon = horizon
+        self.action_dim = action_dim
+        self.diffusion_steps = diffusion_steps
+        self.eval_samples = eval_samples
+        self.action_limit = action_limit
+        self.encoder = ActionContextEncoder(
+            context, state_dim, action_dim, history_dim, hidden_dim, use_context_actions
+        )
+        self.time_embedding = SinusoidalTimeEmbedding(time_dim)
+        path_dim = horizon * action_dim
+        self.denoiser = mlp([path_dim + history_dim + time_dim, hidden_dim, hidden_dim, path_dim])
+
+        betas = torch.linspace(beta_start, beta_end, diffusion_steps, dtype=torch.float32)
+        alphas = 1.0 - betas
+        alpha_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alpha_cumprod", alpha_cumprod)
+        self.register_buffer("sqrt_recip_alphas", torch.rsqrt(alphas))
+        self.register_buffer("sqrt_alpha_cumprod", torch.sqrt(alpha_cumprod))
+        self.register_buffer("sqrt_one_minus_alpha_cumprod", torch.sqrt(1.0 - alpha_cumprod))
+
+    def predict_noise(
+        self,
+        noisy_actions: torch.Tensor,
+        timesteps: torch.Tensor,
+        history: torch.Tensor,
+    ) -> torch.Tensor:
+        flat_actions = noisy_actions.reshape(noisy_actions.shape[0], -1)
+        time_emb = self.time_embedding(timesteps).to(device=history.device, dtype=history.dtype)
+        pred = self.denoiser(torch.cat([flat_actions, history, time_emb], dim=-1))
+        return pred.reshape(noisy_actions.shape[0], self.horizon, self.action_dim)
+
+    def training_loss(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        context_states = batch["context_states"]
+        context_actions = batch["context_actions"]
+        target = batch["future_actions"]
+        history = self.encoder(context_states, context_actions)
+        timesteps = torch.randint(
+            0,
+            self.diffusion_steps,
+            (target.shape[0],),
+            device=target.device,
+        )
+        noise = torch.randn_like(target)
+        sqrt_alpha = self.sqrt_alpha_cumprod[timesteps][:, None, None].to(dtype=target.dtype)
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod[timesteps][:, None, None].to(dtype=target.dtype)
+        noisy = sqrt_alpha * target + sqrt_one_minus_alpha * noise
+        pred_noise = self.predict_noise(noisy, timesteps, history)
+        diffusion_loss = F.mse_loss(pred_noise, noise)
+        pred_x0 = (noisy - sqrt_one_minus_alpha * pred_noise) / sqrt_alpha.clamp_min(1e-8)
+        pred_x0 = pred_x0.clamp(-self.action_limit, self.action_limit)
+        return {
+            "loss": diffusion_loss,
+            "actions": pred_x0,
+            "init_action": context_actions[:, -1],
+            "history": history,
+            "diffusion": diffusion_loss,
+            "timesteps": timesteps,
+        }
+
+    @torch.no_grad()
+    def sample_particles(
+        self,
+        batch: dict[str, torch.Tensor],
+        deterministic: bool = False,
+        samples: int | None = None,
+    ) -> torch.Tensor:
+        context_states = batch["context_states"]
+        context_actions = batch["context_actions"]
+        history = self.encoder(context_states, context_actions)
+        sample_count = samples if samples is not None else (1 if deterministic else self.eval_samples)
+        sample_count = max(1, int(sample_count))
+        batch_size = history.shape[0]
+        history_particles = history[:, None, :].expand(batch_size, sample_count, -1)
+        history_flat = history_particles.reshape(batch_size * sample_count, -1)
+        shape = (batch_size * sample_count, self.horizon, self.action_dim)
+        if deterministic:
+            actions = torch.zeros(shape, device=history.device, dtype=history.dtype)
+        else:
+            actions = torch.randn(shape, device=history.device, dtype=history.dtype)
+
+        for step in range(self.diffusion_steps - 1, -1, -1):
+            timesteps = torch.full(
+                (actions.shape[0],),
+                step,
+                device=actions.device,
+                dtype=torch.long,
+            )
+            pred_noise = self.predict_noise(actions, timesteps, history_flat)
+            beta = self.betas[step].to(dtype=actions.dtype)
+            sqrt_one_minus_alpha_cumprod = self.sqrt_one_minus_alpha_cumprod[step].to(dtype=actions.dtype)
+            mean = self.sqrt_recip_alphas[step].to(dtype=actions.dtype) * (
+                actions - beta * pred_noise / sqrt_one_minus_alpha_cumprod.clamp_min(1e-8)
+            )
+            if step > 0 and not deterministic:
+                actions = mean + torch.sqrt(beta) * torch.randn_like(actions)
+            else:
+                actions = mean
+
+        actions = actions.clamp(-self.action_limit, self.action_limit)
+        return actions.reshape(batch_size, sample_count, self.horizon, self.action_dim)
+
+    def forward(self, batch: dict[str, torch.Tensor], deterministic: bool = False) -> dict[str, torch.Tensor]:
+        particles = self.sample_particles(batch, deterministic=deterministic)
+        if deterministic or particles.shape[1] == 1:
+            actions = particles[:, 0]
+        else:
+            actions = particles.mean(dim=1)
+        history = self.encoder(batch["context_states"], batch["context_actions"])
+        return {
+            "actions": actions,
+            "particles": particles,
+            "init_action": batch["context_actions"][:, -1],
+            "history": history,
+        }
+
+    @property
+    def network_evals(self) -> int:
+        return self.diffusion_steps
 
 
 class ChunkMLPPolicy(nn.Module):

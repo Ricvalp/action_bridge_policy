@@ -8,7 +8,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .data import PointObstacleConfig
+from ..data import PointObstacleConfig
 
 
 def parse_args() -> argparse.Namespace:

@@ -22,6 +22,7 @@ Here bridge time is execution time, so the intermediate outputs are the future a
 
 - `regression`: deterministic MLP action-chunk regression.
 - `gaussian_chunk`: MLP chunk generator conditioned on Gaussian noise.
+- `diffusion_delayed_modes`: context-conditioned diffusion policy over full action chunks on the delayed-mode dataset.
 - `bridge_no_energy`: previous-action initialized residual action bridge with no path-energy term.
 - `bridge_prev`: previous-action initialized residual action bridge with path energy.
 - `bridge_gaussian`: Gaussian-initialized residual bridge with path energy.
@@ -94,6 +95,17 @@ uv run python -m action_bridge.train \
   --config.data.num_trajectories=1000 \
   --config.train.batch_size=64 \
   --config.model.particles=24 \
+  --config.device=cuda
+```
+
+Run the matched delayed-branch diffusion policy baseline:
+
+```bash
+uv run python -m action_bridge.train_diffusion \
+  --config.run_name=diffusion_delayed_modes_full \
+  --config.train.epochs=12 \
+  --config.data.num_trajectories=1000 \
+  --config.train.batch_size=64 \
   --config.device=cuda
 ```
 

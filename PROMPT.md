@@ -95,14 +95,19 @@ sandbox/action_bridge_policy/
     losses.py
     models.py
     train.py
+    train_diffusion.py
     run_all.py
-    visualize_data.py
-    visualize_metric_geodesic.py
-    visualize_sb_action_distributions.py
-    visualize_sb_push_t_intuition.py
+    visualizations/
+      visualize_data.py
+      visualize_gt_marginals.py
+      visualize_metric_geodesic.py
+      visualize_model_marginals.py
+      visualize_sb_action_distributions.py
+      visualize_sb_push_t_intuition.py
     configs/
       base.py
       regression.py
+      diffusion_delayed_modes.py
       gaussian_chunk.py
       bridge_no_energy.py
       bridge_prev.py
@@ -290,7 +295,7 @@ time_index:      chunk start index
 Dataset visualization code exists:
 
 ```text
-action_bridge/visualize_data.py
+action_bridge/visualizations/visualize_data.py
 ```
 
 Run:
@@ -298,7 +303,7 @@ Run:
 ```bash
 cd sandbox/action_bridge_policy
 
-uv run python -m action_bridge.visualize_data \
+uv run python -m action_bridge.visualizations.visualize_data \
   --dataset=data/point_modes_prefix6_n128_t36_s7.npz \
   --out_dir=runs/dataset_viz \
   --max_trajectories=96 \
@@ -1007,11 +1012,15 @@ If `bridge_prev` does not beat `bridge_no_energy`, then bridge path energy may o
 
 It is only a cheap Gaussian-conditioned one-shot baseline.
 
-6. The current latent path-Sinkhorn model is not the full non-conservative/contact-Hamiltonian CWG formulation.
+6. `diffusion_delayed_modes` is the matched diffusion policy baseline.
+
+It denoises full action chunks from Gaussian noise, conditioned on the same `context_states` and `context_actions` as the bridge policies. Use `python -m action_bridge.train_diffusion` for the dedicated diffusion entrypoint.
+
+7. The current latent path-Sinkhorn model is not the full non-conservative/contact-Hamiltonian CWG formulation.
 
 It is a conditional particle ResNet with local PyTorch Sinkhorn losses. It borrows the particle-cloud / transport-step / Sinkhorn-matching style, but it is not a faithful reproduction of the whole Contact Wasserstein Geodesics method.
 
-7. Path-level Sinkhorn can be batch-sensitive.
+8. Path-level Sinkhorn can be batch-sensitive.
 
 The target empirical distribution is built from the minibatch. Large enough batches help the model see nearby contexts and both modes. If mode coverage looks unstable, try:
 
@@ -1022,11 +1031,11 @@ smaller/larger path_context_weight
 more trajectories
 ```
 
-8. `loss.bridge_weight = 0.0` in the current latent config on purpose.
+9. `loss.bridge_weight = 0.0` in the current latent config on purpose.
 
 The first goal is to test whether path-level Sinkhorn learns multimodal coherent action chunks. Add CWG-style consecutive-marginal bridge energy only after the path-level experiment is understood.
 
-9. Generated `.venv`, `data/`, and `runs/` are gitignored.
+10. Generated `.venv`, `data/`, and `runs/` are gitignored.
 
 Do not treat them as source files.
 
@@ -1052,7 +1061,7 @@ runs/<run-name>/multimodal_samples.png
 4. Visualize the dataset:
 
 ```bash
-uv run python -m action_bridge.visualize_data \
+uv run python -m action_bridge.visualizations.visualize_data \
   --dataset=data/point_modes_prefix6_n128_t36_s7.npz \
   --split=all
 ```

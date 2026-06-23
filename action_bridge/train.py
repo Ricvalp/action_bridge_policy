@@ -36,6 +36,7 @@ from .losses import (
 )
 from .models import (
     ChunkMLPPolicy,
+    DiffusionActionPolicy,
     LatentSinkhornActionBridgePolicy,
     ResidualActionBridgePolicy,
     SinkhornActionBridgePolicy,
@@ -43,11 +44,7 @@ from .models import (
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "bridge_prev.py"
-_CONFIG = config_flags.DEFINE_config_file(
-    "config",
-    str(DEFAULT_CONFIG),
-    "Path to an ml_collections config file.",
-)
+_CONFIG = None
 
 
 def get_device(name: str) -> torch.device:
@@ -214,6 +211,22 @@ def make_model(cfg: config_dict.ConfigDict) -> torch.nn.Module:
     )
     if cfg.model.type == "chunk":
         return ChunkMLPPolicy(**common)
+    if cfg.model.type == "diffusion":
+        return DiffusionActionPolicy(
+            context=cfg.data.context,
+            horizon=cfg.data.horizon,
+            state_dim=cfg.model.state_dim,
+            action_dim=cfg.model.action_dim,
+            history_dim=cfg.model.history_dim,
+            hidden_dim=cfg.model.hidden_dim,
+            diffusion_steps=cfg.model.get("diffusion_steps", 50),
+            beta_start=cfg.model.get("diffusion_beta_start", 1e-4),
+            beta_end=cfg.model.get("diffusion_beta_end", 0.02),
+            time_dim=cfg.model.get("diffusion_time_dim", 32),
+            eval_samples=cfg.model.get("diffusion_eval_samples", cfg.model.get("particles", 24)),
+            action_limit=cfg.model.action_limit,
+            use_context_actions=cfg.model.get("use_context_actions", True),
+        )
     if cfg.model.type == "bridge":
         return ResidualActionBridgePolicy(
             **common,
@@ -281,6 +294,32 @@ def path_context_features(
 
 
 def compute_loss(batch: dict[str, torch.Tensor], model: torch.nn.Module, cfg: config_dict.ConfigDict):
+    if cfg.model.type == "diffusion":
+        out = model.training_loss(batch)
+        pred = out["actions"]
+        target = batch["future_actions"]
+        diffusion_loss = out["diffusion"]
+        action_loss = F.mse_loss(pred, target)
+        endpoint_loss = F.mse_loss(pred[:, -1], target[:, -1])
+        first_loss = F.mse_loss(pred[:, 0], target[:, 0])
+        jerk = action_jerk_loss(pred, batch["context_actions"])
+        total = (
+            cfg.loss.get("diffusion_weight", 1.0) * diffusion_loss
+            + cfg.loss.action_weight * action_loss
+            + cfg.loss.endpoint_weight * endpoint_loss
+            + cfg.loss.first_action_weight * first_loss
+            + cfg.loss.jerk_weight * jerk
+        )
+        parts = {
+            "loss": total.detach(),
+            "diffusion": diffusion_loss.detach(),
+            "action": action_loss.detach(),
+            "endpoint": endpoint_loss.detach(),
+            "first": first_loss.detach(),
+            "jerk": jerk.detach(),
+        }
+        return total, parts
+
     out = model(batch, deterministic=False)
     pred = out["actions"]
     target = batch["future_actions"]
@@ -1096,7 +1135,7 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
     best_state = None
     best_epoch = -1
     global_step = 0
-    use_batch_bar = cfg.model.type in ("sinkhorn_bridge", "latent_sinkhorn_bridge")
+    use_batch_bar = cfg.model.type in ("sinkhorn_bridge", "latent_sinkhorn_bridge", "diffusion")
     epoch_iter = range(cfg.train.epochs) if use_batch_bar else tqdm(
         range(cfg.train.epochs),
         desc="epochs",
@@ -1245,8 +1284,15 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
 def main(argv) -> None:
     if len(argv) > 1:
         raise app.UsageError(f"Unknown arguments: {argv[1:]}")
+    if _CONFIG is None:
+        raise app.UsageError("No config flag was registered.")
     train_from_config(_CONFIG.value)
 
 
 if __name__ == "__main__":
+    _CONFIG = config_flags.DEFINE_config_file(
+        "config",
+        str(DEFAULT_CONFIG),
+        "Path to an ml_collections config file.",
+    )
     app.run(main)
