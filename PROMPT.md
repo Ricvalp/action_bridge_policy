@@ -110,8 +110,6 @@ sandbox/action_bridge_policy/
       sinkhorn_bridge.py
       sinkhorn_bridge_state_only.py
       latent_path_sinkhorn_delayed_modes.py
-      latent_path_sinkhorn_delayed_modes_long_prefix.py
-      latent_path_sinkhorn_delayed_modes_short.py
       latent_marginal_sinkhorn_delayed_modes.py
   data/       # generated, gitignored
   runs/       # generated, gitignored

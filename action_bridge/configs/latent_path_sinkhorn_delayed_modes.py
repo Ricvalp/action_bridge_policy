@@ -1,4 +1,10 @@
-"""Latent path-Sinkhorn bridge on delayed-branch top/bottom modes."""
+"""Latent path-Sinkhorn bridge on delayed-branch top/bottom modes.
+
+The dataset keeps top/bottom demonstrations identical for a longer moving
+prefix before the branch. This creates several training windows where the
+history is genuinely ambiguous but the future path can still commit to either
+mode.
+"""
 
 from __future__ import annotations
 
@@ -10,8 +16,8 @@ def get_config():
 
     cfg.data.context = 6
     cfg.data.horizon = 18
-    cfg.data.shared_prefix_steps = 6
-    cfg.data.shared_prefix_speed = 0.55
+    cfg.data.shared_prefix_steps = 12
+    cfg.data.shared_prefix_speed = 0.28
     cfg.data.shared_prefix_target_x = 0.30
     cfg.data.paired_modes = True
 

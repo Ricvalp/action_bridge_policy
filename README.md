@@ -27,9 +27,7 @@ Here bridge time is execution time, so the intermediate outputs are the future a
 - `bridge_gaussian`: Gaussian-initialized residual bridge with path energy.
 - `sinkhorn_bridge`: probabilistic particle bridge with Sinkhorn marginal matching.
 - `sinkhorn_bridge_state_only`: more ambiguous Sinkhorn ablation without action-history conditioning.
-- `latent_path_sinkhorn_delayed_modes`: latent particle bridge trained with path-level Sinkhorn matching on the delayed-branch dataset.
-- `latent_path_sinkhorn_delayed_modes_short`: same path-level delayed-mode setup with a shorter action horizon to reduce late near-goal dominance.
-- `latent_path_sinkhorn_delayed_modes_long_prefix`: same path-level delayed-mode setup with a longer shared moving prefix before the top/bottom fork.
+- `latent_path_sinkhorn_delayed_modes`: latent particle bridge trained with path-level Sinkhorn matching on the delayed-branch dataset with a long shared moving prefix before the top/bottom fork.
 - `latent_marginal_sinkhorn_delayed_modes`: latent particle bridge trained only with per-timestep Sinkhorn marginal matching on the delayed-branch dataset.
 
 `bridge_no_energy` is the most important sanity baseline: if `bridge_prev` does not beat it, the path/bridge objective is probably not adding much.
