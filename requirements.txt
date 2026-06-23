@@ -3,3 +3,4 @@ torch
 matplotlib
 ml-collections<1.1.0
 tqdm
+wandb

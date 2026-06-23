@@ -123,6 +123,30 @@ Each run contains:
 - `rollouts.png`
 - `multimodal_samples.png` for configs with `eval.multimodal_examples > 0`
 - `position_marginals.png` for configs with `eval.marginal_examples > 0`
+- `training_path_plots/step_*.png` when `logging.path_plot_every_steps > 0`
+
+## W&B Logging
+
+W&B is off by default so local breakpoint debugging stays lightweight. Enable it with config overrides:
+
+```bash
+uv run python -m action_bridge.train \
+  --config=action_bridge/configs/latent_path_sinkhorn_delayed_modes.py \
+  --config.logging.wandb=True \
+  --config.logging.wandb_project=action-bridge-policy \
+  --config.logging.log_every_steps=25 \
+  --config.logging.path_plot_every_steps=100 \
+  --config.device=cuda
+```
+
+Useful logging knobs:
+
+- `logging.wandb`: enable/disable W&B.
+- `logging.wandb_mode`: use `online`, `offline`, or `disabled`.
+- `logging.log_every_steps`: scalar training metrics frequency.
+- `logging.path_plot_every_steps`: predicted-vs-target path snapshot frequency; `0` disables it.
+- `logging.path_plot_examples`: batch examples per snapshot.
+- `logging.path_plot_particles`: generated particles shown per example.
 
 ## Readout
 

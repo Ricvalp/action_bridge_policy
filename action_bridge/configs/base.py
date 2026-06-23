@@ -51,6 +51,18 @@ def get_config() -> ConfigDict:
     cfg.train.grad_clip = 5.0
     cfg.train.num_workers = 0
 
+    cfg.logging = ConfigDict()
+    cfg.logging.wandb = False
+    cfg.logging.wandb_project = "action-bridge-policy"
+    cfg.logging.wandb_entity = ""
+    cfg.logging.wandb_group = ""
+    cfg.logging.wandb_mode = "online"
+    cfg.logging.log_every_steps = 50
+    cfg.logging.path_plot_every_steps = 0
+    cfg.logging.path_plot_examples = 4
+    cfg.logging.path_plot_particles = 12
+    cfg.logging.save_local_path_plots = True
+
     cfg.loss = ConfigDict()
     cfg.loss.action_weight = 1.0
     cfg.loss.endpoint_weight = 0.15

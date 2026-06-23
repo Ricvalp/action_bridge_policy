@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=2.0.2",
     "tqdm>=4.67.1",
     "torch==2.11.*",
+    "wandb>=0.18.7",
 ]
 
 [tool.uv]

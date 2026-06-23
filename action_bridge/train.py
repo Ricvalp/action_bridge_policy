@@ -76,6 +76,39 @@ def cfg_to_dict(value):
     return value
 
 
+def maybe_init_wandb(cfg: config_dict.ConfigDict, run_name: str, run_dir: Path):
+    logging_cfg = cfg.get("logging", {})
+    if not bool(logging_cfg.get("wandb", False)):
+        return None
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError(
+            "W&B logging is enabled, but `wandb` is not installed. "
+            "Run `uv sync` from sandbox/action_bridge_policy, or disable it with "
+            "`--config.logging.wandb=False`."
+        ) from exc
+
+    init_kwargs = {
+        "project": logging_cfg.get("wandb_project", "action-bridge-policy"),
+        "name": run_name,
+        "config": cfg_to_dict(cfg),
+        "dir": str(run_dir),
+        "mode": logging_cfg.get("wandb_mode", "online"),
+    }
+    if logging_cfg.get("wandb_entity", ""):
+        init_kwargs["entity"] = logging_cfg.get("wandb_entity")
+    if logging_cfg.get("wandb_group", ""):
+        init_kwargs["group"] = logging_cfg.get("wandb_group")
+    return wandb.init(**init_kwargs)
+
+
+def wandb_image(path: Path):
+    import wandb
+
+    return wandb.Image(str(path))
+
+
 def experiment_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -646,6 +679,71 @@ def rollout_open_loop(
     return np.asarray(positions, dtype=np.float32), float(np.mean(contacts)) if contacts else 0.0
 
 
+def plot_training_path_snapshot(
+    batch: dict[str, torch.Tensor],
+    out: dict[str, torch.Tensor],
+    env_cfg: PointObstacleConfig,
+    path: Path,
+    max_examples: int,
+    max_particles: int,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    context_states = batch["context_states"].detach().cpu().numpy()
+    target_actions = batch["future_actions"].detach().cpu().numpy()
+    modes = batch.get("mode")
+    time_indices = batch.get("time_index")
+    mode_np = modes.detach().cpu().numpy() if modes is not None else np.zeros(context_states.shape[0], dtype=np.int64)
+    time_np = (
+        time_indices.detach().cpu().numpy()
+        if time_indices is not None
+        else np.zeros(context_states.shape[0], dtype=np.int64)
+    )
+    if "particles" in out:
+        pred_chunks = out["particles"].detach().cpu().numpy()
+    else:
+        pred_chunks = out["actions"][:, None].detach().cpu().numpy()
+
+    num_examples = min(max_examples, context_states.shape[0])
+    num_particles = min(max_particles, pred_chunks.shape[1])
+    if num_examples <= 0 or num_particles <= 0:
+        return
+
+    particle_ids = np.linspace(0, pred_chunks.shape[1] - 1, num_particles, dtype=np.int64)
+    cols = min(2, num_examples)
+    rows = int(np.ceil(num_examples / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(3.6 * cols, 3.6 * rows), squeeze=False)
+    theta = np.linspace(0.0, 2.0 * np.pi, 96)
+    ox = env_cfg.obstacle_center_x + env_cfg.obstacle_radius * np.cos(theta)
+    oy = env_cfg.obstacle_center_y + env_cfg.obstacle_radius * np.sin(theta)
+
+    for plot_idx, ax in enumerate(axes.flat):
+        if plot_idx >= num_examples:
+            ax.axis("off")
+            continue
+        state = context_states[plot_idx, -1]
+        target_pos, _ = rollout_open_loop(state, target_actions[plot_idx], env_cfg)
+        for particle_idx in particle_ids:
+            pred_pos, _ = rollout_open_loop(state, pred_chunks[plot_idx, particle_idx], env_cfg)
+            ax.plot(pred_pos[:, 0], pred_pos[:, 1], color="#4c78a8", alpha=0.24, linewidth=0.9)
+        ax.plot(target_pos[:, 0], target_pos[:, 1], color="black", linewidth=2.2, label="target")
+        ax.scatter(state[0], state[1], color="#2ca02c", s=28, zorder=3, label="start")
+        ax.scatter(state[2], state[3], color="#d62728", marker="*", s=70, zorder=3, label="goal")
+        ax.plot(ox, oy, color="black", linewidth=1.0)
+        mode_name = "top" if int(mode_np[plot_idx]) > 0 else "bottom"
+        ax.set_title(f"t={int(time_np[plot_idx])} target={mode_name}", fontsize=9)
+        ax.set_xlim(env_cfg.box_min, env_cfg.box_max)
+        ax.set_ylim(env_cfg.box_min, env_cfg.box_max)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.18)
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
 def mode_entropy(top_count: int, bottom_count: int) -> float:
     total = top_count + bottom_count
     if total == 0:
@@ -987,11 +1085,17 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
     device = get_device(cfg.device)
     model = make_model(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+    wandb_run = maybe_init_wandb(cfg, run_name, run_dir)
+    logging_cfg = cfg.get("logging", {})
+    log_every_steps = int(logging_cfg.get("log_every_steps", 0))
+    path_plot_every_steps = int(logging_cfg.get("path_plot_every_steps", 0))
+    save_local_path_plots = bool(logging_cfg.get("save_local_path_plots", True))
 
     history = []
     best_score = float("inf")
     best_state = None
     best_epoch = -1
+    global_step = 0
     use_batch_bar = cfg.model.type in ("sinkhorn_bridge", "latent_sinkhorn_bridge")
     epoch_iter = range(cfg.train.epochs) if use_batch_bar else tqdm(
         range(cfg.train.epochs),
@@ -1019,8 +1123,39 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
             opt.step()
             count += 1
+            global_step += 1
             for key, value in parts.items():
                 sums[key] = sums.get(key, 0.0) + float(value.item())
+            if wandb_run is not None and log_every_steps > 0 and global_step % log_every_steps == 0:
+                wandb_run.log(
+                    {
+                        **{f"train_step/{key}": float(value.item()) for key, value in parts.items()},
+                        "train_step/epoch": epoch,
+                        "train_step/lr": float(opt.param_groups[0]["lr"]),
+                    },
+                    step=global_step,
+                )
+            if path_plot_every_steps > 0 and global_step % path_plot_every_steps == 0:
+                if save_local_path_plots or wandb_run is not None:
+                    was_training = model.training
+                    model.eval()
+                    with torch.no_grad():
+                        snapshot_out = model(batch, deterministic=False)
+                    if was_training:
+                        model.train()
+                    snapshot_path = run_dir / "training_path_plots" / f"step_{global_step:07d}.png"
+                    plot_training_path_snapshot(
+                        batch,
+                        snapshot_out,
+                        env_cfg,
+                        snapshot_path,
+                        max_examples=int(logging_cfg.get("path_plot_examples", 4)),
+                        max_particles=int(logging_cfg.get("path_plot_particles", 12)),
+                    )
+                    if wandb_run is not None and snapshot_path.exists():
+                        wandb_run.log({"train/path_snapshot": wandb_image(snapshot_path)}, step=global_step)
+                    if not save_local_path_plots and snapshot_path.exists():
+                        snapshot_path.unlink()
             if use_batch_bar:
                 batch_iter.set_postfix(
                     loss=f"{sums.get('loss', 0.0) / max(1, count):.4f}",
@@ -1038,6 +1173,16 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
         score = selection_score(eval_metrics)
         row["selection_score"] = score
         history.append(row)
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    **{f"train_epoch/{key}": float(value) for key, value in row.items() if key != "epoch"},
+                    **{f"test/{key}": float(value) for key, value in eval_metrics.items()},
+                    "epoch": epoch,
+                    "selection_score": float(score),
+                },
+                step=global_step,
+            )
         if score < best_score:
             best_score = score
             best_epoch = epoch
@@ -1085,6 +1230,14 @@ def train_from_config(cfg: config_dict.ConfigDict) -> dict[str, float]:
         json.dump(metrics, f, indent=2)
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(cfg_to_dict(cfg), f, indent=2)
+    if wandb_run is not None:
+        final_payload = {f"final/{key}": value for key, value in metrics.items() if isinstance(value, (int, float))}
+        for image_name in ("rollouts.png", "multimodal_samples.png", "position_marginals.png"):
+            image_path = run_dir / image_name
+            if image_path.exists():
+                final_payload[f"final/{image_path.stem}"] = wandb_image(image_path)
+        wandb_run.log(final_payload, step=global_step)
+        wandb_run.finish()
     print(json.dumps(metrics, indent=2))
     return metrics
 
