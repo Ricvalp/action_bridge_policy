@@ -21,6 +21,8 @@ def get_config():
     cfg.model.action_limit = 1.0
     cfg.model.use_context_actions = True
     cfg.model.diffusion_steps = 50
+    cfg.model.diffusion_inference_steps = 50
+    cfg.model.diffusion_schedule = "squaredcos_cap_v2"
     cfg.model.diffusion_beta_start = 1e-4
     cfg.model.diffusion_beta_end = 0.02
     cfg.model.diffusion_time_dim = 32

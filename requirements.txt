@@ -1,3 +1,4 @@
+diffusers
 numpy
 torch
 matplotlib

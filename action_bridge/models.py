@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+from diffusers import DDPMScheduler
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -73,6 +74,21 @@ class SinusoidalTimeEmbedding(nn.Module):
         return emb.to(dtype=torch.float32)
 
 
+def diffusers_beta_schedule(schedule: str) -> str:
+    """Map local schedule names to Diffusers scheduler names."""
+
+    aliases = {
+        "cosine": "squaredcos_cap_v2",
+        "squaredcos_cap_v2": "squaredcos_cap_v2",
+        "linear": "linear",
+        "scaled_linear": "scaled_linear",
+        "sigmoid": "sigmoid",
+    }
+    if schedule not in aliases:
+        raise ValueError(f"Unknown diffusion schedule: {schedule!r}.")
+    return aliases[schedule]
+
+
 class DiffusionActionPolicy(nn.Module):
     """Context-conditioned DDPM baseline over full action chunks."""
 
@@ -85,8 +101,10 @@ class DiffusionActionPolicy(nn.Module):
         history_dim: int = 96,
         hidden_dim: int = 192,
         diffusion_steps: int = 50,
+        inference_steps: int | None = None,
         beta_start: float = 1e-4,
         beta_end: float = 0.02,
+        schedule: str = "linear",
         time_dim: int = 32,
         eval_samples: int = 24,
         action_limit: float = 1.0,
@@ -98,6 +116,7 @@ class DiffusionActionPolicy(nn.Module):
         self.horizon = horizon
         self.action_dim = action_dim
         self.diffusion_steps = diffusion_steps
+        self.inference_steps = diffusion_steps if inference_steps is None else inference_steps
         self.eval_samples = eval_samples
         self.action_limit = action_limit
         self.encoder = ActionContextEncoder(
@@ -106,16 +125,35 @@ class DiffusionActionPolicy(nn.Module):
         self.time_embedding = SinusoidalTimeEmbedding(time_dim)
         path_dim = horizon * action_dim
         self.denoiser = mlp([path_dim + history_dim + time_dim, hidden_dim, hidden_dim, path_dim])
+        self.scheduler = DDPMScheduler(
+            num_train_timesteps=diffusion_steps,
+            beta_start=beta_start,
+            beta_end=beta_end,
+            beta_schedule=diffusers_beta_schedule(schedule),
+            prediction_type="epsilon",
+            clip_sample=False,
+        )
 
-        betas = torch.linspace(beta_start, beta_end, diffusion_steps, dtype=torch.float32)
-        alphas = 1.0 - betas
-        alpha_cumprod = torch.cumprod(alphas, dim=0)
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("alpha_cumprod", alpha_cumprod)
-        self.register_buffer("sqrt_recip_alphas", torch.rsqrt(alphas))
-        self.register_buffer("sqrt_alpha_cumprod", torch.sqrt(alpha_cumprod))
-        self.register_buffer("sqrt_one_minus_alpha_cumprod", torch.sqrt(1.0 - alpha_cumprod))
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs) -> None:
+        legacy_scheduler_keys = (
+            "betas",
+            "alphas",
+            "alpha_cumprod",
+            "posterior_variance",
+            "sqrt_recip_alphas",
+            "sqrt_alpha_cumprod",
+            "sqrt_one_minus_alpha_cumprod",
+        )
+        for key in legacy_scheduler_keys:
+            state_dict.pop(prefix + key, None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def move_scheduler_tensors(self, device: torch.device) -> None:
+        """Keep Diffusers scheduler tensors on the model input device."""
+
+        for name, value in vars(self.scheduler).items():
+            if torch.is_tensor(value):
+                setattr(self.scheduler, name, value.to(device=device))
 
     def predict_noise(
         self,
@@ -133,6 +171,7 @@ class DiffusionActionPolicy(nn.Module):
         context_actions = batch["context_actions"]
         target = batch["future_actions"]
         history = self.encoder(context_states, context_actions)
+        self.move_scheduler_tensors(target.device)
         timesteps = torch.randint(
             0,
             self.diffusion_steps,
@@ -140,11 +179,12 @@ class DiffusionActionPolicy(nn.Module):
             device=target.device,
         )
         noise = torch.randn_like(target)
-        sqrt_alpha = self.sqrt_alpha_cumprod[timesteps][:, None, None].to(dtype=target.dtype)
-        sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod[timesteps][:, None, None].to(dtype=target.dtype)
-        noisy = sqrt_alpha * target + sqrt_one_minus_alpha * noise
+        noisy = self.scheduler.add_noise(target, noise, timesteps)
         pred_noise = self.predict_noise(noisy, timesteps, history)
         diffusion_loss = F.mse_loss(pred_noise, noise)
+        alpha_cumprod = self.scheduler.alphas_cumprod.to(device=target.device, dtype=target.dtype)
+        sqrt_alpha = alpha_cumprod[timesteps][:, None, None].sqrt()
+        sqrt_one_minus_alpha = (1.0 - alpha_cumprod[timesteps])[:, None, None].sqrt()
         pred_x0 = (noisy - sqrt_one_minus_alpha * pred_noise) / sqrt_alpha.clamp_min(1e-8)
         pred_x0 = pred_x0.clamp(-self.action_limit, self.action_limit)
         return {
@@ -176,24 +216,30 @@ class DiffusionActionPolicy(nn.Module):
             actions = torch.zeros(shape, device=history.device, dtype=history.dtype)
         else:
             actions = torch.randn(shape, device=history.device, dtype=history.dtype)
+        actions = actions * self.scheduler.init_noise_sigma
+        self.move_scheduler_tensors(actions.device)
+        self.scheduler.set_timesteps(self.inference_steps, device=actions.device)
+        generator = None
+        if deterministic:
+            generator = torch.Generator(device=actions.device)
+            generator.manual_seed(0)
 
-        for step in range(self.diffusion_steps - 1, -1, -1):
-            timesteps = torch.full(
+        for step in self.scheduler.timesteps:
+            step = step.to(device=actions.device)
+            model_timesteps = torch.full(
                 (actions.shape[0],),
-                step,
+                int(step.item()),
                 device=actions.device,
                 dtype=torch.long,
             )
-            pred_noise = self.predict_noise(actions, timesteps, history_flat)
-            beta = self.betas[step].to(dtype=actions.dtype)
-            sqrt_one_minus_alpha_cumprod = self.sqrt_one_minus_alpha_cumprod[step].to(dtype=actions.dtype)
-            mean = self.sqrt_recip_alphas[step].to(dtype=actions.dtype) * (
-                actions - beta * pred_noise / sqrt_one_minus_alpha_cumprod.clamp_min(1e-8)
-            )
-            if step > 0 and not deterministic:
-                actions = mean + torch.sqrt(beta) * torch.randn_like(actions)
-            else:
-                actions = mean
+            pred_noise = self.predict_noise(actions, model_timesteps, history_flat)
+            actions = self.scheduler.step(
+                pred_noise,
+                step,
+                actions,
+                generator=generator,
+                return_dict=True,
+            ).prev_sample
 
         actions = actions.clamp(-self.action_limit, self.action_limit)
         return actions.reshape(batch_size, sample_count, self.horizon, self.action_dim)
@@ -214,7 +260,7 @@ class DiffusionActionPolicy(nn.Module):
 
     @property
     def network_evals(self) -> int:
-        return self.diffusion_steps
+        return self.inference_steps
 
 
 class ChunkMLPPolicy(nn.Module):

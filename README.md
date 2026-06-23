@@ -98,7 +98,8 @@ uv run python -m action_bridge.train \
   --config.device=cuda
 ```
 
-Run the matched delayed-branch diffusion policy baseline:
+Run the matched delayed-branch diffusion policy baseline. It uses
+Diffusers' `DDPMScheduler` with the `squaredcos_cap_v2` schedule.
 
 ```bash
 uv run python -m action_bridge.train_diffusion \

@@ -1014,7 +1014,7 @@ It is only a cheap Gaussian-conditioned one-shot baseline.
 
 6. `diffusion_delayed_modes` is the matched diffusion policy baseline.
 
-It denoises full action chunks from Gaussian noise, conditioned on the same `context_states` and `context_actions` as the bridge policies. Use `python -m action_bridge.train_diffusion` for the dedicated diffusion entrypoint.
+It denoises full action chunks from Gaussian noise, conditioned on the same `context_states` and `context_actions` as the bridge policies. Use `python -m action_bridge.train_diffusion` for the dedicated diffusion entrypoint. The implementation uses Diffusers' `DDPMScheduler`; the delayed-mode diffusion config uses the `squaredcos_cap_v2` schedule. The older hand-written linear `50`-step schedule with `beta_end=0.02` left the terminal noising level too close to data and was not a good match to ancestral sampling from pure Gaussian noise.
 
 7. The current latent path-Sinkhorn model is not the full non-conservative/contact-Hamiltonian CWG formulation.
 
