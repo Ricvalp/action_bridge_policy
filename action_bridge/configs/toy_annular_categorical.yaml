@@ -1,0 +1,67 @@
+seed: 0
+device: cuda
+benchmark: toy_annular
+trajectory_len: 64
+chunk_horizon: 16
+obs_history: 2
+action_history: 2
+action_dim: 2
+obs_dim: 4
+output_dir: outputs
+
+data:
+  num_contexts: 256
+  paired_fraction: 0.3
+  obstacle_center: [0.5, 0.5]
+  obstacle_radius: 0.15
+  margin: 0.08
+  r_min: 0.28
+  r_max: 0.48
+  min_start_goal_distance: 0.35
+  require_interaction: true
+  interaction_distance_threshold: 0.18
+  p_min: 0.08
+  temperature: 0.08
+  speed_noise_std: 0.002
+
+model:
+  policy_type: action_bridge
+  hidden_dim: 128
+  h_emb_dim: 128
+  time_emb_dim: 32
+  z_embed_dim: 32
+  latent_type: categorical
+  num_categories: 2
+
+reference:
+  type: continuation
+  alpha: 0.8
+  sigma: 0.05
+  learn_alpha: false
+  learn_sigma: false
+
+loss:
+  beta_R: 0.01
+  beta_z_start: 0.0
+  beta_z_end: 0.01
+  beta_z_warmup_steps: 10000
+  free_nats: 0.1
+  tube_training: false
+  tube_noise_std_start: 0.0
+  tube_noise_std_end: 0.02
+  tube_noise_warmup_steps: 5000
+
+optim:
+  lr: 0.0003
+  batch_size: 256
+  max_steps: 100000
+  grad_clip: 1.0
+
+logging:
+  log_every_steps: 25
+  eval_every_steps: 100
+
+inference:
+  deterministic: true
+  num_samples: 32
+  latent_commitment: chunk

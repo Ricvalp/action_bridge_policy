@@ -1,0 +1,54 @@
+seed: 0
+device: cuda
+benchmark: pusht_lowdim
+chunk_horizon: 16
+obs_history: 2
+action_history: 2
+action_dim: 2
+obs_dim: 20
+output_dir: outputs
+
+data:
+  backend: auto
+  dataset_path: null
+
+model:
+  policy_type: action_bridge
+  hidden_dim: 512
+  h_emb_dim: 512
+  time_emb_dim: 32
+  z_embed_dim: 64
+  latent_type: continuous
+  z_dim: 8
+  continuous_prior: learned_conditional_gaussian
+
+reference:
+  type: continuation
+  alpha: 0.8
+  sigma: 0.05
+  learn_alpha: true
+  learn_sigma: false
+
+loss:
+  beta_R: 0.005
+  beta_z_start: 0.0
+  beta_z_end: 0.001
+  beta_z_warmup_steps: 20000
+  free_nats: 0.05
+  tube_training: true
+  tube_noise_std_start: 0.0
+  tube_noise_std_end: 0.01
+  tube_noise_warmup_steps: 10000
+  num_z_samples_train: 1
+
+optim:
+  lr: 0.0002
+  batch_size: 256
+  max_steps: 200000
+  grad_clip: 1.0
+
+inference:
+  deterministic: true
+  num_samples: 8
+  latent_commitment: episode
+  n_exec: 8

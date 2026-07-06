@@ -2,7 +2,7 @@
 
 You are implementing a research pilot for a robotics-policy idea:
 
-> Learn action chunks as **stochastic action-path laws** rather than as independent timestep marginals or direct chunk regressions. The policy is a learned minimum-control deformation of a robot-specific reference process.
+> Learn action chunks as **stochastic action-path laws** rather than as independent timestep marginals or direct chunk regressions. The policy is a learned minimum-control deformation of a robot-specific reference process. 
 
 This is not a full Schrödinger Bridge solver. Do **not** implement Sinkhorn, IPF, score matching, or diffusion noising. Implement an amortized **path-KL controlled action process** with latent mode commitment.
 

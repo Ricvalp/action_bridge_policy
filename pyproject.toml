@@ -1,0 +1,19 @@
+[project]
+name = "action-bridge-policy"
+version = "0.1.0"
+description = "Research pilot for latent path-KL controlled action bridge policies."
+requires-python = ">=3.9"
+dependencies = [
+  "matplotlib>=3.7",
+  "numpy>=1.24",
+  "pyyaml>=6.0",
+  "torch>=2.0",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
