@@ -113,6 +113,32 @@ uv run python -m action_bridge.eval.eval_toy \
   device=cpu
 ```
 
+By default this creates a timestamped eval artifact directory:
+
+```text
+outputs/eval/<run_id>_<YYYYmmdd_HHMMSS>/
+```
+
+Use `--output-dir` to choose a specific destination:
+
+```bash
+uv run python -m action_bridge.eval.eval_toy \
+  --checkpoint outputs/<run_id>/checkpoints/latest.pt \
+  --output-dir outputs/eval/manual_eval \
+  device=cpu
+```
+
+Toy evaluation includes open-loop chunk metrics and closed-loop receding-horizon rollout metrics by default. Useful closed-loop overrides:
+
+```bash
+uv run python -m action_bridge.eval.eval_toy \
+  --checkpoint outputs/<run_id>/checkpoints/best.pt \
+  device=cpu \
+  eval.n_exec=4 \
+  eval.closed_loop_episodes=128 \
+  eval.success_radius=0.08
+```
+
 Every training run writes:
 
 ```text
@@ -123,8 +149,10 @@ outputs/<run_id>/
   metrics/train_metrics.csv
   metrics/val_metrics.csv
   metrics/test_metrics.json
+  metrics/closed_loop_metrics.json
   figures/dataset_samples.png
   figures/generated_same_history.png
+  figures/closed_loop_rollouts.png
   figures/energy_histograms.png
 ```
 
@@ -146,7 +174,7 @@ Implemented baselines include direct chunk BC, autoregressive BC without a refer
 
 ## Metrics
 
-Toy evaluation reports action MSE, goal error, path length, collision rate, minimum clearance, acceleration energy, jerk energy, path-KL energy, mode switch rate, hybrid rate, valid top/bottom rates for delayed data, cw/ccw rates for annular data, and an RBF-MMD over simple trajectory features.
+Toy evaluation reports action MSE, goal error, path length, collision rate, minimum clearance, acceleration energy, jerk energy, path-KL energy, mode switch rate, hybrid rate, valid top/bottom rates for delayed data, cw/ccw rates for annular data, and an RBF-MMD over simple trajectory features. Closed-loop evaluation additionally reports success rate, clean success rate, receding-horizon chunk-boundary discontinuity, closed-loop collision/hybrid rates, and final goal error.
 
 ## Push-T
 

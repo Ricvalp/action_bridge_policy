@@ -39,6 +39,7 @@ def generate_chunk(
     actions = []
     means = []
     controls = []
+    path_kl_steps = []
     path_kl = torch.zeros(obs_hist.shape[0], device=obs_hist.device, dtype=obs_hist.dtype)
     for k in range(policy.chunk_horizon):
         mu_r, log_sigma = policy.reference_process(a_prev, a_prevprev, h_emb, k)
@@ -48,7 +49,9 @@ def generate_chunk(
             action = mu
         else:
             action = mu + log_sigma.exp() * torch.randn_like(mu)
-        path_kl = path_kl + 0.5 * (u / log_sigma.exp().clamp_min(1e-6)).pow(2).sum(dim=-1)
+        step_path_kl = 0.5 * (u / log_sigma.exp().clamp_min(1e-6)).pow(2).sum(dim=-1)
+        path_kl = path_kl + step_path_kl
+        path_kl_steps.append(step_path_kl)
         actions.append(action)
         means.append(mu)
         controls.append(u)
@@ -60,6 +63,7 @@ def generate_chunk(
         "z": z,
         "z_emb": z_emb,
         "path_kl_energy": path_kl,
+        "path_kl_steps": torch.stack(path_kl_steps, dim=1),
     }
 
 
@@ -76,6 +80,7 @@ def predict_actions(model, batch: Dict[str, torch.Tensor], deterministic: bool =
     return {
         "actions": actions,
         "path_kl_energy": torch.zeros(actions.shape[0], device=actions.device, dtype=actions.dtype),
+        "path_kl_steps": torch.zeros(actions.shape[0], actions.shape[1], device=actions.device, dtype=actions.dtype),
         "z": None,
     }
 

@@ -122,3 +122,36 @@ def plot_latent_scatter(z: torch.Tensor, mode: torch.Tensor, path: Path) -> None
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     plt.close(fig)
+
+
+def plot_closed_loop_rollouts(
+    positions: torch.Tensor,
+    expert_positions: torch.Tensor,
+    goals: torch.Tensor,
+    centers: torch.Tensor,
+    radii: torch.Tensor,
+    modes: torch.Tensor,
+    success: torch.Tensor,
+    path: Path,
+    max_rollouts: int = 24,
+) -> None:
+    plt = _import_pyplot()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    count = min(max_rollouts, positions.shape[0])
+    fig, ax = plt.subplots(figsize=(6.2, 5.6))
+    for idx in range(count):
+        expert = expert_positions[idx].detach().cpu()
+        rollout = positions[idx].detach().cpu()
+        mode = int(modes[idx].detach().cpu()) if torch.is_tensor(modes) else int(modes[idx])
+        color = "tab:blue" if mode > 0 else "tab:orange"
+        linewidth = 2.0 if bool(success[idx]) else 1.2
+        alpha = 0.9 if bool(success[idx]) else 0.42
+        ax.plot(expert[:, 0], expert[:, 1], color="0.75", linewidth=1.0, alpha=0.55)
+        ax.plot(rollout[:, 0], rollout[:, 1], color=color, linewidth=linewidth, alpha=alpha)
+    ax.scatter(goals[:count, 0].detach().cpu(), goals[:count, 1].detach().cpu(), color="red", marker="x", s=28, label="goals")
+    _draw_obstacle(ax, centers[0].detach().cpu(), radii[0].detach().cpu())
+    ax.set_title("Closed-loop receding-horizon rollouts")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
