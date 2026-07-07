@@ -277,7 +277,7 @@ def main() -> None:
     parser.add_argument("--pusht-dataset", default=PUSHT_DATASET)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--wandb-project", default="action-bridge-policy")
+    parser.add_argument("--wandb-project", default="action-bridge-policy-experiment-batch")
     parser.add_argument("--run-prefix", default="")
     parser.add_argument("--include-optional", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
