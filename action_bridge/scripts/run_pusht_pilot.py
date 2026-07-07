@@ -1,4 +1,4 @@
-"""Push-T pilot launcher placeholder."""
+"""Push-T pilot launcher."""
 
 from action_bridge.training.train_pusht import main
 

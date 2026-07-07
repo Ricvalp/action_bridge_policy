@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable
 import numpy as np
 import torch
 
+from action_bridge.config import to_plain_dict
+from action_bridge.data.pusht_adapter import PushTLowDimDataset
 from action_bridge.data.toy_annular import AnnularObstacleDataset
 from action_bridge.data.toy_obstacle import DelayedBranchObstacleDataset
 from action_bridge.models.action_bridge_policy import ActionBridgePolicy
@@ -69,6 +71,21 @@ def build_dataset(config: Dict, split: str):
         return DelayedBranchObstacleDataset(data_cfg, split=split)
     if benchmark == "toy_annular":
         return AnnularObstacleDataset(data_cfg, split=split)
+    if benchmark == "pusht_lowdim":
+        return PushTLowDimDataset(
+            dataset_path=data_cfg.get("dataset_path"),
+            backend=str(data_cfg.get("backend", "auto")),
+            split=split,
+            obs_history=int(config.get("obs_history", 2)),
+            action_history=int(config.get("action_history", 2)),
+            chunk_horizon=int(config.get("chunk_horizon", 16)),
+            train_fraction=float(data_cfg.get("train_fraction", 0.8)),
+            val_fraction=float(data_cfg.get("val_fraction", 0.1)),
+            obs_key=data_cfg.get("obs_key"),
+            action_key=data_cfg.get("action_key"),
+            episode_ends_key=data_cfg.get("episode_ends_key"),
+            max_episodes=data_cfg.get("max_episodes"),
+        )
     raise ValueError(f"Unsupported benchmark {benchmark!r} for train_toy.")
 
 
@@ -118,7 +135,7 @@ def append_csv(path: Path, row: Dict[str, Any]) -> None:
 def save_json(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+        json.dump(to_plain_dict(data), f, indent=2, sort_keys=True)
 
 
 def tensor_metrics_to_float(metrics: Dict[str, Any]) -> Dict[str, float]:

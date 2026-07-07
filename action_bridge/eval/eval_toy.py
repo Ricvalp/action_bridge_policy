@@ -433,7 +433,7 @@ def main() -> None:
     dataset = build_dataset(config, split=args.split)
     metrics = evaluate_toy_model(model, dataset, config, device, output_dir=out_dir)
     if out_dir is not None:
-        save_config(config, out_dir / "eval_config.yaml")
+        save_config(config, out_dir / "eval_config.json")
         metadata = {
             "output_dir": str(out_dir),
             "split": args.split,

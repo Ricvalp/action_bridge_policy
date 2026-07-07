@@ -36,7 +36,7 @@ uv run python -m action_bridge.scripts.generate_toy_annular \
   --out /tmp/toy_annular_small.pt
 ```
 
-The training scripts generate toy data in memory from the YAML config, so these artifacts are mostly for inspection and debugging.
+The training scripts generate toy data in memory from the Python `ml_collections` config, so these artifacts are mostly for inspection and debugging.
 
 Visualize the toy datasets before training:
 
@@ -95,6 +95,37 @@ loss.lambda_acc=0.01 loss.lambda_jerk=0.001
 loss.tube_training=true
 ```
 
+Configs live in `action_bridge/configs/*.py` and expose `get_config()`. CLI overrides still use the same dotted style:
+
+```bash
+uv run python -m action_bridge.training.train_toy \
+  --config-name toy_delayed_continuous \
+  device=cpu \
+  optim.max_steps=10000 \
+  reference.type=continuation
+```
+
+Training periodically writes reduced validation eval artifacts under `outputs/<run_id>/eval/step_<step>/` according to:
+
+```text
+logging.full_eval_every_steps
+logging.full_eval_split
+logging.full_eval_max_batches
+logging.full_eval_closed_loop_episodes
+logging.full_eval_num_samples
+```
+
+Enable Weights & Biases logging with:
+
+```bash
+uv run python -m action_bridge.training.train_toy \
+  --config-name toy_delayed_continuous \
+  logging.wandb.enabled=true \
+  logging.wandb.project=action-bridge-policy
+```
+
+When enabled, training logs train/validation scalars, periodic closed-loop/open-loop eval metrics, and the generated figures: `closed_loop_rollouts`, `continuous_latent_scatter`, `energy_histograms`, and `generated_same_history`.
+
 Run the compact delayed-branch comparison sweep:
 
 ```bash
@@ -143,11 +174,12 @@ Every training run writes:
 
 ```text
 outputs/<run_id>/
-  config.yaml
+  config.json
   checkpoints/latest.pt
   checkpoints/best.pt
   metrics/train_metrics.csv
   metrics/val_metrics.csv
+  metrics/periodic_eval_metrics.csv
   metrics/test_metrics.json
   metrics/closed_loop_metrics.json
   figures/dataset_samples.png
@@ -178,7 +210,32 @@ Toy evaluation reports action MSE, goal error, path length, collision rate, mini
 
 ## Push-T
 
-`action_bridge.data.pusht_adapter.PushTLowDimDataset` is a clear adapter stub. It raises setup instructions unless a local Push-T low-dimensional dataset path and backend-specific loader are added. The toy benchmarks are the complete first deliverable.
+`action_bridge.data.pusht_adapter.PushTLowDimDataset` loads local low-dimensional offline Push-T data. Supported backends are:
+
+```text
+data.backend=zarr   # Diffusion Policy-style zarr with data/state, data/action, meta/episode_ends
+data.backend=npz    # arrays such as obs/actions/episode_ends
+data.backend=torch  # .pt/.pth dict with the same arrays
+data.backend=auto   # infer from the path suffix
+```
+
+Train the continuous latent Push-T pilot:
+
+```bash
+uv run python -m action_bridge.training.train_pusht \
+  --config-name pusht_lowdim_continuous \
+  data.dataset_path=/path/to/pusht_lowdim.zarr
+```
+
+If your local file uses nonstandard names, pass explicit keys:
+
+```bash
+data.obs_key=data/state \
+data.action_key=data/action \
+data.episode_ends_key=meta/episode_ends
+```
+
+The Push-T entrypoint reports offline metrics: action MSE/L1, acceleration/jerk energy, chunk-boundary discontinuity, path-KL energy, and logged-history receding-horizon action error. It does not run simulator closed-loop success unless a simulator backend is added later.
 
 ## Tests
 

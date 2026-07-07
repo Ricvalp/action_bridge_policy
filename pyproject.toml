@@ -5,10 +5,12 @@ description = "Research pilot for latent path-KL controlled action bridge polici
 requires-python = ">=3.9"
 dependencies = [
   "matplotlib>=3.7",
+  "ml-collections>=0.1.1",
   "numpy>=1.24",
-  "pyyaml>=6.0",
   "torch>=2.0",
   "tqdm>=4.66",
+  "wandb>=0.16",
+  "zarr>=2.16",
 ]
 
 [project.optional-dependencies]

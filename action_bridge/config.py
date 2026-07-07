@@ -1,27 +1,69 @@
-"""Plain YAML config loading with small Hydra-style CLI overrides."""
+"""ml_collections config loading with small Hydra-style CLI overrides."""
 
 from __future__ import annotations
 
 import copy
+import importlib
 import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-import yaml
+from ml_collections import ConfigDict
 
 
 CONFIG_DIR = Path(__file__).resolve().parent / "configs"
+CONFIG_PACKAGE = "action_bridge.configs"
+_NON_CONFIG_MODULES = {"__init__", "base"}
 
 
-def load_config(config_name: str) -> Dict[str, Any]:
-    name = config_name[:-5] if config_name.endswith(".yaml") else config_name
-    path = CONFIG_DIR / f"{name}.yaml"
-    if not path.exists():
-        raise FileNotFoundError(f"Unknown config {config_name!r}; expected {path}")
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    data.setdefault("config_name", name)
-    return data
+def available_config_names() -> List[str]:
+    return sorted(
+        path.stem
+        for path in CONFIG_DIR.glob("*.py")
+        if path.stem not in _NON_CONFIG_MODULES and not path.stem.startswith("_")
+    )
+
+
+def _canonical_name(config_name: str) -> str:
+    name = config_name
+    for suffix in [".py", ".yaml", ".yml"]:
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name
+
+
+def to_plain_dict(value: Any) -> Any:
+    if isinstance(value, ConfigDict):
+        value = value.to_dict()
+    if isinstance(value, dict):
+        return {key: to_plain_dict(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [to_plain_dict(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(to_plain_dict(item) for item in value)
+    return value
+
+
+def to_config_dict(value: Any) -> ConfigDict:
+    if isinstance(value, ConfigDict):
+        return copy.deepcopy(value)
+    return ConfigDict(to_plain_dict(value))
+
+
+def load_config(config_name: str) -> ConfigDict:
+    name = _canonical_name(config_name)
+    try:
+        module = importlib.import_module(f"{CONFIG_PACKAGE}.{name}")
+    except ModuleNotFoundError as exc:
+        available = ", ".join(available_config_names())
+        raise FileNotFoundError(f"Unknown config {config_name!r}. Available configs: {available}") from exc
+    if not hasattr(module, "get_config"):
+        raise AttributeError(f"{CONFIG_PACKAGE}.{name} must define get_config().")
+    config = to_config_dict(module.get_config())
+    if "config_name" not in config:
+        config.config_name = name
+    return config
 
 
 def parse_value(raw: str) -> Any:
@@ -43,20 +85,20 @@ def parse_value(raw: str) -> Any:
         return text
 
 
-def set_nested(config: Dict[str, Any], dotted_key: str, value: Any) -> None:
-    cursor = config
+def set_nested(config: ConfigDict, dotted_key: str, value: Any) -> None:
+    cursor: Any = config
     parts = dotted_key.split(".")
     for part in parts[:-1]:
         existing = cursor.get(part)
-        if not isinstance(existing, dict):
-            existing = {}
+        if not isinstance(existing, (ConfigDict, dict)):
+            existing = ConfigDict()
             cursor[part] = existing
         cursor = existing
     cursor[parts[-1]] = value
 
 
-def apply_overrides(config: Dict[str, Any], overrides: Iterable[str]) -> Dict[str, Any]:
-    result = copy.deepcopy(config)
+def apply_overrides(config: Any, overrides: Iterable[str]) -> ConfigDict:
+    result = to_config_dict(config)
     for item in overrides:
         if not item:
             continue
@@ -67,15 +109,15 @@ def apply_overrides(config: Dict[str, Any], overrides: Iterable[str]) -> Dict[st
     return result
 
 
-def save_config(config: Dict[str, Any], path: Path) -> None:
+def save_config(config: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(config, f, sort_keys=False)
+        json.dump(to_plain_dict(config), f, indent=2, sort_keys=False)
 
 
-def flatten_dict(data: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+def flatten_dict(data: Any, prefix: str = "") -> Dict[str, Any]:
     flat: Dict[str, Any] = {}
-    for key, value in data.items():
+    for key, value in to_plain_dict(data).items():
         next_key = f"{prefix}.{key}" if prefix else str(key)
         if isinstance(value, dict):
             flat.update(flatten_dict(value, next_key))

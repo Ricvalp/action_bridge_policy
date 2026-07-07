@@ -1,6 +1,8 @@
 torch>=2.0
 numpy>=1.24
-pyyaml>=6.0
+ml-collections>=0.1.1
 matplotlib>=3.7
 tqdm>=4.66
+wandb>=0.16
+zarr>=2.16
 pytest>=8.0
