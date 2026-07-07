@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -90,6 +92,87 @@ def plot_action_rollout_examples(batch: Dict[str, Any], pred_actions: torch.Tens
     axes[0, 0].legend(fontsize=8)
     axes[-1, 0].set_xlabel("chunk step")
     axes[-1, 1].set_xlabel("chunk step")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def _tee_polygons(pose: np.ndarray, scale: float = 30.0):
+    x, y, theta = float(pose[0]), float(pose[1]), float(pose[2])
+    length = 4.0
+    local_polys = [
+        np.array(
+            [
+                [-length * scale / 2, scale],
+                [length * scale / 2, scale],
+                [length * scale / 2, 0.0],
+                [-length * scale / 2, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.array(
+            [
+                [-scale / 2, scale],
+                [-scale / 2, length * scale],
+                [scale / 2, length * scale],
+                [scale / 2, scale],
+            ],
+            dtype=np.float32,
+        ),
+    ]
+    rotation = np.array([[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]], dtype=np.float32)
+    return [poly @ rotation.T + np.array([x, y], dtype=np.float32) for poly in local_polys]
+
+
+def _draw_tee(ax, pose: np.ndarray, color: str, alpha: float, label: Optional[str] = None, linestyle: str = "-") -> None:
+    from matplotlib.patches import Polygon
+
+    for idx, poly in enumerate(_tee_polygons(pose)):
+        patch = Polygon(
+            poly,
+            closed=True,
+            facecolor=color if linestyle == "-" else "none",
+            edgecolor=color,
+            linewidth=1.4,
+            linestyle=linestyle,
+            alpha=alpha,
+            label=label if idx == 0 else None,
+        )
+        ax.add_patch(patch)
+
+
+def plot_action_chunk_2d(batch: Dict[str, Any], pred_actions: torch.Tensor, path: Path, max_items: int = 6) -> None:
+    plt = _import_pyplot()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    count = min(max_items, pred_actions.shape[0])
+    cols = min(3, count)
+    rows = int(math.ceil(count / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.2 * cols, 4.2 * rows), squeeze=False)
+    target = batch["future_actions"].detach().cpu().numpy()
+    pred = pred_actions.detach().cpu().numpy()
+    obs_hist = batch["obs_hist"].detach().cpu().numpy()
+    act_hist = batch["act_hist"].detach().cpu().numpy()
+    goal_pose = np.array([256.0, 256.0, math.pi / 4], dtype=np.float32)
+    for flat_idx, ax in enumerate(axes.ravel()):
+        if flat_idx >= count:
+            ax.axis("off")
+            continue
+        state = obs_hist[flat_idx, -1]
+        agent = state[:2]
+        block_pose = state[2:5] if state.shape[-1] >= 5 else None
+        if block_pose is not None:
+            _draw_tee(ax, goal_pose, color="tab:green", alpha=0.28, label="goal T", linestyle="--")
+            _draw_tee(ax, block_pose, color="0.35", alpha=0.32, label="current T")
+        ax.plot(act_hist[flat_idx, :, 0], act_hist[flat_idx, :, 1], color="0.55", marker="o", markersize=3, linewidth=1.0, label="history")
+        ax.scatter(agent[0], agent[1], color="tab:purple", s=28, marker="o", label="agent")
+        ax.plot(target[flat_idx, :, 0], target[flat_idx, :, 1], color="black", marker="o", markersize=3, linewidth=1.6, label="logged chunk")
+        ax.plot(pred[flat_idx, :, 0], pred[flat_idx, :, 1], color="tab:blue", marker="x", markersize=4, linewidth=1.4, label="pred chunk")
+        ax.set_xlim(0, 512)
+        ax.set_ylim(512, 0)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(f"chunk {flat_idx}")
+        if flat_idx == 0:
+            ax.legend(fontsize=7, loc="upper right")
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     plt.close(fig)
@@ -200,6 +283,10 @@ def evaluate_pusht_model(
                 plot_action_rollout_examples(first_batch, first_pred, figures / "receding_horizon_action_rollout.png")
             except Exception as exc:
                 summary["plot_action_rollout_error"] = str(exc)
+            try:
+                plot_action_chunk_2d(first_batch, first_pred, figures / "action_chunk_2d_with_t.png")
+            except Exception as exc:
+                summary["plot_action_chunk_2d_error"] = str(exc)
         save_json(output_dir / "metrics" / "pusht_metrics.json", summary)
     model.train()
     return summary

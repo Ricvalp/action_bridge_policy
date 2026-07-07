@@ -27,6 +27,7 @@ from action_bridge.training.losses import model_loss
 
 
 FIGURE_FILES = [
+    "action_chunk_2d_with_t.png",
     "action_error_histograms.png",
     "closed_loop_rollouts.png",
     "continuous_latent_scatter.png",
