@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from action_bridge.config import apply_overrides, load_config, save_config
 from action_bridge.eval.metrics import action_smoothness, average_metric_dicts
@@ -178,6 +178,60 @@ def plot_action_chunk_2d(batch: Dict[str, Any], pred_actions: torch.Tensor, path
     plt.close(fig)
 
 
+def representative_plot_indices(dataset, max_items: int) -> list[int]:
+    count = min(max_items, len(dataset))
+    if count <= 0:
+        return []
+
+    pairs = getattr(dataset, "indices", None)
+    if pairs:
+        by_episode: Dict[int, list[int]] = {}
+        for dataset_idx, pair in enumerate(pairs):
+            episode_id = int(pair[0])
+            by_episode.setdefault(episode_id, []).append(dataset_idx)
+        episodes = sorted(by_episode)
+        if episodes:
+            if len(episodes) >= count:
+                episode_positions = np.linspace(0, len(episodes) - 1, num=count, dtype=int)
+                chosen = []
+                for pos in episode_positions:
+                    episode_indices = by_episode[episodes[int(pos)]]
+                    chosen.append(episode_indices[len(episode_indices) // 2])
+                return chosen
+
+            chosen = []
+            for episode_id in episodes:
+                episode_indices = by_episode[episode_id]
+                chosen.append(episode_indices[len(episode_indices) // 2])
+            remaining = count - len(chosen)
+            if remaining > 0:
+                used = set(chosen)
+                global_positions = np.linspace(0, len(pairs) - 1, num=remaining + 2, dtype=int)[1:-1]
+                for pos in global_positions:
+                    idx = int(pos)
+                    if idx not in used:
+                        chosen.append(idx)
+                        used.add(idx)
+                    if len(chosen) >= count:
+                        break
+            return chosen[:count]
+
+    return np.linspace(0, len(dataset) - 1, num=count, dtype=int).tolist()
+
+
+@torch.no_grad()
+def representative_plot_batch(model, dataset, config: Dict, device: torch.device) -> tuple[Optional[Dict[str, Any]], Optional[torch.Tensor]]:
+    max_items = int(config.get("eval", {}).get("plot_examples", 6))
+    indices = representative_plot_indices(dataset, max_items)
+    if not indices:
+        return None, None
+    loader = DataLoader(Subset(dataset, indices), batch_size=len(indices), shuffle=False)
+    batch = next(iter(loader))
+    batch_device = move_to_device(batch, device)
+    pred = predict_actions(model, batch_device, deterministic=bool(config.get("inference", {}).get("deterministic", True)))
+    return move_to_device(batch_device, torch.device("cpu")), pred["actions"].detach().cpu()
+
+
 @torch.no_grad()
 def offline_receding_horizon_metrics(model, dataset, config: Dict, device: torch.device) -> Dict[str, float]:
     if not hasattr(dataset, "episode_ids") or not hasattr(dataset, "item_from_episode_time"):
@@ -243,8 +297,6 @@ def evaluate_pusht_model(
     all_path_kl = []
     per_sample_mse = []
     per_sample_l1 = []
-    first_batch = None
-    first_pred = None
     for batch_idx, batch in enumerate(loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
@@ -256,14 +308,12 @@ def evaluate_pusht_model(
             all_path_kl.append(pred["path_kl_energy"].detach().cpu())
         per_sample_mse.append((pred["actions"] - target).pow(2).mean(dim=(1, 2)).detach().cpu())
         per_sample_l1.append((pred["actions"] - target).abs().mean(dim=(1, 2)).detach().cpu())
-        if first_batch is None:
-            first_batch = move_to_device(batch, torch.device("cpu"))
-            first_pred = pred["actions"].detach().cpu()
     summary = average_metric_dicts(metrics)
     summary.update(offline_receding_horizon_metrics(model, dataset, config, device))
 
     if output_dir is not None:
         figures = output_dir / "figures"
+        plot_batch, plot_pred = representative_plot_batch(model, dataset, config, device)
         if all_path_kl:
             try:
                 plot_energy_histograms({"path_KL": torch.cat(all_path_kl)}, figures / "energy_histograms.png")
@@ -278,13 +328,13 @@ def evaluate_pusht_model(
                 )
             except Exception as exc:
                 summary["plot_action_error_error"] = str(exc)
-        if first_batch is not None and first_pred is not None:
+        if plot_batch is not None and plot_pred is not None:
             try:
-                plot_action_rollout_examples(first_batch, first_pred, figures / "receding_horizon_action_rollout.png")
+                plot_action_rollout_examples(plot_batch, plot_pred, figures / "receding_horizon_action_rollout.png")
             except Exception as exc:
                 summary["plot_action_rollout_error"] = str(exc)
             try:
-                plot_action_chunk_2d(first_batch, first_pred, figures / "action_chunk_2d_with_t.png")
+                plot_action_chunk_2d(plot_batch, plot_pred, figures / "action_chunk_2d_with_t.png")
             except Exception as exc:
                 summary["plot_action_chunk_2d_error"] = str(exc)
         save_json(output_dir / "metrics" / "pusht_metrics.json", summary)

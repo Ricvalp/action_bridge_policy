@@ -4,6 +4,7 @@ import numpy as np
 
 from action_bridge.config import apply_overrides, load_config
 from action_bridge.data.pusht_adapter import PushTLowDimDataset
+from action_bridge.eval.eval_pusht import representative_plot_indices
 from action_bridge.training.train_pusht import train
 
 
@@ -31,6 +32,23 @@ def test_pusht_npz_dataset_shapes(tmp_path):
     assert item["obs_hist"].shape == (2, 6)
     assert item["act_hist"].shape == (2, 2)
     assert item["future_actions"].shape == (4, 2)
+
+
+def test_representative_plot_indices_spread_across_episodes(tmp_path):
+    dataset_path = tmp_path / "pusht_tiny.npz"
+    write_tiny_pusht_npz(dataset_path)
+    dataset = PushTLowDimDataset(
+        dataset_path=str(dataset_path),
+        backend="npz",
+        split="all",
+        obs_history=2,
+        action_history=2,
+        chunk_horizon=4,
+    )
+    indices = representative_plot_indices(dataset, max_items=4)
+    episodes = {dataset.indices[idx][0] for idx in indices}
+    assert len(indices) == 4
+    assert len(episodes) == 4
 
 
 def test_train_pusht_smoke(tmp_path):
