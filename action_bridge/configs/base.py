@@ -72,10 +72,30 @@ def _toy_model(latent_type: str) -> ConfigDict:
 def _toy_reference() -> ConfigDict:
     config = ConfigDict()
     config.type = "continuation"
+    config.coordinate_mode = "raw_action"
+    config.dt = 1.0
     config.alpha = 0.8
     config.sigma = 0.05
     config.learn_alpha = False
     config.learn_sigma = False
+    config.control_is_whitened = True
+    config.gamma_mode = "constant"
+    config.gamma_const = 0.2
+    config.gamma_min = 0.0
+    config.gamma_max = 0.95
+    config.potential_type = "none"
+    config.stiffness_mode = "learned_diag"
+    config.k_const = 0.0
+    config.k_min = 0.0
+    config.k_max = 2.0
+    config.attractor_mode = "learned"
+    config.time_emb_dim = 32
+    config.hidden_dim = 128
+    config.beta_kl = 1.0
+    config.lambda_q = 1.0
+    config.lambda_ref_reg = 0.0001
+    config.lambda_m_smooth = 0.001
+    config.deterministic_inference = True
     return config
 
 
@@ -128,6 +148,8 @@ def toy_delayed_config(latent_type: str) -> ConfigDict:
     config.data.shared_prefix_target_x = 0.30
     config.data.action_noise_std = 0.005
     config.data.speed = 0.035
+    config.data.train_absolute_actions = False
+    config.data.env_accepts_absolute_actions = False
     config.model = _toy_model(latent_type)
     if latent_type == "categorical":
         config.model.z_dim = 4
@@ -156,6 +178,8 @@ def toy_annular_config(latent_type: str) -> ConfigDict:
     config.data.p_min = 0.08
     config.data.temperature = 0.08
     config.data.speed_noise_std = 0.002
+    config.data.train_absolute_actions = False
+    config.data.env_accepts_absolute_actions = False
     config.model = _toy_model(latent_type)
     config.reference = _toy_reference()
     config.loss = _toy_loss(latent_type)
@@ -200,10 +224,30 @@ def pusht_lowdim_config(latent_type: str) -> ConfigDict:
         raise ValueError(f"Unsupported latent_type {latent_type!r}.")
     config.reference = ConfigDict()
     config.reference.type = "continuation"
+    config.reference.coordinate_mode = "raw_action"
+    config.reference.dt = 1.0
     config.reference.alpha = 0.8
     config.reference.sigma = 0.05
     config.reference.learn_alpha = True
     config.reference.learn_sigma = False
+    config.reference.control_is_whitened = True
+    config.reference.gamma_mode = "constant"
+    config.reference.gamma_const = 0.2
+    config.reference.gamma_min = 0.0
+    config.reference.gamma_max = 0.95
+    config.reference.potential_type = "none"
+    config.reference.stiffness_mode = "learned_diag"
+    config.reference.k_const = 0.0
+    config.reference.k_min = 0.0
+    config.reference.k_max = 2.0
+    config.reference.attractor_mode = "learned"
+    config.reference.time_emb_dim = 32
+    config.reference.hidden_dim = 128
+    config.reference.beta_kl = 1.0
+    config.reference.lambda_q = 1.0
+    config.reference.lambda_ref_reg = 0.0001
+    config.reference.lambda_m_smooth = 0.001
+    config.reference.deterministic_inference = True
     config.loss = ConfigDict()
     config.loss.beta_R = 0.005
     config.loss.beta_z_start = 0.0

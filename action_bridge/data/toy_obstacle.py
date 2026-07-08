@@ -39,6 +39,8 @@ class DelayedBranchConfig:
     seed: int = 0
     train_fraction: float = 0.8
     val_fraction: float = 0.1
+    train_absolute_actions: bool = False
+    env_accepts_absolute_actions: bool = False
 
 
 def _as_pair(value) -> np.ndarray:
@@ -176,7 +178,10 @@ class DelayedBranchObstacleDataset(Dataset):
             self.cfg = DelayedBranchConfig(**{k: v for k, v in data.items() if k in DelayedBranchConfig.__dataclass_fields__})
             arrays = generate_delayed_branch_arrays(asdict(self.cfg))
         self.positions = arrays["positions"].float()
-        self.actions = arrays["actions"].float()
+        if self.cfg.train_absolute_actions:
+            self.actions = arrays["positions"][:, 1:].float()
+        else:
+            self.actions = arrays["actions"].float()
         self.starts = arrays["starts"].float()
         self.goals = arrays["goals"].float()
         self.modes = arrays["modes"].long()
@@ -217,4 +222,5 @@ class DelayedBranchObstacleDataset(Dataset):
             self.cfg.obs_history,
             self.cfg.action_history,
             self.cfg.chunk_horizon,
+            action_representation="absolute" if self.cfg.train_absolute_actions else "delta",
         )

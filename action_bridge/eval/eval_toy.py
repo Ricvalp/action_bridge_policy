@@ -18,8 +18,9 @@ from action_bridge.eval.metrics import (
     collision_stats,
     compute_toy_metrics,
     delayed_mode_metrics,
+    toy_actions_to_positions,
 )
-from action_bridge.eval.rollout import actions_to_positions, generate_chunk, predict_actions
+from action_bridge.eval.rollout import generate_chunk, predict_actions
 from action_bridge.eval.visualization import (
     plot_closed_loop_rollouts,
     plot_calibration,
@@ -158,6 +159,7 @@ def closed_loop_rollout(model, dataset, config: Dict, device: torch.device) -> D
     box_max = float(eval_cfg.get("box_max", 1.0))
     deterministic = bool(config.get("inference", {}).get("deterministic", True))
     commitment = str(config.get("inference", {}).get("latent_commitment", "chunk"))
+    action_is_absolute = bool(getattr(getattr(dataset, "cfg", None), "train_absolute_actions", False))
 
     pos_hist = expert_positions[:, warm_start - obs_history + 1 : warm_start + 1]
     act_hist = expert_actions[:, warm_start - action_history : warm_start]
@@ -208,7 +210,10 @@ def closed_loop_rollout(model, dataset, config: Dict, device: torch.device) -> D
 
         new_positions = []
         for step in range(execute):
-            current_pos = (current_pos + executed[:, step]).clamp(box_min, box_max)
+            if action_is_absolute:
+                current_pos = executed[:, step].clamp(box_min, box_max)
+            else:
+                current_pos = (current_pos + executed[:, step]).clamp(box_min, box_max)
             new_positions.append(current_pos)
         new_pos_tensor = torch.stack(new_positions, dim=1)
         generated_positions.append(new_pos_tensor)
@@ -355,7 +360,8 @@ def evaluate_toy_model(
             repeated = {
                 "context": {k: v.repeat(flat_actions.shape[0], *([1] * (v.ndim - 1))) for k, v in single["context"].items() if torch.is_tensor(v)},
             }
-            pred_pos = actions_to_positions(single["future_positions"][:, 0].repeat(flat_actions.shape[0], 1), flat_actions)
+            repeated["action_is_absolute"] = single.get("action_is_absolute", torch.tensor([False], device=flat_actions.device)).repeat(flat_actions.shape[0])
+            pred_pos = toy_actions_to_positions(single["future_positions"][:, 0].repeat(flat_actions.shape[0], 1), flat_actions, repeated)
             mode = classify_generated_modes(
                 pred_pos,
                 repeated["context"]["obstacle_center"],

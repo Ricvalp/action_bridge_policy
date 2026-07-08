@@ -59,6 +59,7 @@ def trajectory_batch_item(
     obs_history: int,
     action_history: int,
     chunk_horizon: int,
+    action_representation: str = "delta",
 ) -> dict:
     pos = positions[traj_id]
     act = actions[traj_id]
@@ -70,6 +71,8 @@ def trajectory_batch_item(
     future_positions = pos[t : t + chunk_horizon + 1]
     future_actions = act[t : t + chunk_horizon]
     act_hist = act[t - action_history : t]
+    previous_position = pos[t - 1] if t > 0 else pos[t]
+    action_is_absolute = action_representation == "absolute"
 
     context = {
         "start": starts[traj_id],
@@ -93,6 +96,9 @@ def trajectory_batch_item(
         "act_hist": act_hist.float(),
         "future_actions": future_actions.float(),
         "future_positions": future_positions.float(),
+        "current_position": pos[t].float(),
+        "previous_position": previous_position.float(),
+        "action_is_absolute": torch.tensor(action_is_absolute, dtype=torch.bool),
         "mode_label": label,
         "mode_sign": mode_sign.long(),
         "true_mode_probs": true_probs.float(),

@@ -20,8 +20,30 @@ def test_delayed_dataset_schema_shapes():
     assert item["act_hist"].shape == (2, 2)
     assert item["future_actions"].shape == (6, 2)
     assert item["future_positions"].shape == (7, 2)
+    assert item["current_position"].shape == (2,)
+    assert item["previous_position"].shape == (2,)
+    assert item["action_is_absolute"].shape == ()
     assert item["true_mode_probs"].shape == (2,)
     assert "goal" in item["context"]
+
+
+def test_delayed_dataset_absolute_actions_are_future_targets():
+    ds = DelayedBranchObstacleDataset(
+        {
+            "num_contexts": 8,
+            "trajectory_len": 24,
+            "chunk_horizon": 6,
+            "obs_history": 2,
+            "action_history": 2,
+            "shared_prefix_steps": 4,
+            "train_absolute_actions": True,
+        },
+        split="train",
+    )
+    item = ds[0]
+    assert bool(item["action_is_absolute"])
+    assert torch.allclose(item["act_hist"][-1], item["current_position"])
+    assert torch.allclose(item["future_actions"], item["future_positions"][1:])
 
 
 def test_paired_delayed_prefix_actions_are_identical():

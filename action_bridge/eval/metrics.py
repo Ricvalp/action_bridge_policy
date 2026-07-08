@@ -46,6 +46,13 @@ def action_smoothness(actions: torch.Tensor, act_hist: Optional[torch.Tensor] = 
     return {"acceleration_energy": accel_energy.mean(), "jerk_energy": jerk_energy.mean()}
 
 
+def toy_actions_to_positions(initial_pos: torch.Tensor, actions: torch.Tensor, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    is_absolute = batch.get("action_is_absolute")
+    if is_absolute is not None and bool(is_absolute.reshape(-1)[0].detach().cpu().item()):
+        return torch.cat([initial_pos[:, None], actions], dim=1)
+    return actions_to_positions(initial_pos, actions)
+
+
 def delayed_mode_metrics(positions: torch.Tensor, center: torch.Tensor, radius: torch.Tensor, collision: torch.Tensor) -> Dict[str, torch.Tensor]:
     batch = positions.shape[0]
     modes = []
@@ -160,7 +167,7 @@ def compute_toy_metrics(
 ) -> Dict[str, float]:
     target_actions = batch["future_actions"]
     true_positions = batch["future_positions"]
-    pred_positions = actions_to_positions(true_positions[:, 0], pred_actions)
+    pred_positions = toy_actions_to_positions(true_positions[:, 0], pred_actions, batch)
     context = batch["context"]
     center = context["obstacle_center"]
     radius = context["obstacle_radius"]

@@ -34,6 +34,40 @@ def generate_chunk(
             kappa=kappa,
             rho_z=rho_z,
         )
+    if bool(getattr(policy, "uses_contact_langevin", False)):
+        adapter = policy.coordinate_adapter
+        q, p = adapter.init_qp_from_history({"obs_hist": obs_hist, "act_hist": act_hist})
+        q_list = [q]
+        p_list = [p]
+        controls = []
+        path_kl_steps = []
+        path_kl = torch.zeros(obs_hist.shape[0], device=obs_hist.device, dtype=obs_hist.dtype)
+        for k in range(policy.chunk_horizon):
+            q, p, u, _ = policy.contact_step(q, p, h_emb, k, z_emb, deterministic=deterministic)
+            sigma = policy.reference_process.sigma_like(q)
+            if policy.reference_process.control_is_whitened:
+                step_path_kl = 0.5 * policy.reference_process.dt * u.pow(2).sum(dim=-1)
+            else:
+                step_path_kl = 0.5 * policy.reference_process.dt * (u / sigma).pow(2).sum(dim=-1)
+            path_kl = path_kl + step_path_kl
+            path_kl_steps.append(step_path_kl)
+            controls.append(u)
+            q_list.append(q)
+            p_list.append(p)
+        q_seq = torch.stack(q_list, dim=1)
+        actions = adapter.decode_raw_actions(q_seq)
+        return {
+            "actions": actions,
+            "means": actions,
+            "controls": torch.stack(controls, dim=1),
+            "q_seq": q_seq,
+            "p_seq": torch.stack(p_list, dim=1),
+            "z": z,
+            "z_emb": z_emb,
+            "path_kl_energy": path_kl,
+            "path_kl_steps": torch.stack(path_kl_steps, dim=1),
+        }
+
     a_prevprev = act_hist[:, -2]
     a_prev = act_hist[:, -1]
     actions = []
