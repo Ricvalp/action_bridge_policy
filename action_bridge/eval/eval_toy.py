@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from action_bridge.config import apply_overrides, load_config, save_config
 from action_bridge.eval.metrics import (
@@ -21,6 +21,7 @@ from action_bridge.eval.metrics import (
     toy_actions_to_positions,
 )
 from action_bridge.eval.rollout import generate_chunk, predict_actions
+from action_bridge.eval.selection import history_index_metadata, select_history_index
 from action_bridge.eval.visualization import (
     plot_closed_loop_rollouts,
     plot_calibration,
@@ -320,9 +321,20 @@ def evaluate_toy_model(
         except Exception as exc:
             summary["plot_dataset_error"] = str(exc)
 
-        first_loader = DataLoader(dataset, batch_size=min(8, max(1, len(dataset))), shuffle=False)
-        first_batch = move_to_device(next(iter(first_loader)), device)
-        single = slice_batch(first_batch, slice(0, 1))
+        eval_cfg = config.get("eval", {})
+        plot_index = select_history_index(
+            dataset,
+            trajectory_fraction=float(eval_cfg.get("generated_history_trajectory_fraction", 0.5)),
+            time_fraction=float(eval_cfg.get("generated_history_time_fraction", 0.5)),
+        )
+        plot_loader = DataLoader(Subset(dataset, [plot_index]), batch_size=1, shuffle=False)
+        single = move_to_device(next(iter(plot_loader)), device)
+        selected_metadata = history_index_metadata(dataset, [plot_index])[0]
+        summary["generated_plot_dataset_index"] = float(selected_metadata["dataset_index"])
+        if "trajectory_id" in selected_metadata:
+            summary["generated_plot_trajectory_id"] = float(selected_metadata["trajectory_id"])
+        if "time_index" in selected_metadata:
+            summary["generated_plot_time_index"] = float(selected_metadata["time_index"])
         num_samples = int(config.get("inference", {}).get("num_samples", 16))
         generated = []
         z_samples = []
@@ -347,6 +359,8 @@ def evaluate_toy_model(
                 summary["plot_energy_error"] = str(exc)
 
         if isinstance(model, ActionBridgePolicy) and model.latent_type == "categorical" and config.get("benchmark") == "toy_annular":
+            first_loader = DataLoader(dataset, batch_size=min(8, max(1, len(dataset))), shuffle=False)
+            first_batch = move_to_device(next(iter(first_loader)), device)
             prior = torch.softmax(model.prior_logits(model.encode_history(first_batch["obs_hist"], first_batch["act_hist"])), dim=-1)
             true = first_batch["context"]["p_ccw_true"]
             try:

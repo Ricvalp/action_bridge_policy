@@ -36,6 +36,18 @@ def _actions_to_positions_for_batch(base_pos: torch.Tensor, actions: torch.Tenso
     return actions_to_positions(base_pos, actions)
 
 
+def _batch_goal(batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
+    context = batch.get("context", {})
+    if not isinstance(context, dict):
+        return None
+    goal = context.get("goal")
+    if not torch.is_tensor(goal):
+        return None
+    if goal.ndim == 1:
+        return goal[None]
+    return goal
+
+
 def plot_dataset_samples(dataset, path: Path, max_items: int = 24) -> None:
     plt = _import_pyplot()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -81,8 +93,22 @@ def plot_generated_samples(
             single_batch = {**batch, "action_is_absolute": is_absolute}
             pred_pos = _actions_to_positions_for_batch(base_pos[b : b + 1], generated_actions[b, s : s + 1], single_batch).squeeze(0)
             ax.plot(pred_pos[:, 0].detach().cpu(), pred_pos[:, 1].detach().cpu(), linewidth=1.2, alpha=0.8)
+    goals = _batch_goal(batch)
+    if goals is not None:
+        ax.scatter(
+            goals[:, 0].detach().cpu(),
+            goals[:, 1].detach().cpu(),
+            color="red",
+            marker="x",
+            s=48,
+            linewidths=2.0,
+            label="goal",
+            zorder=5,
+        )
     _draw_obstacle(ax, batch["context"]["obstacle_center"][0], batch["context"]["obstacle_radius"][0])
     ax.set_title(title)
+    if goals is not None:
+        ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     plt.close(fig)

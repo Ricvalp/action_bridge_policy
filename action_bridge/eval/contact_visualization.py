@@ -220,6 +220,44 @@ def plot_contact_parameter_heatmaps(diagnostics: Dict[str, Any], path: Path) -> 
     plt.close(fig)
 
 
+def _spread_steps(horizon: int, count: int = 5) -> list[int]:
+    if horizon <= 1:
+        return [0]
+    raw = torch.linspace(0, horizon - 1, steps=min(count, horizon)).round().long().tolist()
+    steps: list[int] = []
+    for step in raw:
+        step = int(step)
+        if step not in steps:
+            steps.append(step)
+    return steps
+
+
+def _plot_contact_overlay(ax, diagnostics: Dict[str, Any], idx: int, *, show_labels: bool = False) -> None:
+    batch = diagnostics["batch"]
+    context = batch.get("context", {})
+    expert = batch.get("future_positions")
+    if expert is not None:
+        e = expert[idx]
+        ax.plot(e[:, 0], e[:, 1], color="white", linewidth=1.5, alpha=0.9, label="expert" if show_labels else None)
+    reference = diagnostics.get("reference_positions")
+    if reference is not None:
+        r = reference[idx]
+        ax.plot(r[:, 0], r[:, 1], color="tab:green", linestyle="--", linewidth=1.4, alpha=0.9, label="reference" if show_labels else None)
+    controlled = diagnostics["controlled_positions"][idx]
+    ax.plot(controlled[:, 0], controlled[:, 1], color="tab:cyan", linewidth=1.8, label="controlled" if show_labels else None)
+    m = diagnostics.get("m")
+    if m is not None:
+        attractor = m[idx]
+        ax.plot(attractor[:, 0], attractor[:, 1], color="tab:red", marker="x", markersize=3, linewidth=1.0, alpha=0.7, label="m path" if show_labels else None)
+    goal = context.get("goal")
+    if torch.is_tensor(goal):
+        g = goal[idx] if goal.ndim > 1 else goal
+        ax.scatter([float(g[0])], [float(g[1])], color="red", marker="*", s=70, edgecolors="white", linewidths=0.5, label="goal" if show_labels else None, zorder=6)
+    center = context.get("obstacle_center")
+    radius = context.get("obstacle_radius")
+    _draw_obstacle(ax, center[idx] if torch.is_tensor(center) else None, radius[idx] if torch.is_tensor(radius) else None)
+
+
 def plot_contact_potential_contours(diagnostics: Dict[str, Any], path: Path, example_idx: int = 0, grid_size: int = 80) -> None:
     m = diagnostics.get("m")
     k_diag = diagnostics.get("k_diag")
@@ -229,32 +267,72 @@ def plot_contact_potential_contours(diagnostics: Dict[str, Any], path: Path, exa
     path.parent.mkdir(parents=True, exist_ok=True)
     idx = min(example_idx, m.shape[0] - 1)
     horizon = m.shape[1]
-    steps = sorted(set([0, horizon // 2, horizon - 1]))
+    steps = _spread_steps(horizon, count=5)
     xs = torch.linspace(0.0, 1.0, grid_size)
     ys = torch.linspace(0.0, 1.0, grid_size)
     yy, xx = torch.meshgrid(ys, xs, indexing="ij")
     grid = torch.stack([xx, yy], dim=-1)
-    fig, axes = plt.subplots(1, len(steps), figsize=(4.2 * len(steps), 3.9), squeeze=False)
-    batch = diagnostics["batch"]
-    context = batch.get("context", {})
-    center = context.get("obstacle_center")
-    radius = context.get("obstacle_radius")
-    expert = batch.get("future_positions")
-    controlled = diagnostics["controlled_positions"][idx]
-    for ax, step in zip(axes.ravel(), steps):
+    potentials = []
+    forces = []
+    force_norms = []
+    for step in steps:
         center_m = m[idx, step]
         stiffness = k_diag[idx, step]
         diff = grid - center_m
         potential = 0.5 * (stiffness * diff.pow(2)).sum(dim=-1)
-        ax.contourf(xx.numpy(), yy.numpy(), potential.numpy(), levels=24, cmap="viridis")
-        ax.scatter([float(center_m[0])], [float(center_m[1])], color="red", marker="x", s=45, label="m")
-        if expert is not None:
-            e = expert[idx]
-            ax.plot(e[:, 0], e[:, 1], color="white", linewidth=1.5, alpha=0.85, label="expert")
-        ax.plot(controlled[:, 0], controlled[:, 1], color="tab:cyan", linewidth=1.7, label="controlled")
-        _draw_obstacle(ax, center[idx] if torch.is_tensor(center) else None, radius[idx] if torch.is_tensor(radius) else None)
-        ax.set_title(f"V(q,h,k), k={step}")
-    axes[0, 0].legend(fontsize=7)
-    fig.tight_layout()
+        force = -stiffness * diff
+        potentials.append(potential)
+        forces.append(force)
+        force_norms.append(torch.linalg.norm(force, dim=-1))
+
+    potential_stack = torch.stack(potentials)
+    force_norm_stack = torch.stack(force_norms)
+    potential_max = float(potential_stack.max().item())
+    force_norm_max = float(force_norm_stack.max().item())
+    potential_levels = torch.linspace(0.0, max(potential_max, 1e-8), 25).numpy()
+    force_levels = torch.linspace(0.0, max(force_norm_max, 1e-8), 25).numpy()
+
+    fig, axes = plt.subplots(2, len(steps), figsize=(4.1 * len(steps), 7.7), squeeze=False, layout="constrained")
+    gamma = diagnostics.get("gamma")
+    for col, step in enumerate(steps):
+        center_m = m[idx, step]
+        stiffness = k_diag[idx, step]
+        gamma_text = ""
+        if gamma is not None:
+            gamma_value = gamma[idx, step].float().mean()
+            gamma_text = f", gamma={float(gamma_value):.3g}"
+
+        ax = axes[0, col]
+        image = ax.contourf(xx.numpy(), yy.numpy(), potentials[col].numpy(), levels=potential_levels, cmap="viridis")
+        ax.scatter([float(center_m[0])], [float(center_m[1])], color="red", marker="x", s=52, linewidths=2.0, label="m" if col == 0 else None, zorder=7)
+        _plot_contact_overlay(ax, diagnostics, idx, show_labels=(col == 0))
+        ax.set_title(f"V, k={step}\nstiff=[{float(stiffness[0]):.2g}, {float(stiffness[1]):.2g}]{gamma_text}")
+
+        ax = axes[1, col]
+        ax.contourf(xx.numpy(), yy.numpy(), force_norms[col].numpy(), levels=force_levels, cmap="magma")
+        skip = max(1, grid_size // 14)
+        force = forces[col]
+        if force_norm_max > 1e-12:
+            quiver = force / force_norm_max * 0.08
+            ax.quiver(
+                xx[::skip, ::skip].numpy(),
+                yy[::skip, ::skip].numpy(),
+                quiver[::skip, ::skip, 0].numpy(),
+                quiver[::skip, ::skip, 1].numpy(),
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+                width=0.003,
+                color="white",
+                alpha=0.8,
+            )
+        ax.scatter([float(center_m[0])], [float(center_m[1])], color="cyan", marker="x", s=52, linewidths=2.0, zorder=7)
+        _plot_contact_overlay(ax, diagnostics, idx, show_labels=False)
+        ax.set_title(f"|-grad V| and force, k={step}")
+
+    axes[0, 0].legend(fontsize=7, loc="upper right")
+    fig.colorbar(image, ax=axes[0, :], fraction=0.02, pad=0.015, label="V(q,h,k)")
+    force_image = axes[1, -1].collections[0]
+    fig.colorbar(force_image, ax=axes[1, :], fraction=0.02, pad=0.015, label="|-grad V|")
     fig.savefig(path, dpi=170)
     plt.close(fig)

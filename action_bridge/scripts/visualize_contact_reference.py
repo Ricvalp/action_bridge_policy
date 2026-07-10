@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import List
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -18,40 +17,17 @@ from action_bridge.eval.contact_visualization import (
     plot_contact_potential_contours,
     plot_contact_reference_summary,
 )
+from action_bridge.eval.selection import history_index_metadata, representative_history_indices
 from action_bridge.training.common import build_dataset, build_model, resolve_device, save_json, seed_everything
 
 
-def representative_indices(dataset, count: int) -> List[int]:
-    count = min(count, len(dataset))
-    if count <= 0:
-        return []
-    selected: List[int] = []
-    seen_modes = set()
-    for idx in range(len(dataset)):
-        item = dataset[idx]
-        mode = item.get("mode_sign")
-        if mode is None:
-            continue
-        mode_value = int(mode)
-        if mode_value in seen_modes:
-            continue
-        selected.append(idx)
-        seen_modes.add(mode_value)
-        if len(selected) >= count:
-            return selected
-    if len(selected) < count:
-        positions = torch.linspace(0, max(0, len(dataset) - 1), steps=count + 2).long().tolist()[1:-1]
-        for idx in positions:
-            if idx not in selected:
-                selected.append(int(idx))
-            if len(selected) >= count:
-                break
-    idx = 0
-    while len(selected) < count:
-        if idx not in selected:
-            selected.append(idx)
-        idx += 1
-    return selected
+def parse_fraction_list(raw: str | None):
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    return [float(part.strip()) for part in text.split(",") if part.strip()]
 
 
 def default_output_dir(checkpoint: Path) -> Path:
@@ -73,6 +49,9 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-examples", type=int, default=12)
     parser.add_argument("--example-idx", type=int, default=0)
+    parser.add_argument("--time-fractions", default="0.2,0.5,0.8")
+    parser.add_argument("--trajectory-fractions", default=None)
+    parser.add_argument("--dataset-index", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -92,7 +71,15 @@ def main() -> None:
         raise SystemExit("This checkpoint does not use reference.type=contact_langevin.")
 
     dataset = build_dataset(config, split=args.split)
-    indices = representative_indices(dataset, args.num_examples)
+    if args.dataset_index is not None:
+        indices = [int(args.dataset_index)]
+    else:
+        indices = representative_history_indices(
+            dataset,
+            args.num_examples,
+            time_fractions=parse_fraction_list(args.time_fractions) or [0.5],
+            trajectory_fractions=parse_fraction_list(args.trajectory_fractions),
+        )
     subset = Subset(dataset, indices)
     batch = next(iter(DataLoader(subset, batch_size=len(indices), shuffle=False)))
 
@@ -109,6 +96,9 @@ def main() -> None:
             "checkpoint": str(checkpoint),
             "split": args.split,
             "indices": indices,
+            "selected_histories": history_index_metadata(dataset, indices),
+            "time_fractions": parse_fraction_list(args.time_fractions),
+            "trajectory_fractions": parse_fraction_list(args.trajectory_fractions),
             "coordinate_mode": diagnostics["coordinate_mode"],
             "summary": contact_summary_stats(diagnostics),
         },

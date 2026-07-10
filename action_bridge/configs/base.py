@@ -31,6 +31,8 @@ def _toy_eval_config() -> ConfigDict:
     config.closed_loop = True
     config.closed_loop_episodes = 128
     config.closed_loop_plot_rollouts = 24
+    config.generated_history_trajectory_fraction = 0.5
+    config.generated_history_time_fraction = 0.5
     return config
 
 
