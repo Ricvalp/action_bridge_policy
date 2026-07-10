@@ -41,6 +41,16 @@ def smoothness_losses(actions: torch.Tensor, act_hist: Optional[torch.Tensor] = 
     return {"acceleration_energy": accel_energy, "jerk_energy": jerk_energy}
 
 
+def scheduled_loss_weight(loss_config: Dict, key: str, global_step: int) -> float:
+    target = float(loss_config.get(key, 0.0))
+    if target <= 0.0:
+        return 0.0
+    warmup = int(loss_config.get(f"{key}_warmup_steps", 0))
+    if warmup <= 0:
+        return target
+    return linear_warmup(global_step, 0.0, target, warmup)
+
+
 def bridge_path_losses_conditioned(
     policy: ActionBridgePolicy,
     h_emb: torch.Tensor,
@@ -68,6 +78,23 @@ def bridge_path_losses_conditioned(
         path_kl = path_kl + step_kl.sum(dim=-1)
         mse = mse + (target - mu).pow(2).sum(dim=-1)
     return {"nll": nll, "path_kl": path_kl, "mse": mse / max(1, future_actions.shape[1])}
+
+
+def bridge_unrolled_mse_conditioned(
+    policy: ActionBridgePolicy,
+    h_emb: torch.Tensor,
+    act_hist: torch.Tensor,
+    future_actions: torch.Tensor,
+    z_emb: Optional[torch.Tensor],
+) -> torch.Tensor:
+    a_prevprev = act_hist[:, -2]
+    a_prev = act_hist[:, -1]
+    mse = torch.zeros(future_actions.shape[0], device=future_actions.device, dtype=future_actions.dtype)
+    for k in range(future_actions.shape[1]):
+        action, _, _, _ = policy.step(a_prev, a_prevprev, h_emb, k, z_emb, deterministic=True)
+        mse = mse + (future_actions[:, k] - action).pow(2).sum(dim=-1)
+        a_prevprev, a_prev = a_prev, action
+    return mse / max(1, future_actions.shape[1])
 
 
 def contact_path_losses_conditioned(
@@ -161,14 +188,35 @@ def contact_path_losses_conditioned(
     }
 
 
+def contact_unrolled_mse_conditioned(
+    policy: ActionBridgePolicy,
+    h_emb: torch.Tensor,
+    batch: Dict[str, torch.Tensor],
+    z_emb: Optional[torch.Tensor],
+) -> torch.Tensor:
+    future_actions = batch["future_actions"]
+    adapter = policy.coordinate_adapter
+    q, p = adapter.init_qp_from_history(batch)
+    mse = torch.zeros(future_actions.shape[0], device=future_actions.device, dtype=future_actions.dtype)
+    for k in range(future_actions.shape[1]):
+        q_next, p_next, _, _ = policy.contact_step(q, p, h_emb, k, z_emb, deterministic=True)
+        raw_pred = adapter.decode_step(q, q_next)
+        mse = mse + (future_actions[:, k] - raw_pred).pow(2).sum(dim=-1)
+        q, p = q_next, p_next
+    return mse / max(1, future_actions.shape[1])
+
+
 def _contact_metric_template(policy: ActionBridgePolicy, value: torch.Tensor, metrics: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     ref = policy.reference_process
     ref_reg_loss = ref.lambda_ref_reg * metrics["ref_reg"]
     m_smooth_loss = ref.lambda_m_smooth * metrics["m_smooth"]
+    zero = value.new_zeros(())
     return {
         "nll": value,
         "path_kl": metrics["path_kl"],
         "action_mse": metrics["action_mse"],
+        "unroll_mse": metrics.get("unroll_mse", zero),
+        "lambda_unroll": metrics.get("lambda_unroll", zero),
         "loss_p": metrics["loss_p"],
         "loss_q": metrics["loss_q"],
         "control_energy": metrics["path_kl"],
@@ -201,6 +249,7 @@ def contact_bridge_loss(
         float(loss_config.get("beta_z_end", 0.01)),
         int(loss_config.get("beta_z_warmup_steps", 10000)),
     )
+    lambda_unroll = scheduled_loss_weight(loss_config, "lambda_unroll", global_step)
     free_nats = float(loss_config.get("free_nats", 0.0))
 
     def aggregate(out: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -226,21 +275,31 @@ def contact_bridge_loss(
         q_logits = policy.latent.posterior_logits(h_emb, future_actions)
         q_probs = torch.softmax(q_logits, dim=-1)
         per_z = []
+        per_z_unroll = []
         for z_id in range(policy.latent.num_categories):
             ids = torch.full((future_actions.shape[0],), z_id, device=future_actions.device, dtype=torch.long)
             z_emb = policy.latent.embed_ids(ids)
             per_z.append(contact_path_losses_conditioned(policy, h_emb, batch, z_emb))
+            if lambda_unroll > 0.0:
+                per_z_unroll.append(contact_unrolled_mse_conditioned(policy, h_emb, batch, z_emb))
         nll_z = torch.stack([item["nll"] for item in per_z], dim=-1)
         path_kl_z = torch.stack([item["path_kl"] for item in per_z], dim=-1)
         mse_z = torch.stack([item["mse"] for item in per_z], dim=-1)
         loss_p_z = torch.stack([item["loss_p"] for item in per_z], dim=-1)
         loss_q_z = torch.stack([item["loss_q"] for item in per_z], dim=-1)
+        if per_z_unroll:
+            unroll_z = torch.stack(per_z_unroll, dim=-1)
+            unroll_mse = (q_probs * unroll_z).sum(dim=-1).mean()
+        else:
+            unroll_mse = future_actions.new_zeros(())
         metrics = {
             "nll": (q_probs * nll_z).sum(dim=-1).mean(),
             "path_kl": (q_probs * path_kl_z).sum(dim=-1).mean(),
             "action_mse": (q_probs * mse_z).sum(dim=-1).mean(),
             "loss_p": (q_probs * loss_p_z).sum(dim=-1).mean(),
             "loss_q": (q_probs * loss_q_z).sum(dim=-1).mean(),
+            "unroll_mse": unroll_mse,
+            "lambda_unroll": future_actions.new_tensor(lambda_unroll),
             **{key: per_z[0][key] for key in ["ref_reg", "m_smooth", "gamma_mean", "gamma_min", "gamma_max", "k_diag_mean", "k_diag_max", "velocity_energy", "q_acceleration_energy"]},
         }
         raw_latent_kl = categorical_kl(q_logits, p_logits)
@@ -254,7 +313,7 @@ def contact_bridge_loss(
         base_loss = metrics["nll"] + ref.beta_kl * metrics["path_kl"]
         ref_reg_loss = ref.lambda_ref_reg * metrics["ref_reg"]
         m_smooth_loss = ref.lambda_m_smooth * metrics["m_smooth"]
-        loss = base_loss + beta_z * latent_kl_loss + beta_aux * aux + ref_reg_loss + m_smooth_loss
+        loss = base_loss + lambda_unroll * unroll_mse + beta_z * latent_kl_loss + beta_aux * aux + ref_reg_loss + m_smooth_loss
         return {
             "loss": loss,
             **_contact_metric_template(policy, metrics["nll"], metrics),
@@ -274,18 +333,23 @@ def contact_bridge_loss(
         latent_kl_loss = raw_latent_kl.clamp_min(free_nats).mean() if free_nats > 0 else raw_latent_kl.mean()
         n_samples = int(loss_config.get("num_z_samples_train", 1))
         totals = []
+        unroll_total = future_actions.new_zeros(())
         for _ in range(max(1, n_samples)):
             z = policy.latent.reparameterize(mu_q, logvar_q)
             z_emb = policy.latent.embed(z)
             totals.append(aggregate(contact_path_losses_conditioned(policy, h_emb, batch, z_emb)))
+            if lambda_unroll > 0.0:
+                unroll_total = unroll_total + contact_unrolled_mse_conditioned(policy, h_emb, batch, z_emb).mean()
         denom = float(max(1, n_samples))
         metrics = {}
         for key in totals[0]:
             metrics[key] = sum(item[key] for item in totals) / denom
+        metrics["unroll_mse"] = unroll_total / denom if lambda_unroll > 0.0 else future_actions.new_zeros(())
+        metrics["lambda_unroll"] = future_actions.new_tensor(lambda_unroll)
         base_loss = metrics["nll"] + ref.beta_kl * metrics["path_kl"]
         ref_reg_loss = ref.lambda_ref_reg * metrics["ref_reg"]
         m_smooth_loss = ref.lambda_m_smooth * metrics["m_smooth"]
-        loss = base_loss + beta_z * latent_kl_loss + ref_reg_loss + m_smooth_loss
+        loss = base_loss + lambda_unroll * metrics["unroll_mse"] + beta_z * latent_kl_loss + ref_reg_loss + m_smooth_loss
         posterior_entropy = 0.5 * (1.0 + torch.log(torch.tensor(2.0 * torch.pi, device=future_actions.device)) + logvar_q).sum(dim=-1).mean()
         prior_entropy = 0.5 * (1.0 + torch.log(torch.tensor(2.0 * torch.pi, device=future_actions.device)) + logvar_p).sum(dim=-1).mean()
         return {
@@ -300,10 +364,16 @@ def contact_bridge_loss(
         }
 
     metrics = aggregate(contact_path_losses_conditioned(policy, h_emb, batch, None))
+    metrics["unroll_mse"] = (
+        contact_unrolled_mse_conditioned(policy, h_emb, batch, None).mean()
+        if lambda_unroll > 0.0
+        else future_actions.new_zeros(())
+    )
+    metrics["lambda_unroll"] = future_actions.new_tensor(lambda_unroll)
     base_loss = metrics["nll"] + ref.beta_kl * metrics["path_kl"]
     ref_reg_loss = ref.lambda_ref_reg * metrics["ref_reg"]
     m_smooth_loss = ref.lambda_m_smooth * metrics["m_smooth"]
-    loss = base_loss + ref_reg_loss + m_smooth_loss
+    loss = base_loss + lambda_unroll * metrics["unroll_mse"] + ref_reg_loss + m_smooth_loss
     return {
         "loss": loss,
         **_contact_metric_template(policy, metrics["nll"], metrics),
@@ -336,6 +406,7 @@ def bridge_loss(
         float(loss_config.get("beta_z_end", 0.01)),
         int(loss_config.get("beta_z_warmup_steps", 10000)),
     )
+    lambda_unroll = scheduled_loss_weight(loss_config, "lambda_unroll", global_step)
     tube_std = 0.0
     if bool(loss_config.get("tube_training", False)):
         tube_std = linear_warmup(
@@ -353,6 +424,7 @@ def bridge_loss(
         per_z_nll = []
         per_z_kl = []
         per_z_mse = []
+        per_z_unroll = []
         for z_id in range(policy.latent.num_categories):
             ids = torch.full((future_actions.shape[0],), z_id, device=future_actions.device, dtype=torch.long)
             z_emb = policy.latent.embed_ids(ids)
@@ -360,9 +432,16 @@ def bridge_loss(
             per_z_nll.append(out["nll"])
             per_z_kl.append(out["path_kl"])
             per_z_mse.append(out["mse"])
+            if lambda_unroll > 0.0:
+                per_z_unroll.append(bridge_unrolled_mse_conditioned(policy, h_emb, act_hist, future_actions, z_emb))
         nll_z = torch.stack(per_z_nll, dim=-1)
         path_kl_z = torch.stack(per_z_kl, dim=-1)
         mse_z = torch.stack(per_z_mse, dim=-1)
+        if per_z_unroll:
+            unroll_z = torch.stack(per_z_unroll, dim=-1)
+            unroll_mse = (q_probs * unroll_z).sum(dim=-1).mean()
+        else:
+            unroll_mse = future_actions.new_zeros(())
         nll = (q_probs * nll_z).sum(dim=-1).mean()
         path_kl = (q_probs * path_kl_z).sum(dim=-1).mean()
         action_mse = (q_probs * mse_z).sum(dim=-1).mean()
@@ -374,12 +453,14 @@ def bridge_loss(
         beta_aux = float(loss_config.get("beta_aux_mode_ce", 0.0))
         if beta_aux > 0 and "mode_label" in batch:
             aux = F.cross_entropy(q_logits, batch["mode_label"].long())
-        loss = nll + beta_r * path_kl + beta_z * latent_kl_loss + beta_aux * aux
+        loss = nll + beta_r * path_kl + lambda_unroll * unroll_mse + beta_z * latent_kl_loss + beta_aux * aux
         return {
             "loss": loss,
             "nll": nll,
             "path_kl": path_kl,
             "action_mse": action_mse,
+            "unroll_mse": unroll_mse,
+            "lambda_unroll": future_actions.new_tensor(lambda_unroll),
             "latent_kl": raw_latent_kl.mean(),
             "latent_kl_loss": latent_kl_loss,
             "prior_entropy": prior_entropy,
@@ -398,6 +479,7 @@ def bridge_loss(
         nll_total = future_actions.new_zeros(())
         path_kl_total = future_actions.new_zeros(())
         mse_total = future_actions.new_zeros(())
+        unroll_total = future_actions.new_zeros(())
         for _ in range(max(1, n_samples)):
             z = policy.latent.reparameterize(mu_q, logvar_q)
             z_emb = policy.latent.embed(z)
@@ -405,11 +487,14 @@ def bridge_loss(
             nll_total = nll_total + out["nll"].mean()
             path_kl_total = path_kl_total + out["path_kl"].mean()
             mse_total = mse_total + out["mse"].mean()
+            if lambda_unroll > 0.0:
+                unroll_total = unroll_total + bridge_unrolled_mse_conditioned(policy, h_emb, act_hist, future_actions, z_emb).mean()
         denom = float(max(1, n_samples))
         nll = nll_total / denom
         path_kl = path_kl_total / denom
         action_mse = mse_total / denom
-        loss = nll + beta_r * path_kl + beta_z * latent_kl_loss
+        unroll_mse = unroll_total / denom if lambda_unroll > 0.0 else future_actions.new_zeros(())
+        loss = nll + beta_r * path_kl + lambda_unroll * unroll_mse + beta_z * latent_kl_loss
         posterior_entropy = 0.5 * (1.0 + torch.log(torch.tensor(2.0 * torch.pi, device=future_actions.device)) + logvar_q).sum(dim=-1).mean()
         prior_entropy = 0.5 * (1.0 + torch.log(torch.tensor(2.0 * torch.pi, device=future_actions.device)) + logvar_p).sum(dim=-1).mean()
         return {
@@ -417,6 +502,8 @@ def bridge_loss(
             "nll": nll,
             "path_kl": path_kl,
             "action_mse": action_mse,
+            "unroll_mse": unroll_mse,
+            "lambda_unroll": future_actions.new_tensor(lambda_unroll),
             "latent_kl": raw_latent_kl.mean(),
             "latent_kl_loss": latent_kl_loss,
             "prior_entropy": prior_entropy,
@@ -429,12 +516,19 @@ def bridge_loss(
     nll = out["nll"].mean()
     path_kl = out["path_kl"].mean()
     action_mse = out["mse"].mean()
-    loss = nll + beta_r * path_kl
+    unroll_mse = (
+        bridge_unrolled_mse_conditioned(policy, h_emb, act_hist, future_actions, None).mean()
+        if lambda_unroll > 0.0
+        else future_actions.new_zeros(())
+    )
+    loss = nll + beta_r * path_kl + lambda_unroll * unroll_mse
     return {
         "loss": loss,
         "nll": nll,
         "path_kl": path_kl,
         "action_mse": action_mse,
+        "unroll_mse": unroll_mse,
+        "lambda_unroll": future_actions.new_tensor(lambda_unroll),
         "latent_kl": future_actions.new_zeros(()),
         "latent_kl_loss": future_actions.new_zeros(()),
         "prior_entropy": future_actions.new_zeros(()),
@@ -444,7 +538,13 @@ def bridge_loss(
     }
 
 
-def direct_bc_loss(model: DirectChunkBCPolicy, batch: Dict[str, torch.Tensor], loss_config: Dict) -> Dict[str, torch.Tensor]:
+def direct_bc_loss(
+    model: DirectChunkBCPolicy,
+    batch: Dict[str, torch.Tensor],
+    loss_config: Dict,
+    global_step: int = 0,
+) -> Dict[str, torch.Tensor]:
+    del global_step
     pred = model(batch["obs_hist"], batch["act_hist"])
     mse = F.mse_loss(pred, batch["future_actions"])
     smooth = smoothness_losses(pred, batch["act_hist"])
@@ -457,12 +557,19 @@ def direct_bc_loss(model: DirectChunkBCPolicy, batch: Dict[str, torch.Tensor], l
         "nll": mse,
         "path_kl": pred.new_zeros(()),
         "latent_kl": pred.new_zeros(()),
+        "unroll_mse": mse,
+        "lambda_unroll": pred.new_zeros(()),
         "acceleration_energy": smooth["acceleration_energy"],
         "jerk_energy": smooth["jerk_energy"],
     }
 
 
-def autoregressive_bc_loss(model: AutoregressiveBCPolicy, batch: Dict[str, torch.Tensor], loss_config: Dict) -> Dict[str, torch.Tensor]:
+def autoregressive_bc_loss(
+    model: AutoregressiveBCPolicy,
+    batch: Dict[str, torch.Tensor],
+    loss_config: Dict,
+    global_step: int = 0,
+) -> Dict[str, torch.Tensor]:
     obs_hist = batch["obs_hist"]
     act_hist = batch["act_hist"]
     future = batch["future_actions"]
@@ -473,8 +580,12 @@ def autoregressive_bc_loss(model: AutoregressiveBCPolicy, batch: Dict[str, torch
         preds.append(model.predict_step(a_prev, a_prevprev, h, k))
     pred = torch.stack(preds, dim=1)
     mse = F.mse_loss(pred, future)
+    free_pred = model.generate(obs_hist, act_hist, deterministic=True)
+    unroll_mse = F.mse_loss(free_pred, future)
+    lambda_unroll = scheduled_loss_weight(loss_config, "lambda_unroll", global_step)
     smooth = smoothness_losses(pred, act_hist)
     loss = mse
+    loss = loss + lambda_unroll * unroll_mse
     loss = loss + float(loss_config.get("lambda_acc", 0.0)) * smooth["acceleration_energy"]
     loss = loss + float(loss_config.get("lambda_jerk", 0.0)) * smooth["jerk_energy"]
     return {
@@ -483,6 +594,8 @@ def autoregressive_bc_loss(model: AutoregressiveBCPolicy, batch: Dict[str, torch
         "nll": mse,
         "path_kl": pred.new_zeros(()),
         "latent_kl": pred.new_zeros(()),
+        "unroll_mse": unroll_mse,
+        "lambda_unroll": pred.new_tensor(lambda_unroll),
         "acceleration_energy": smooth["acceleration_energy"],
         "jerk_energy": smooth["jerk_energy"],
     }
@@ -492,7 +605,7 @@ def model_loss(model, batch: Dict[str, torch.Tensor], loss_config: Dict, global_
     if isinstance(model, ActionBridgePolicy):
         return bridge_loss(model, batch, loss_config, global_step=global_step)
     if isinstance(model, DirectChunkBCPolicy):
-        return direct_bc_loss(model, batch, loss_config)
+        return direct_bc_loss(model, batch, loss_config, global_step=global_step)
     if isinstance(model, AutoregressiveBCPolicy):
-        return autoregressive_bc_loss(model, batch, loss_config)
+        return autoregressive_bc_loss(model, batch, loss_config, global_step=global_step)
     raise TypeError(f"Unsupported model type {type(model)!r}.")

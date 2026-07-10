@@ -85,6 +85,10 @@ def build_dataset(config: Dict, split: str):
             action_key=data_cfg.get("action_key"),
             episode_ends_key=data_cfg.get("episode_ends_key"),
             max_episodes=data_cfg.get("max_episodes"),
+            normalize=bool(data_cfg.get("normalize", False)),
+            normalization_stats=data_cfg.get("normalization_stats"),
+            normalization_eps=float(data_cfg.get("normalization_eps", 1e-6)),
+            pad_episode_starts=bool(data_cfg.get("pad_episode_starts", False)),
         )
     raise ValueError(f"Unsupported benchmark {benchmark!r} for train_toy.")
 
@@ -116,6 +120,13 @@ def make_run_dir(config: Dict) -> Path:
         run_id = f"{stamp}_{config.get('config_name', 'run')}_{config.get('model', {}).get('policy_type', 'action_bridge')}"
     root = Path(config.get("output_dir", "outputs"))
     path = root / run_id
+    if path.exists() and not path.is_dir():
+        raise FileExistsError(f"Output path exists and is not a directory: {path}")
+    if path.exists() and any(path.iterdir()) and not bool(config.get("resume", False)):
+        raise FileExistsError(
+            f"Output directory already exists: {path}. Use a new run_id, remove the directory, "
+            "or pass resume=true to allow reusing it."
+        )
     (path / "checkpoints").mkdir(parents=True, exist_ok=True)
     (path / "metrics").mkdir(parents=True, exist_ok=True)
     (path / "figures").mkdir(parents=True, exist_ok=True)

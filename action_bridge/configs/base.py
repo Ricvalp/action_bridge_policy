@@ -210,6 +210,10 @@ def pusht_lowdim_config(latent_type: str) -> ConfigDict:
     config.data.action_key = None
     config.data.episode_ends_key = None
     config.data.max_episodes = None
+    config.data.normalize = True
+    config.data.normalization_stats = None
+    config.data.normalization_eps = 1e-6
+    config.data.pad_episode_starts = True
     config.model = ConfigDict()
     config.model.policy_type = "action_bridge"
     config.model.hidden_dim = 512
@@ -260,6 +264,8 @@ def pusht_lowdim_config(latent_type: str) -> ConfigDict:
     config.loss.tube_noise_std_start = 0.0
     config.loss.tube_noise_std_end = 0.01
     config.loss.tube_noise_warmup_steps = 10000
+    config.loss.lambda_unroll = 1.0
+    config.loss.lambda_unroll_warmup_steps = 5000
     if latent_type == "continuous":
         config.loss.num_z_samples_train = 1
     config.optim = ConfigDict()

@@ -41,6 +41,9 @@ def sync_config_dims(config, dataset) -> None:
         config["obs_dim"] = int(obs_dim)
     if action_dim is not None:
         config["action_dim"] = int(action_dim)
+    normalization_stats = getattr(dataset, "normalization_stats", None)
+    if normalization_stats is not None:
+        config["data"]["normalization_stats"] = normalization_stats
 
 
 def periodic_pusht_eval_config(config, logging_cfg) -> ConfigDict:

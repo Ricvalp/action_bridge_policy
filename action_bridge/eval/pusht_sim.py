@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 
+from action_bridge.data.pusht_adapter import denormalize_actions_np, normalize_actions_np, normalize_observations_np
 from action_bridge.eval.rollout import generate_chunk, predict_actions
 from action_bridge.models.action_bridge_policy import ActionBridgePolicy
 from action_bridge.training.common import save_json
@@ -18,6 +19,14 @@ def _as_float(value: Any) -> float:
     if torch.is_tensor(value):
         return float(value.detach().cpu().item())
     return float(value)
+
+
+def _normalization_stats(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    data_cfg = config.get("data", {})
+    stats = data_cfg.get("normalization_stats")
+    if bool(data_cfg.get("normalize", False)) and stats is not None:
+        return stats
+    return None
 
 
 def _import_pyplot():
@@ -201,12 +210,17 @@ def rollout_pusht_sim_episode(model, config: Dict[str, Any], device: torch.devic
         num_replans = 0
 
         for _ in range(0, max_steps, n_exec):
+            stats = _normalization_stats(config)
+            model_obs_hist = normalize_observations_np(obs_hist, stats) if stats is not None else obs_hist
+            model_act_hist = normalize_actions_np(act_hist, stats) if stats is not None else act_hist
             batch = {
-                "obs_hist": torch.from_numpy(obs_hist[None]).to(device=device, dtype=torch.float32),
-                "act_hist": torch.from_numpy(act_hist[None]).to(device=device, dtype=torch.float32),
+                "obs_hist": torch.from_numpy(model_obs_hist[None]).to(device=device, dtype=torch.float32),
+                "act_hist": torch.from_numpy(model_act_hist[None]).to(device=device, dtype=torch.float32),
             }
             pred, z, z_emb = _generate_chunk_with_commitment(model, batch, config, z, z_emb)
             pred_actions = pred["actions"][0].detach().cpu().numpy().astype(np.float32)
+            if stats is not None:
+                pred_actions = denormalize_actions_np(pred_actions, stats)
             execute = min(n_exec, pred_actions.shape[0], max_steps - len(actions))
             if execute <= 0:
                 break

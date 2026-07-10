@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from action_bridge.config import apply_overrides, load_config, save_config
+from action_bridge.data.pusht_adapter import denormalize_actions_tensor, denormalize_observations_tensor
 from action_bridge.eval.metrics import action_smoothness, average_metric_dicts
 from action_bridge.eval.rollout import predict_actions
 from action_bridge.eval.visualization import plot_energy_histograms
@@ -26,10 +27,35 @@ def _sync_config_dims(config, dataset) -> None:
         config["obs_dim"] = int(obs_dim)
     if action_dim is not None:
         config["action_dim"] = int(action_dim)
+    normalization_stats = getattr(dataset, "normalization_stats", None)
+    if normalization_stats is not None:
+        config["data"]["normalization_stats"] = normalization_stats
 
 
 def _as_float(value: torch.Tensor) -> float:
     return float(value.detach().cpu().item())
+
+
+def _normalization_stats(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    data_cfg = config.get("data", {})
+    stats = data_cfg.get("normalization_stats")
+    if bool(data_cfg.get("normalize", False)) and stats is not None:
+        return stats
+    return None
+
+
+def _maybe_denormalize_actions(actions: torch.Tensor, config: Dict[str, Any]) -> torch.Tensor:
+    stats = _normalization_stats(config)
+    if stats is None:
+        return actions
+    return denormalize_actions_tensor(actions, stats)
+
+
+def _maybe_denormalize_observations(obs: torch.Tensor, config: Dict[str, Any]) -> torch.Tensor:
+    stats = _normalization_stats(config)
+    if stats is None:
+        return obs
+    return denormalize_observations_tensor(obs, stats)
 
 
 def _import_pyplot():
@@ -41,11 +67,18 @@ def _import_pyplot():
     return plt
 
 
-def compute_pusht_batch_metrics(pred_actions: torch.Tensor, batch: Dict[str, Any], path_kl_energy: Optional[torch.Tensor] = None) -> Dict[str, float]:
-    target_actions = batch["future_actions"]
-    smooth_pred = action_smoothness(pred_actions, batch["act_hist"])
-    smooth_target = action_smoothness(target_actions, batch["act_hist"])
-    boundary = torch.linalg.norm(pred_actions[:, 0] - batch["act_hist"][:, -1], dim=-1).mean()
+def compute_pusht_batch_metrics(
+    pred_actions: torch.Tensor,
+    batch: Dict[str, Any],
+    config: Dict[str, Any],
+    path_kl_energy: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
+    target_actions = _maybe_denormalize_actions(batch["future_actions"], config)
+    pred_actions = _maybe_denormalize_actions(pred_actions, config)
+    act_hist = _maybe_denormalize_actions(batch["act_hist"], config)
+    smooth_pred = action_smoothness(pred_actions, act_hist)
+    smooth_target = action_smoothness(target_actions, act_hist)
+    boundary = torch.linalg.norm(pred_actions[:, 0] - act_hist[:, -1], dim=-1).mean()
     return {
         "action_mse": _as_float(F.mse_loss(pred_actions, target_actions)),
         "action_l1": _as_float(F.l1_loss(pred_actions, target_actions)),
@@ -75,14 +108,20 @@ def plot_action_error_histograms(per_sample_mse: torch.Tensor, per_sample_l1: to
     plt.close(fig)
 
 
-def plot_action_rollout_examples(batch: Dict[str, Any], pred_actions: torch.Tensor, path: Path, max_items: int = 6) -> None:
+def plot_action_rollout_examples(
+    batch: Dict[str, Any],
+    pred_actions: torch.Tensor,
+    path: Path,
+    config: Dict[str, Any],
+    max_items: int = 6,
+) -> None:
     plt = _import_pyplot()
     path.parent.mkdir(parents=True, exist_ok=True)
     count = min(max_items, pred_actions.shape[0])
     fig, axes = plt.subplots(count, 2, figsize=(8.0, 2.2 * count), squeeze=False, sharex=True)
     t = torch.arange(pred_actions.shape[1]).detach().cpu()
-    target = batch["future_actions"].detach().cpu()
-    pred = pred_actions.detach().cpu()
+    target = _maybe_denormalize_actions(batch["future_actions"], config).detach().cpu()
+    pred = _maybe_denormalize_actions(pred_actions, config).detach().cpu()
     for idx in range(count):
         for dim, name in enumerate(["action x", "action y"]):
             ax = axes[idx, dim]
@@ -141,17 +180,23 @@ def _draw_tee(ax, pose: np.ndarray, color: str, alpha: float, label: Optional[st
         ax.add_patch(patch)
 
 
-def plot_action_chunk_2d(batch: Dict[str, Any], pred_actions: torch.Tensor, path: Path, max_items: int = 6) -> None:
+def plot_action_chunk_2d(
+    batch: Dict[str, Any],
+    pred_actions: torch.Tensor,
+    path: Path,
+    config: Dict[str, Any],
+    max_items: int = 6,
+) -> None:
     plt = _import_pyplot()
     path.parent.mkdir(parents=True, exist_ok=True)
     count = min(max_items, pred_actions.shape[0])
     cols = min(3, count)
     rows = int(math.ceil(count / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(4.2 * cols, 4.2 * rows), squeeze=False)
-    target = batch["future_actions"].detach().cpu().numpy()
-    pred = pred_actions.detach().cpu().numpy()
-    obs_hist = batch["obs_hist"].detach().cpu().numpy()
-    act_hist = batch["act_hist"].detach().cpu().numpy()
+    target = _maybe_denormalize_actions(batch["future_actions"], config).detach().cpu().numpy()
+    pred = _maybe_denormalize_actions(pred_actions, config).detach().cpu().numpy()
+    obs_hist = _maybe_denormalize_observations(batch["obs_hist"], config).detach().cpu().numpy()
+    act_hist = _maybe_denormalize_actions(batch["act_hist"], config).detach().cpu().numpy()
     goal_pose = np.array([256.0, 256.0, math.pi / 4], dtype=np.float32)
     for flat_idx, ax in enumerate(axes.ravel()):
         if flat_idx >= count:
@@ -261,9 +306,12 @@ def offline_receding_horizon_metrics(model, dataset, config: Dict, device: torch
             execute = min(n_exec, length - t, pred["actions"].shape[1])
             generated = pred["actions"][:, :execute]
             target = batch["future_actions"][:, :execute]
-            action_errors.append((generated - target).pow(2).mean())
-            first_errors.append((generated[:, 0] - target[:, 0]).pow(2).mean())
-            boundaries.append(torch.linalg.norm(generated[:, 0] - batch["act_hist"][:, -1], dim=-1).mean())
+            generated_raw = _maybe_denormalize_actions(generated, config)
+            target_raw = _maybe_denormalize_actions(target, config)
+            act_hist_raw = _maybe_denormalize_actions(batch["act_hist"], config)
+            action_errors.append((generated_raw - target_raw).pow(2).mean())
+            first_errors.append((generated_raw[:, 0] - target_raw[:, 0]).pow(2).mean())
+            boundaries.append(torch.linalg.norm(generated_raw[:, 0] - act_hist_raw[:, -1], dim=-1).mean())
             if pred.get("path_kl_steps") is not None:
                 path_kl.append(pred["path_kl_steps"][:, :execute].sum(dim=1).mean())
             chunks += 1
@@ -303,11 +351,13 @@ def evaluate_pusht_model(
         batch = move_to_device(batch, device)
         pred = predict_actions(model, batch, deterministic=bool(config.get("inference", {}).get("deterministic", True)))
         target = batch["future_actions"]
-        metrics.append(compute_pusht_batch_metrics(pred["actions"], batch, pred.get("path_kl_energy")))
+        metrics.append(compute_pusht_batch_metrics(pred["actions"], batch, config, pred.get("path_kl_energy")))
         if pred.get("path_kl_energy") is not None:
             all_path_kl.append(pred["path_kl_energy"].detach().cpu())
-        per_sample_mse.append((pred["actions"] - target).pow(2).mean(dim=(1, 2)).detach().cpu())
-        per_sample_l1.append((pred["actions"] - target).abs().mean(dim=(1, 2)).detach().cpu())
+        pred_raw = _maybe_denormalize_actions(pred["actions"], config)
+        target_raw = _maybe_denormalize_actions(target, config)
+        per_sample_mse.append((pred_raw - target_raw).pow(2).mean(dim=(1, 2)).detach().cpu())
+        per_sample_l1.append((pred_raw - target_raw).abs().mean(dim=(1, 2)).detach().cpu())
     summary = average_metric_dicts(metrics)
     summary.update(offline_receding_horizon_metrics(model, dataset, config, device))
     if bool(config.get("eval", {}).get("sim_closed_loop", False)):
@@ -334,11 +384,11 @@ def evaluate_pusht_model(
                 summary["plot_action_error_error"] = str(exc)
         if plot_batch is not None and plot_pred is not None:
             try:
-                plot_action_rollout_examples(plot_batch, plot_pred, figures / "receding_horizon_action_rollout.png")
+                plot_action_rollout_examples(plot_batch, plot_pred, figures / "receding_horizon_action_rollout.png", config)
             except Exception as exc:
                 summary["plot_action_rollout_error"] = str(exc)
             try:
-                plot_action_chunk_2d(plot_batch, plot_pred, figures / "action_chunk_2d_with_t.png")
+                plot_action_chunk_2d(plot_batch, plot_pred, figures / "action_chunk_2d_with_t.png", config)
             except Exception as exc:
                 summary["plot_action_chunk_2d_error"] = str(exc)
         save_json(output_dir / "metrics" / "pusht_metrics.json", summary)

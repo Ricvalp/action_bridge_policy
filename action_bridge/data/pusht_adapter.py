@@ -200,6 +200,83 @@ def _split_episode_ids(num_episodes: int, split: str, train_fraction: float, val
     raise ValueError(f"Unknown split {split!r}; expected train, val, test, or all.")
 
 
+def _stats_from_episodes(
+    observations: Sequence[torch.Tensor],
+    actions: Sequence[torch.Tensor],
+    episode_ids: Sequence[int],
+    eps: float = 1e-6,
+) -> Dict[str, Any]:
+    if not episode_ids:
+        raise ValueError("Cannot compute Push-T normalization statistics from an empty episode split.")
+    obs = torch.cat([observations[int(idx)].float() for idx in episode_ids], dim=0)
+    act = torch.cat([actions[int(idx)].float() for idx in episode_ids], dim=0)
+    obs_std = obs.std(dim=0).clamp_min(float(eps))
+    action_std = act.std(dim=0).clamp_min(float(eps))
+    return {
+        "type": "standard",
+        "eps": float(eps),
+        "obs_mean": obs.mean(dim=0).tolist(),
+        "obs_std": obs_std.tolist(),
+        "action_mean": act.mean(dim=0).tolist(),
+        "action_std": action_std.tolist(),
+    }
+
+
+def _stats_tensors(stats: Dict[str, Any], dtype: torch.dtype = torch.float32) -> Dict[str, torch.Tensor]:
+    return {
+        "obs_mean": torch.as_tensor(stats["obs_mean"], dtype=dtype),
+        "obs_std": torch.as_tensor(stats["obs_std"], dtype=dtype),
+        "action_mean": torch.as_tensor(stats["action_mean"], dtype=dtype),
+        "action_std": torch.as_tensor(stats["action_std"], dtype=dtype),
+    }
+
+
+def normalize_observations_tensor(obs: torch.Tensor, stats: Dict[str, Any]) -> torch.Tensor:
+    tensors = _stats_tensors(stats, dtype=obs.dtype)
+    mean = tensors["obs_mean"].to(device=obs.device)
+    std = tensors["obs_std"].to(device=obs.device)
+    return (obs - mean) / std
+
+
+def denormalize_observations_tensor(obs: torch.Tensor, stats: Dict[str, Any]) -> torch.Tensor:
+    tensors = _stats_tensors(stats, dtype=obs.dtype)
+    mean = tensors["obs_mean"].to(device=obs.device)
+    std = tensors["obs_std"].to(device=obs.device)
+    return obs * std + mean
+
+
+def normalize_actions_tensor(actions: torch.Tensor, stats: Dict[str, Any]) -> torch.Tensor:
+    tensors = _stats_tensors(stats, dtype=actions.dtype)
+    mean = tensors["action_mean"].to(device=actions.device)
+    std = tensors["action_std"].to(device=actions.device)
+    return (actions - mean) / std
+
+
+def denormalize_actions_tensor(actions: torch.Tensor, stats: Dict[str, Any]) -> torch.Tensor:
+    tensors = _stats_tensors(stats, dtype=actions.dtype)
+    mean = tensors["action_mean"].to(device=actions.device)
+    std = tensors["action_std"].to(device=actions.device)
+    return actions * std + mean
+
+
+def normalize_observations_np(obs: np.ndarray, stats: Dict[str, Any]) -> np.ndarray:
+    mean = np.asarray(stats["obs_mean"], dtype=np.float32)
+    std = np.asarray(stats["obs_std"], dtype=np.float32)
+    return ((np.asarray(obs, dtype=np.float32) - mean) / std).astype(np.float32)
+
+
+def normalize_actions_np(actions: np.ndarray, stats: Dict[str, Any]) -> np.ndarray:
+    mean = np.asarray(stats["action_mean"], dtype=np.float32)
+    std = np.asarray(stats["action_std"], dtype=np.float32)
+    return ((np.asarray(actions, dtype=np.float32) - mean) / std).astype(np.float32)
+
+
+def denormalize_actions_np(actions: np.ndarray, stats: Dict[str, Any]) -> np.ndarray:
+    mean = np.asarray(stats["action_mean"], dtype=np.float32)
+    std = np.asarray(stats["action_std"], dtype=np.float32)
+    return (np.asarray(actions, dtype=np.float32) * std + mean).astype(np.float32)
+
+
 def _valid_indices(
     observations: Sequence[torch.Tensor],
     actions: Sequence[torch.Tensor],
@@ -207,8 +284,9 @@ def _valid_indices(
     obs_history: int,
     action_history: int,
     chunk_horizon: int,
+    pad_episode_starts: bool = False,
 ) -> List[Tuple[int, int]]:
-    start_t = max(obs_history - 1, action_history)
+    start_t = 0 if pad_episode_starts else max(obs_history - 1, action_history)
     indices: List[Tuple[int, int]] = []
     for episode_id in episode_ids:
         length = min(int(observations[episode_id].shape[0]), int(actions[episode_id].shape[0]))
@@ -216,6 +294,14 @@ def _valid_indices(
         for t in range(start_t, end_t + 1):
             indices.append((int(episode_id), int(t)))
     return indices
+
+
+def _left_padded_slice(sequence: torch.Tensor, start: int, end: int, pad_value: torch.Tensor) -> torch.Tensor:
+    if start >= 0:
+        return sequence[start:end]
+    pad_count = -int(start)
+    pad = pad_value.reshape(1, -1).expand(pad_count, -1)
+    return torch.cat([pad, sequence[0:end]], dim=0)
 
 
 class PushTLowDimDataset(Dataset):
@@ -233,6 +319,10 @@ class PushTLowDimDataset(Dataset):
         action_key: Optional[str] = None,
         episode_ends_key: Optional[str] = None,
         max_episodes: Optional[int] = None,
+        normalize: bool = False,
+        normalization_stats: Optional[Dict[str, Any]] = None,
+        normalization_eps: float = 1e-6,
+        pad_episode_starts: bool = False,
     ):
         if dataset_path is None:
             raise _setup_error()
@@ -253,12 +343,27 @@ class PushTLowDimDataset(Dataset):
             obs_eps = obs_eps[: int(max_episodes)]
             action_eps = action_eps[: int(max_episodes)]
 
-        self.observations = obs_eps
-        self.actions = action_eps
+        initial_actions = [obs[0, : int(action_eps[0].shape[-1])].float() for obs in obs_eps]
+
         self.obs_history = int(obs_history)
         self.action_history = int(action_history)
         self.chunk_horizon = int(chunk_horizon)
+        self.pad_episode_starts = bool(pad_episode_starts)
         self.episode_ids = _split_episode_ids(len(obs_eps), split, float(train_fraction), float(val_fraction))
+        self.normalize = bool(normalize)
+        self.normalization_stats = None
+        if self.normalize:
+            train_ids = _split_episode_ids(len(obs_eps), "train", float(train_fraction), float(val_fraction))
+            stats = normalization_stats or _stats_from_episodes(obs_eps, action_eps, train_ids, eps=float(normalization_eps))
+            self.normalization_stats = stats
+            tensors = _stats_tensors(stats)
+            obs_eps = [(obs.float() - tensors["obs_mean"]) / tensors["obs_std"] for obs in obs_eps]
+            action_eps = [(act.float() - tensors["action_mean"]) / tensors["action_std"] for act in action_eps]
+            initial_actions = [(act.float() - tensors["action_mean"]) / tensors["action_std"] for act in initial_actions]
+
+        self.observations = obs_eps
+        self.actions = action_eps
+        self.initial_actions = initial_actions
         self.indices = _valid_indices(
             self.observations,
             self.actions,
@@ -266,6 +371,7 @@ class PushTLowDimDataset(Dataset):
             self.obs_history,
             self.action_history,
             self.chunk_horizon,
+            pad_episode_starts=self.pad_episode_starts,
         )
         if not self.indices:
             raise ValueError(
@@ -288,12 +394,14 @@ class PushTLowDimDataset(Dataset):
         actions = self.actions[episode_id]
         obs_start = t - self.obs_history + 1
         act_start = t - self.action_history
-        obs_hist = obs[obs_start : t + 1]
-        act_hist = actions[act_start:t]
+        obs_hist = _left_padded_slice(obs, obs_start, t + 1, obs[0])
+        initial_action = self.initial_actions[episode_id].to(dtype=actions.dtype)
+        act_hist = _left_padded_slice(actions, act_start, t, initial_action)
         future_actions = actions[t : t + self.chunk_horizon]
         context = {
             "traj_id": torch.tensor(episode_id, dtype=torch.long),
             "time_index": torch.tensor(t, dtype=torch.long),
+            "padded_start": torch.tensor(t < max(self.obs_history - 1, self.action_history), dtype=torch.bool),
         }
         return {
             "obs_hist": obs_hist.float(),
