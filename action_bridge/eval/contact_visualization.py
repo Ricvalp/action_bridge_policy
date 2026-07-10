@@ -40,6 +40,10 @@ def _toy_positions_from_raw_actions(batch: Dict[str, Any], actions: torch.Tensor
     return actions_to_positions(base, actions)
 
 
+def _make_toy_obs_hist(pos_hist: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+    return torch.cat([pos_hist, goal[:, None, :].expand(pos_hist.shape[0], pos_hist.shape[1], -1)], dim=-1)
+
+
 def _q_seq_as_display_positions(batch: Dict[str, Any], q_seq: torch.Tensor, raw_actions: torch.Tensor) -> torch.Tensor:
     if "future_positions" not in batch:
         return q_seq
@@ -47,6 +51,222 @@ def _q_seq_as_display_positions(batch: Dict[str, Any], q_seq: torch.Tensor, raw_
     if mode in {"absolute_from_delta", "absolute_action"}:
         return q_seq
     return _toy_positions_from_raw_actions(batch, raw_actions)
+
+
+def _unique_trajectory_ids(dataset) -> list[int]:
+    seen = set()
+    ids: list[int] = []
+    for traj_id, _ in getattr(dataset, "indices", []):
+        traj_id = int(traj_id)
+        if traj_id in seen:
+            continue
+        ids.append(traj_id)
+        seen.add(traj_id)
+    return ids
+
+
+def _select_trajectory_id(dataset, trajectory_id: Optional[int] = None, trajectory_fraction: float = 0.5) -> int:
+    ids = _unique_trajectory_ids(dataset)
+    if not ids:
+        raise ValueError("Closed-loop contact diagnostics require a toy dataset with trajectory indices.")
+    if trajectory_id is not None:
+        if int(trajectory_id) not in ids:
+            raise ValueError(f"trajectory_id={trajectory_id} is not present in this split.")
+        return int(trajectory_id)
+    fraction = max(0.0, min(1.0, float(trajectory_fraction)))
+    return ids[round(fraction * (len(ids) - 1))]
+
+
+def _select_records(records: list[Dict[str, Any]], max_panels: int) -> list[Dict[str, Any]]:
+    if max_panels <= 0 or len(records) <= max_panels:
+        return records
+    positions = torch.linspace(0, len(records) - 1, steps=max_panels).round().long().tolist()
+    selected = []
+    seen = set()
+    for pos in positions:
+        pos = int(pos)
+        if pos in seen:
+            continue
+        selected.append(records[pos])
+        seen.add(pos)
+    return selected
+
+
+@torch.no_grad()
+def collect_closed_loop_contact_diagnostics(
+    model,
+    dataset,
+    config: Dict[str, Any],
+    device: torch.device,
+    trajectory_id: Optional[int] = None,
+    trajectory_fraction: float = 0.5,
+    potential_step: Optional[int] = None,
+    reference_steps: Optional[int] = None,
+    reference_time_mode: str = "hold_last",
+) -> Dict[str, Any]:
+    """Run one toy closed-loop episode and record contact-potential snapshots."""
+
+    if not bool(getattr(model, "uses_contact_langevin", False)):
+        raise ValueError("Closed-loop contact diagnostics require reference.type=contact_langevin.")
+    if not all(hasattr(dataset, name) for name in ["positions", "actions", "goals", "obstacle_centers", "obstacle_radii", "modes"]):
+        raise ValueError("Closed-loop contact diagnostics currently support toy datasets.")
+
+    model.eval()
+    eval_cfg = config.get("eval", {})
+    traj_id = _select_trajectory_id(dataset, trajectory_id=trajectory_id, trajectory_fraction=trajectory_fraction)
+    obs_history = int(config.get("obs_history", 2))
+    action_history = int(config.get("action_history", 2))
+    chunk_horizon = int(config.get("chunk_horizon", 16))
+    ref_steps = int(reference_steps) if reference_steps is not None else 4 * chunk_horizon
+    ref_steps = max(1, ref_steps)
+    if reference_time_mode not in {"hold_last", "extrapolate"}:
+        raise ValueError("reference_time_mode must be 'hold_last' or 'extrapolate'.")
+    warm_start = int(eval_cfg.get("closed_loop_warm_start_steps", max(obs_history - 1, action_history)))
+    n_exec = int(eval_cfg.get("n_exec", config.get("inference", {}).get("n_exec", chunk_horizon)))
+    n_exec = max(1, n_exec)
+    local_step = min(n_exec - 1, chunk_horizon - 1) if potential_step is None else int(potential_step)
+    local_step = max(0, min(local_step, chunk_horizon - 1))
+    action_clip = eval_cfg.get("action_clip", None)
+    if action_clip is not None:
+        action_clip = float(action_clip)
+    box_min = float(eval_cfg.get("box_min", 0.0))
+    box_max = float(eval_cfg.get("box_max", 1.0))
+    deterministic = bool(config.get("inference", {}).get("deterministic", True))
+    commitment = str(config.get("inference", {}).get("latent_commitment", "chunk"))
+    action_is_absolute = bool(getattr(getattr(dataset, "cfg", None), "train_absolute_actions", False))
+
+    expert_positions = dataset.positions[traj_id : traj_id + 1].to(device)
+    expert_actions = dataset.actions[traj_id : traj_id + 1].to(device)
+    goal = dataset.goals[traj_id : traj_id + 1].to(device)
+    center = dataset.obstacle_centers[traj_id : traj_id + 1].to(device)
+    radius = dataset.obstacle_radii[traj_id : traj_id + 1].to(device)
+    mode = dataset.modes[traj_id : traj_id + 1].to(device)
+
+    warm_start = max(max(obs_history - 1, action_history), min(warm_start, expert_actions.shape[1] - 1))
+    pos_hist = expert_positions[:, warm_start - obs_history + 1 : warm_start + 1]
+    act_hist = expert_actions[:, warm_start - action_history : warm_start]
+    current_pos = expert_positions[:, warm_start]
+    rollout_prefix = expert_positions[:, : warm_start + 1]
+    generated_positions = []
+    generated_actions = []
+    records = []
+    z = None
+    z_emb = None
+    executed_so_far = 0
+    remaining = expert_actions.shape[1] - warm_start
+    replan_index = 0
+
+    while remaining > 0:
+        obs_hist = _make_toy_obs_hist(pos_hist, goal)
+        if commitment == "episode" and z_emb is not None:
+            pred = generate_chunk(model, obs_hist, act_hist, deterministic=deterministic, z=z, z_emb=z_emb)
+        elif commitment == "sticky":
+            pred = generate_chunk(
+                model,
+                obs_hist,
+                act_hist,
+                deterministic=deterministic,
+                z=z,
+                sticky=True,
+                kappa=float(eval_cfg.get("sticky_kappa", 2.0)),
+                rho_z=float(eval_cfg.get("rho_z", 1.0)),
+            )
+            z = pred.get("z")
+        else:
+            pred = generate_chunk(model, obs_hist, act_hist, deterministic=deterministic)
+        if commitment == "episode" and z_emb is None:
+            z = pred.get("z")
+            z_emb = pred.get("z_emb")
+
+        h_emb = model.encode_history(obs_hist, act_hist)
+        q_seq = pred["q_seq"]
+        p_seq = pred["p_seq"]
+        m_values = []
+        k_values = []
+        gamma_values = []
+        for k in range(chunk_horizon):
+            _, aux = model.reference_process.force(q_seq[:, k], p_seq[:, k], h_emb, k)
+            if aux["m"] is None or aux["k_diag"] is None:
+                raise ValueError("Closed-loop contact potential plots require reference.potential_type=quadratic.")
+            m_values.append(aux["m"])
+            k_values.append(aux["k_diag"])
+            gamma_values.append(aux["gamma"])
+        m_path = torch.stack(m_values, dim=1)
+        k_path = torch.stack(k_values, dim=1)
+        gamma_path = torch.stack(gamma_values, dim=1)
+
+        ref_q, ref_p = model.coordinate_adapter.init_qp_from_history({"obs_hist": obs_hist, "act_hist": act_hist})
+        ref_q_values = [ref_q]
+        for step in range(ref_steps):
+            ref_k = min(step, chunk_horizon - 1) if reference_time_mode == "hold_last" else step
+            ref_q, ref_p, _ = model.reference_process.reference_step(ref_q, ref_p, h_emb, ref_k)
+            ref_q_values.append(ref_q)
+        ref_q_long = torch.stack(ref_q_values, dim=1)
+        if model.coordinate_adapter.coordinate_mode in {"absolute_from_delta", "absolute_action"}:
+            reference_no_control_positions = ref_q_long
+        else:
+            ref_actions = model.coordinate_adapter.decode_raw_actions(ref_q_long)
+            reference_no_control_positions = actions_to_positions(current_pos, ref_actions)
+
+        records.append(
+            {
+                "replan_index": replan_index,
+                "trajectory_time": warm_start + executed_so_far,
+                "local_step": local_step,
+                "current_position": current_pos[0].detach().cpu(),
+                "predicted_q_seq": q_seq[0].detach().cpu(),
+                "predicted_actions": pred["actions"][0].detach().cpu(),
+                "m_path": m_path[0].detach().cpu(),
+                "k_diag_path": k_path[0].detach().cpu(),
+                "gamma_path": gamma_path[0].detach().cpu(),
+                "m": m_path[0, local_step].detach().cpu(),
+                "k_diag": k_path[0, local_step].detach().cpu(),
+                "gamma": gamma_path[0, local_step].detach().cpu(),
+                "reference_no_control_positions": reference_no_control_positions[0].detach().cpu(),
+            }
+        )
+
+        actions = pred["actions"]
+        if action_clip is not None:
+            actions = actions.clamp(-action_clip, action_clip)
+        execute = min(n_exec, remaining, actions.shape[1])
+        executed = actions[:, :execute]
+        generated_actions.append(executed)
+
+        new_positions = []
+        for step in range(execute):
+            if action_is_absolute:
+                current_pos = executed[:, step].clamp(box_min, box_max)
+            else:
+                current_pos = (current_pos + executed[:, step]).clamp(box_min, box_max)
+            new_positions.append(current_pos)
+        new_pos_tensor = torch.stack(new_positions, dim=1)
+        generated_positions.append(new_pos_tensor)
+        pos_hist = torch.cat([pos_hist, new_pos_tensor], dim=1)[:, -obs_history:]
+        act_hist = torch.cat([act_hist, executed], dim=1)[:, -action_history:]
+        executed_so_far += execute
+        remaining -= execute
+        replan_index += 1
+
+    generated_positions_tensor = torch.cat(generated_positions, dim=1)
+    generated_actions_tensor = torch.cat(generated_actions, dim=1)
+    rollout_positions = torch.cat([rollout_prefix, generated_positions_tensor], dim=1)
+    return {
+        "trajectory_id": traj_id,
+        "warm_start": warm_start,
+        "n_exec": n_exec,
+        "potential_step": local_step,
+        "reference_steps": ref_steps,
+        "reference_time_mode": reference_time_mode,
+        "records": records,
+        "rollout_positions": rollout_positions[0].detach().cpu(),
+        "generated_actions": generated_actions_tensor[0].detach().cpu(),
+        "expert_positions": expert_positions[0, : rollout_positions.shape[1]].detach().cpu(),
+        "goal": goal[0].detach().cpu(),
+        "obstacle_center": center[0].detach().cpu(),
+        "obstacle_radius": radius[0].detach().cpu(),
+        "mode": mode[0].detach().cpu(),
+    }
 
 
 @torch.no_grad()
@@ -334,5 +554,86 @@ def plot_contact_potential_contours(diagnostics: Dict[str, Any], path: Path, exa
     fig.colorbar(image, ax=axes[0, :], fraction=0.02, pad=0.015, label="V(q,h,k)")
     force_image = axes[1, -1].collections[0]
     fig.colorbar(force_image, ax=axes[1, :], fraction=0.02, pad=0.015, label="|-grad V|")
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def plot_closed_loop_contact_potential(
+    diagnostics: Dict[str, Any],
+    path: Path,
+    max_panels: int = 6,
+    grid_size: int = 90,
+) -> None:
+    """Plot learned potential snapshots along one closed-loop rollout."""
+
+    records = _select_records(list(diagnostics["records"]), int(max_panels))
+    if not records:
+        return
+    plt = _import_pyplot()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    xs = torch.linspace(0.0, 1.0, grid_size)
+    ys = torch.linspace(0.0, 1.0, grid_size)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    grid = torch.stack([xx, yy], dim=-1)
+    potentials = []
+    for record in records:
+        m = record["m"]
+        stiffness = record["k_diag"]
+        diff = grid - m
+        potential = 0.5 * (stiffness * diff.pow(2)).sum(dim=-1)
+        potentials.append(potential)
+
+    potential_max = float(torch.stack(potentials).max().item())
+    levels = torch.linspace(0.0, max(potential_max, 1e-8), 25).numpy()
+    fig, axes = plt.subplots(1, len(records), figsize=(5.0 * len(records), 4.4), squeeze=False, layout="constrained")
+    rollout = diagnostics["rollout_positions"]
+    expert = diagnostics["expert_positions"]
+    goal = diagnostics["goal"]
+    center = diagnostics["obstacle_center"]
+    radius = diagnostics["obstacle_radius"]
+    for col, (ax, record, potential) in enumerate(zip(axes.ravel(), records, potentials)):
+        image = ax.contourf(xx.numpy(), yy.numpy(), potential.numpy(), levels=levels, cmap="viridis")
+        replan_time = int(record["trajectory_time"])
+        m_path = record["m_path"]
+        q_seq = record["predicted_q_seq"]
+        ref_no_control = record.get("reference_no_control_positions")
+        m = record["m"]
+        stiffness = record["k_diag"]
+        gamma = record["gamma"].float().mean()
+        ax.plot(expert[:, 0], expert[:, 1], color="white", linewidth=1.4, alpha=0.75, label="expert" if col == 0 else None)
+        ax.plot(rollout[:, 0], rollout[:, 1], color="tab:cyan", linewidth=1.8, alpha=0.8, label="closed loop" if col == 0 else None)
+        ax.plot(rollout[: replan_time + 1, 0], rollout[: replan_time + 1, 1], color="tab:blue", linewidth=2.4, label="executed so far" if col == 0 else None)
+        ax.plot(q_seq[:, 0], q_seq[:, 1], color="tab:orange", linewidth=1.2, linestyle="--", label="planned chunk" if col == 0 else None)
+        if ref_no_control is not None:
+            ax.plot(
+                ref_no_control[:, 0],
+                ref_no_control[:, 1],
+                color="tab:green",
+                linewidth=1.7,
+                linestyle="-.",
+                alpha=0.9,
+                label=f"reference no control ({diagnostics['reference_steps']} steps)" if col == 0 else None,
+            )
+            ax.scatter(
+                [float(ref_no_control[-1, 0])],
+                [float(ref_no_control[-1, 1])],
+                color="tab:green",
+                marker="s",
+                s=30,
+                zorder=8,
+                label="reference end" if col == 0 else None,
+            )
+        ax.plot(m_path[:, 0], m_path[:, 1], color="tab:red", marker="x", markersize=3, linewidth=1.0, alpha=0.7, label="m path" if col == 0 else None)
+        ax.scatter([float(m[0])], [float(m[1])], color="red", marker="x", s=64, linewidths=2.1, zorder=8, label="m at local step" if col == 0 else None)
+        ax.scatter([float(record["current_position"][0])], [float(record["current_position"][1])], color="black", marker="o", s=32, zorder=8, label="current" if col == 0 else None)
+        ax.scatter([float(goal[0])], [float(goal[1])], color="red", marker="*", s=72, edgecolors="white", linewidths=0.5, zorder=9, label="goal" if col == 0 else None)
+        _draw_obstacle(ax, center, radius)
+        ax.set_title(
+            f"replan={record['replan_index']} | t={replan_time} | local step={record['local_step']}\n"
+            f"stiff=[{float(stiffness[0]):.2g}, {float(stiffness[1]):.2g}] | gamma={float(gamma):.3g}",
+            fontsize=9,
+        )
+    axes[0, 0].legend(fontsize=6, loc="upper right")
+    fig.colorbar(image, ax=axes[0, :], fraction=0.02, pad=0.015, label="V(q,h,k)")
     fig.savefig(path, dpi=170)
     plt.close(fig)
