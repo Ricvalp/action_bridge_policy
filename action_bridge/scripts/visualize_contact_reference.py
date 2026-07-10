@@ -52,6 +52,7 @@ def main() -> None:
     parser.add_argument("--time-fractions", default="0.2,0.5,0.8")
     parser.add_argument("--trajectory-fractions", default=None)
     parser.add_argument("--dataset-index", type=int, default=None)
+    parser.add_argument("--grid-size", type=int, default=80)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -88,7 +89,12 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_contact_reference_summary(diagnostics, output_dir / "contact_reference_summary.png", example_idx=args.example_idx)
     plot_contact_parameter_heatmaps(diagnostics, output_dir / "contact_parameter_heatmaps.png")
-    plot_contact_potential_contours(diagnostics, output_dir / "contact_potential_contours.png", example_idx=args.example_idx)
+    plot_contact_potential_contours(
+        diagnostics,
+        output_dir / "contact_potential_contours.png",
+        example_idx=args.example_idx,
+        grid_size=args.grid_size,
+    )
 
     save_json(
         output_dir / "contact_diagnostics_summary.json",
@@ -100,6 +106,7 @@ def main() -> None:
             "time_fractions": parse_fraction_list(args.time_fractions),
             "trajectory_fractions": parse_fraction_list(args.trajectory_fractions),
             "coordinate_mode": diagnostics["coordinate_mode"],
+            "grid_size": args.grid_size,
             "summary": contact_summary_stats(diagnostics),
         },
     )

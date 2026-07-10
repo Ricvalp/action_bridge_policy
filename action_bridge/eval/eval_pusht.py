@@ -310,6 +310,10 @@ def evaluate_pusht_model(
         per_sample_l1.append((pred["actions"] - target).abs().mean(dim=(1, 2)).detach().cpu())
     summary = average_metric_dicts(metrics)
     summary.update(offline_receding_horizon_metrics(model, dataset, config, device))
+    if bool(config.get("eval", {}).get("sim_closed_loop", False)):
+        from action_bridge.eval.pusht_sim import evaluate_pusht_sim_model
+
+        summary.update(evaluate_pusht_sim_model(model, config, device, output_dir=output_dir))
 
     if output_dir is not None:
         figures = output_dir / "figures"

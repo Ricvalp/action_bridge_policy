@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -20,6 +21,46 @@ def _import_pyplot():
     return plt
 
 
+def _tee_polygons(pose: torch.Tensor, scale: float = 30.0) -> list[list[tuple[float, float]]]:
+    x, y, theta = [float(value) for value in pose[:3]]
+    length = 4.0
+    local_polys = [
+        [
+            (-length * scale / 2, scale),
+            (length * scale / 2, scale),
+            (length * scale / 2, 0.0),
+            (-length * scale / 2, 0.0),
+        ],
+        [
+            (-scale / 2, scale),
+            (-scale / 2, length * scale),
+            (scale / 2, length * scale),
+            (scale / 2, scale),
+        ],
+    ]
+    c = math.cos(theta)
+    s = math.sin(theta)
+    return [[(x + px * c - py * s, y + px * s + py * c) for px, py in poly] for poly in local_polys]
+
+
+def _draw_tee(ax, pose: torch.Tensor, color: str, alpha: float, label: Optional[str] = None, linestyle: str = "-") -> None:
+    from matplotlib.patches import Polygon
+
+    for idx, poly in enumerate(_tee_polygons(pose)):
+        ax.add_patch(
+            Polygon(
+                poly,
+                closed=True,
+                facecolor=color if linestyle == "-" else "none",
+                edgecolor=color,
+                linewidth=1.3,
+                linestyle=linestyle,
+                alpha=alpha,
+                label=label if idx == 0 else None,
+            )
+        )
+
+
 def _draw_obstacle(ax, center: Optional[torch.Tensor], radius: Optional[torch.Tensor]) -> None:
     if center is not None and radius is not None:
         import matplotlib.patches as patches
@@ -27,9 +68,84 @@ def _draw_obstacle(ax, center: Optional[torch.Tensor], radius: Optional[torch.Te
         c = center.detach().cpu()
         r = float(radius.detach().cpu())
         ax.add_patch(patches.Circle((float(c[0]), float(c[1])), r, fill=False, color="black", linewidth=1.4))
-    ax.set_xlim(0.0, 1.0)
-    ax.set_ylim(0.0, 1.0)
+
+
+def _is_pusht_like_batch(batch: Dict[str, Any]) -> bool:
+    obs_hist = batch.get("obs_hist")
+    future_actions = batch.get("future_actions")
+    return (
+        "future_positions" not in batch
+        and torch.is_tensor(obs_hist)
+        and torch.is_tensor(future_actions)
+        and obs_hist.shape[-1] >= 5
+        and future_actions.shape[-1] >= 2
+    )
+
+
+def _plot_bounds(diagnostics: Dict[str, Any], example_idx: int = 0) -> tuple[float, float, float, float, bool]:
+    batch = diagnostics["batch"]
+    if "future_positions" in batch:
+        return 0.0, 1.0, 0.0, 1.0, False
+    if _is_pusht_like_batch(batch):
+        return 0.0, 512.0, 0.0, 512.0, True
+
+    values = []
+    for key in ["controlled_positions", "reference_positions", "m"]:
+        value = diagnostics.get(key)
+        if torch.is_tensor(value):
+            values.append(value[..., :2].reshape(-1, 2).float())
+    for key in ["act_hist", "future_actions"]:
+        value = batch.get(key)
+        if torch.is_tensor(value):
+            values.append(value[..., :2].reshape(-1, 2).float())
+    if not values:
+        return 0.0, 1.0, 0.0, 1.0, False
+
+    cloud = torch.cat(values, dim=0)
+    x_min, y_min = cloud.min(dim=0).values.tolist()
+    x_max, y_max = cloud.max(dim=0).values.tolist()
+    x_span = max(float(x_max - x_min), 1e-3)
+    y_span = max(float(y_max - y_min), 1e-3)
+    pad = 0.08 * max(x_span, y_span)
+    return float(x_min - pad), float(x_max + pad), float(y_min - pad), float(y_max + pad), False
+
+
+def _apply_plot_bounds(ax, bounds: tuple[float, float, float, float, bool]) -> None:
+    x_min, x_max, y_min, y_max, invert_y = bounds
+    ax.set_xlim(x_min, x_max)
+    if invert_y:
+        ax.set_ylim(y_max, y_min)
+    else:
+        ax.set_ylim(y_min, y_max)
     ax.set_aspect("equal", adjustable="box")
+
+
+def _potential_grid(bounds: tuple[float, float, float, float, bool], grid_size: int):
+    x_min, x_max, y_min, y_max, _ = bounds
+    xs = torch.linspace(x_min, x_max, grid_size)
+    ys = torch.linspace(y_min, y_max, grid_size)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    return xx, yy, torch.stack([xx, yy], dim=-1)
+
+
+def _draw_pusht_scene(ax, batch: Dict[str, Any], idx: int, show_labels: bool = False) -> None:
+    if not _is_pusht_like_batch(batch):
+        return
+    state = batch["obs_hist"][idx, -1].detach().cpu()
+    agent = state[:2]
+    block_pose = state[2:5]
+    goal_pose = torch.tensor([256.0, 256.0, math.pi / 4], dtype=state.dtype)
+    _draw_tee(ax, goal_pose, color="tab:green", alpha=0.28, label="goal T" if show_labels else None, linestyle="--")
+    _draw_tee(ax, block_pose, color="0.35", alpha=0.35, label="current T" if show_labels else None)
+    ax.scatter(
+        [float(agent[0])],
+        [float(agent[1])],
+        color="tab:purple",
+        marker="o",
+        s=28,
+        zorder=8,
+        label="agent" if show_labels else None,
+    )
 
 
 def _toy_positions_from_raw_actions(batch: Dict[str, Any], actions: torch.Tensor) -> torch.Tensor:
@@ -357,9 +473,20 @@ def plot_contact_reference_summary(diagnostics: Dict[str, Any], path: Path, exam
     fig, axes = plt.subplots(2, 2, figsize=(10.5, 8.4))
 
     ax = axes[0, 0]
+    bounds = _plot_bounds(diagnostics, idx)
+    _draw_pusht_scene(ax, batch, idx, show_labels=True)
     if "future_positions" in batch:
         expert = batch["future_positions"][idx]
         ax.plot(expert[:, 0], expert[:, 1], color="0.55", linewidth=2.0, label="expert")
+    else:
+        act_hist = batch.get("act_hist")
+        future_actions = batch.get("future_actions")
+        if torch.is_tensor(act_hist):
+            h = act_hist[idx]
+            ax.plot(h[:, 0], h[:, 1], color="0.55", marker="o", markersize=3, linewidth=1.0, label="history")
+        if torch.is_tensor(future_actions):
+            f = future_actions[idx]
+            ax.plot(f[:, 0], f[:, 1], color="black", marker="o", markersize=3, linewidth=1.4, label="logged chunk")
     controlled = diagnostics["controlled_positions"][idx]
     reference = diagnostics["reference_positions"][idx]
     ax.plot(reference[:, 0], reference[:, 1], color="tab:green", linestyle="--", linewidth=1.8, label="reference only")
@@ -372,7 +499,8 @@ def plot_contact_reference_summary(diagnostics: Dict[str, Any], path: Path, exam
     center = context.get("obstacle_center")
     radius = context.get("obstacle_radius")
     _draw_obstacle(ax, center[idx] if torch.is_tensor(center) else None, radius[idx] if torch.is_tensor(radius) else None)
-    ax.set_title("Paths in q/world coordinates")
+    _apply_plot_bounds(ax, bounds)
+    ax.set_title("Paths in q/action coordinates")
     ax.legend(fontsize=8)
 
     t = torch.arange(diagnostics["control_energy_steps"].shape[1])
@@ -455,10 +583,21 @@ def _spread_steps(horizon: int, count: int = 5) -> list[int]:
 def _plot_contact_overlay(ax, diagnostics: Dict[str, Any], idx: int, *, show_labels: bool = False) -> None:
     batch = diagnostics["batch"]
     context = batch.get("context", {})
+    bounds = _plot_bounds(diagnostics, idx)
+    _draw_pusht_scene(ax, batch, idx, show_labels=show_labels)
     expert = batch.get("future_positions")
     if expert is not None:
         e = expert[idx]
         ax.plot(e[:, 0], e[:, 1], color="white", linewidth=1.5, alpha=0.9, label="expert" if show_labels else None)
+    else:
+        act_hist = batch.get("act_hist")
+        future_actions = batch.get("future_actions")
+        if torch.is_tensor(act_hist):
+            h = act_hist[idx]
+            ax.plot(h[:, 0], h[:, 1], color="0.85", marker="o", markersize=2.5, linewidth=1.0, alpha=0.85, label="history" if show_labels else None)
+        if torch.is_tensor(future_actions):
+            f = future_actions[idx]
+            ax.plot(f[:, 0], f[:, 1], color="white", marker="o", markersize=2.5, linewidth=1.3, alpha=0.9, label="logged chunk" if show_labels else None)
     reference = diagnostics.get("reference_positions")
     if reference is not None:
         r = reference[idx]
@@ -476,6 +615,7 @@ def _plot_contact_overlay(ax, diagnostics: Dict[str, Any], idx: int, *, show_lab
     center = context.get("obstacle_center")
     radius = context.get("obstacle_radius")
     _draw_obstacle(ax, center[idx] if torch.is_tensor(center) else None, radius[idx] if torch.is_tensor(radius) else None)
+    _apply_plot_bounds(ax, bounds)
 
 
 def plot_contact_potential_contours(diagnostics: Dict[str, Any], path: Path, example_idx: int = 0, grid_size: int = 80) -> None:
@@ -488,10 +628,8 @@ def plot_contact_potential_contours(diagnostics: Dict[str, Any], path: Path, exa
     idx = min(example_idx, m.shape[0] - 1)
     horizon = m.shape[1]
     steps = _spread_steps(horizon, count=5)
-    xs = torch.linspace(0.0, 1.0, grid_size)
-    ys = torch.linspace(0.0, 1.0, grid_size)
-    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-    grid = torch.stack([xx, yy], dim=-1)
+    bounds = _plot_bounds(diagnostics, idx)
+    xx, yy, grid = _potential_grid(bounds, grid_size)
     potentials = []
     forces = []
     force_norms = []
@@ -514,6 +652,7 @@ def plot_contact_potential_contours(diagnostics: Dict[str, Any], path: Path, exa
 
     fig, axes = plt.subplots(2, len(steps), figsize=(4.1 * len(steps), 7.7), squeeze=False, layout="constrained")
     gamma = diagnostics.get("gamma")
+    arrow_scale = 0.08 * max(bounds[1] - bounds[0], bounds[3] - bounds[2])
     for col, step in enumerate(steps):
         center_m = m[idx, step]
         stiffness = k_diag[idx, step]
@@ -533,7 +672,7 @@ def plot_contact_potential_contours(diagnostics: Dict[str, Any], path: Path, exa
         skip = max(1, grid_size // 14)
         force = forces[col]
         if force_norm_max > 1e-12:
-            quiver = force / force_norm_max * 0.08
+            quiver = force / force_norm_max * arrow_scale
             ax.quiver(
                 xx[::skip, ::skip].numpy(),
                 yy[::skip, ::skip].numpy(),
@@ -591,6 +730,7 @@ def plot_closed_loop_contact_potential(
     goal = diagnostics["goal"]
     center = diagnostics["obstacle_center"]
     radius = diagnostics["obstacle_radius"]
+    bounds = (0.0, 1.0, 0.0, 1.0, False)
     for col, (ax, record, potential) in enumerate(zip(axes.ravel(), records, potentials)):
         image = ax.contourf(xx.numpy(), yy.numpy(), potential.numpy(), levels=levels, cmap="viridis")
         replan_time = int(record["trajectory_time"])
@@ -628,6 +768,7 @@ def plot_closed_loop_contact_potential(
         ax.scatter([float(record["current_position"][0])], [float(record["current_position"][1])], color="black", marker="o", s=32, zorder=8, label="current" if col == 0 else None)
         ax.scatter([float(goal[0])], [float(goal[1])], color="red", marker="*", s=72, edgecolors="white", linewidths=0.5, zorder=9, label="goal" if col == 0 else None)
         _draw_obstacle(ax, center, radius)
+        _apply_plot_bounds(ax, bounds)
         ax.set_title(
             f"replan={record['replan_index']} | t={replan_time} | local step={record['local_step']}\n"
             f"stiff=[{float(stiffness[0]):.2g}, {float(stiffness[1]):.2g}] | gamma={float(gamma):.3g}",

@@ -235,7 +235,24 @@ data.action_key=data/action \
 data.episode_ends_key=meta/episode_ends
 ```
 
-The Push-T entrypoint reports offline metrics: action MSE/L1, acceleration/jerk energy, chunk-boundary discontinuity, path-KL energy, and logged-history receding-horizon action error. It does not run simulator closed-loop success unless a simulator backend is added later.
+The Push-T entrypoint reports offline metrics by default: action MSE/L1, acceleration/jerk energy, chunk-boundary discontinuity, path-KL energy, and logged-history receding-horizon action error.
+
+Simulator closed-loop evaluation is optional and uses `gym-pusht`:
+
+```bash
+uv pip install gym-pusht
+
+uv run python -m action_bridge.scripts.eval_pusht_sim \
+  --checkpoint outputs/<run_id>/checkpoints/best.pt \
+  --device cuda \
+  --episodes 50 \
+  --max-steps 300 \
+  --n-exec 8 \
+  --render-episodes 4 \
+  --gif-fps 10
+```
+
+It logs simulator success rate, final/max coverage reward, episode length, replanning count, path-KL energy, chunk-boundary discontinuity, rollout figures, and one GIF per rendered episode under `figures/pusht_sim_gifs/`. Add `--save-videos --video-fps 10` to request MP4 files when `imageio` is installed.
 
 ## Tests
 

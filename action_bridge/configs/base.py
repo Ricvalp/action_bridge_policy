@@ -277,4 +277,19 @@ def pusht_lowdim_config(latent_type: str) -> ConfigDict:
     config.eval.batch_size = 256
     config.eval.offline_rollout_episodes = 64
     config.eval.n_exec = 8
+    config.eval.sim_closed_loop = False
+    config.eval.sim_episodes = 50
+    config.eval.sim_seed = 0
+    config.eval.sim_max_steps = 300
+    config.eval.sim_n_exec = 8
+    config.eval.sim_success_threshold = 0.95
+    config.eval.sim_obs_type = "state"
+    config.eval.sim_render_mode = "rgb_array"
+    config.eval.sim_render_episodes = 0
+    config.eval.sim_plot_episodes = 8
+    config.eval.sim_frames_per_episode = 6
+    config.eval.sim_save_gifs = True
+    config.eval.sim_gif_fps = 10.0
+    config.eval.sim_save_videos = False
+    config.eval.sim_video_fps = 10.0
     return config
