@@ -8,6 +8,11 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from action_bridge.data.pusht_adapter import (
+    denormalize_actions_tensor,
+    denormalize_observations_tensor,
+    normalize_actions_tensor,
+)
 from action_bridge.eval.rollout import actions_to_positions, generate_chunk
 from action_bridge.training.common import move_to_device
 
@@ -82,6 +87,48 @@ def _is_pusht_like_batch(batch: Dict[str, Any]) -> bool:
     )
 
 
+def _has_normalization_stats(stats: Any) -> bool:
+    if stats is None:
+        return False
+    return all(key in stats for key in ("obs_mean", "obs_std", "action_mean", "action_std"))
+
+
+def _normalization_stats(diagnostics: Dict[str, Any]) -> Optional[Any]:
+    stats = diagnostics.get("normalization_stats")
+    if _has_normalization_stats(stats):
+        return stats
+    return None
+
+
+def _actions_for_display(tensor: torch.Tensor, diagnostics: Dict[str, Any]) -> torch.Tensor:
+    stats = _normalization_stats(diagnostics)
+    if stats is None:
+        return tensor
+    return denormalize_actions_tensor(tensor, stats)
+
+
+def _observations_for_display(tensor: torch.Tensor, diagnostics: Dict[str, Any]) -> torch.Tensor:
+    stats = _normalization_stats(diagnostics)
+    if stats is None:
+        return tensor
+    return denormalize_observations_tensor(tensor, stats)
+
+
+def _raw_action_grid_to_model(grid: torch.Tensor, diagnostics: Dict[str, Any]) -> torch.Tensor:
+    stats = _normalization_stats(diagnostics)
+    if stats is None:
+        return grid
+    return normalize_actions_tensor(grid, stats)
+
+
+def _force_to_display(force: torch.Tensor, diagnostics: Dict[str, Any]) -> torch.Tensor:
+    stats = _normalization_stats(diagnostics)
+    if stats is None:
+        return force
+    std = torch.as_tensor(stats["action_std"], dtype=force.dtype, device=force.device)
+    return force / std
+
+
 def _plot_bounds(diagnostics: Dict[str, Any], example_idx: int = 0) -> tuple[float, float, float, float, bool]:
     batch = diagnostics["batch"]
     if "future_positions" in batch:
@@ -131,7 +178,9 @@ def _potential_grid(bounds: tuple[float, float, float, float, bool], grid_size: 
 def _draw_pusht_scene(ax, batch: Dict[str, Any], idx: int, show_labels: bool = False) -> None:
     if not _is_pusht_like_batch(batch):
         return
-    state = batch["obs_hist"][idx, -1].detach().cpu()
+    diagnostics = {"normalization_stats": batch.get("_normalization_stats")}
+    obs_hist = _observations_for_display(batch["obs_hist"], diagnostics)
+    state = obs_hist[idx, -1].detach().cpu()
     agent = state[:2]
     block_pose = state[2:5]
     goal_pose = torch.tensor([256.0, 256.0, math.pi / 4], dtype=state.dtype)
@@ -161,11 +210,12 @@ def _make_toy_obs_hist(pos_hist: torch.Tensor, goal: torch.Tensor) -> torch.Tens
 
 
 def _q_seq_as_display_positions(batch: Dict[str, Any], q_seq: torch.Tensor, raw_actions: torch.Tensor) -> torch.Tensor:
+    diagnostics = {"normalization_stats": batch.get("_normalization_stats")}
     if "future_positions" not in batch:
-        return q_seq
+        return _actions_for_display(q_seq, diagnostics)
     mode = batch.get("reference_coordinate_mode", None)
     if mode in {"absolute_from_delta", "absolute_action"}:
-        return q_seq
+        return _actions_for_display(q_seq, diagnostics)
     return _toy_positions_from_raw_actions(batch, raw_actions)
 
 
@@ -386,7 +436,12 @@ def collect_closed_loop_contact_diagnostics(
 
 
 @torch.no_grad()
-def collect_contact_diagnostics(model, batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
+def collect_contact_diagnostics(
+    model,
+    batch: Dict[str, Any],
+    device: torch.device,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Roll out controlled and reference-only contact dynamics for a batch."""
 
     if not bool(getattr(model, "uses_contact_langevin", False)):
@@ -429,18 +484,24 @@ def collect_contact_diagnostics(model, batch: Dict[str, Any], device: torch.devi
 
     controls = controlled["controls"].detach().cpu()
     control_energy_steps = 0.5 * ref.dt * controls.pow(2).sum(dim=-1)
+    normalization_stats = None
+    if config is not None:
+        data_cfg = config.get("data", {})
+        stats = data_cfg.get("normalization_stats")
+        if bool(data_cfg.get("normalize", False)) and _has_normalization_stats(stats):
+            normalization_stats = stats
+
     batch_cpu = move_to_device(batch_device, torch.device("cpu"))
     batch_cpu["reference_coordinate_mode"] = adapter.coordinate_mode
-    return {
+    batch_cpu["_normalization_stats"] = normalization_stats
+    diagnostics = {
         "batch": batch_cpu,
         "controlled_actions": controlled["actions"].detach().cpu(),
         "controlled_q_seq": controlled["q_seq"].detach().cpu(),
         "controlled_p_seq": controlled["p_seq"].detach().cpu(),
-        "controlled_positions": _q_seq_as_display_positions(batch_cpu, controlled["q_seq"].detach().cpu(), controlled["actions"].detach().cpu()),
         "reference_actions": ref_raw_actions.detach().cpu(),
         "reference_q_seq": ref_q_seq.detach().cpu(),
         "reference_p_seq": torch.stack(ref_p, dim=1).detach().cpu(),
-        "reference_positions": _q_seq_as_display_positions(batch_cpu, ref_q_seq.detach().cpu(), ref_raw_actions.detach().cpu()),
         "controls": controls,
         "control_energy_steps": control_energy_steps,
         "gamma": stack_aux("gamma"),
@@ -449,7 +510,19 @@ def collect_contact_diagnostics(model, batch: Dict[str, Any], device: torch.devi
         "grad_v": stack_aux("grad_v"),
         "dt": float(ref.dt),
         "coordinate_mode": adapter.coordinate_mode,
+        "normalization_stats": normalization_stats,
     }
+    diagnostics["controlled_positions"] = _q_seq_as_display_positions(
+        batch_cpu,
+        diagnostics["controlled_q_seq"],
+        diagnostics["controlled_actions"],
+    )
+    diagnostics["reference_positions"] = _q_seq_as_display_positions(
+        batch_cpu,
+        diagnostics["reference_q_seq"],
+        diagnostics["reference_actions"],
+    )
+    return diagnostics
 
 
 def contact_summary_stats(diagnostics: Dict[str, Any]) -> Dict[str, float]:
@@ -482,10 +555,10 @@ def plot_contact_reference_summary(diagnostics: Dict[str, Any], path: Path, exam
         act_hist = batch.get("act_hist")
         future_actions = batch.get("future_actions")
         if torch.is_tensor(act_hist):
-            h = act_hist[idx]
+            h = _actions_for_display(act_hist, diagnostics)[idx]
             ax.plot(h[:, 0], h[:, 1], color="0.55", marker="o", markersize=3, linewidth=1.0, label="history")
         if torch.is_tensor(future_actions):
-            f = future_actions[idx]
+            f = _actions_for_display(future_actions, diagnostics)[idx]
             ax.plot(f[:, 0], f[:, 1], color="black", marker="o", markersize=3, linewidth=1.4, label="logged chunk")
     controlled = diagnostics["controlled_positions"][idx]
     reference = diagnostics["reference_positions"][idx]
@@ -493,7 +566,7 @@ def plot_contact_reference_summary(diagnostics: Dict[str, Any], path: Path, exam
     ax.plot(controlled[:, 0], controlled[:, 1], color="tab:blue", linewidth=2.0, label="controlled")
     m = diagnostics.get("m")
     if m is not None:
-        attractor = m[idx]
+        attractor = _actions_for_display(m, diagnostics)[idx]
         ax.plot(attractor[:, 0], attractor[:, 1], color="tab:red", marker="x", markersize=4, linewidth=1.2, label="attractor m")
     context = batch.get("context", {})
     center = context.get("obstacle_center")
@@ -593,10 +666,10 @@ def _plot_contact_overlay(ax, diagnostics: Dict[str, Any], idx: int, *, show_lab
         act_hist = batch.get("act_hist")
         future_actions = batch.get("future_actions")
         if torch.is_tensor(act_hist):
-            h = act_hist[idx]
+            h = _actions_for_display(act_hist, diagnostics)[idx]
             ax.plot(h[:, 0], h[:, 1], color="0.85", marker="o", markersize=2.5, linewidth=1.0, alpha=0.85, label="history" if show_labels else None)
         if torch.is_tensor(future_actions):
-            f = future_actions[idx]
+            f = _actions_for_display(future_actions, diagnostics)[idx]
             ax.plot(f[:, 0], f[:, 1], color="white", marker="o", markersize=2.5, linewidth=1.3, alpha=0.9, label="logged chunk" if show_labels else None)
     reference = diagnostics.get("reference_positions")
     if reference is not None:
@@ -606,7 +679,7 @@ def _plot_contact_overlay(ax, diagnostics: Dict[str, Any], idx: int, *, show_lab
     ax.plot(controlled[:, 0], controlled[:, 1], color="tab:cyan", linewidth=1.8, label="controlled" if show_labels else None)
     m = diagnostics.get("m")
     if m is not None:
-        attractor = m[idx]
+        attractor = _actions_for_display(m, diagnostics)[idx]
         ax.plot(attractor[:, 0], attractor[:, 1], color="tab:red", marker="x", markersize=3, linewidth=1.0, alpha=0.7, label="m path" if show_labels else None)
     goal = context.get("goal")
     if torch.is_tensor(goal):
@@ -630,15 +703,17 @@ def plot_contact_potential_contours(diagnostics: Dict[str, Any], path: Path, exa
     steps = _spread_steps(horizon, count=5)
     bounds = _plot_bounds(diagnostics, idx)
     xx, yy, grid = _potential_grid(bounds, grid_size)
+    grid_model = _raw_action_grid_to_model(grid, diagnostics)
+    m_display = _actions_for_display(m, diagnostics)
     potentials = []
     forces = []
     force_norms = []
     for step in steps:
         center_m = m[idx, step]
         stiffness = k_diag[idx, step]
-        diff = grid - center_m
+        diff = grid_model - center_m
         potential = 0.5 * (stiffness * diff.pow(2)).sum(dim=-1)
-        force = -stiffness * diff
+        force = _force_to_display(-stiffness * diff, diagnostics)
         potentials.append(potential)
         forces.append(force)
         force_norms.append(torch.linalg.norm(force, dim=-1))
@@ -654,7 +729,7 @@ def plot_contact_potential_contours(diagnostics: Dict[str, Any], path: Path, exa
     gamma = diagnostics.get("gamma")
     arrow_scale = 0.08 * max(bounds[1] - bounds[0], bounds[3] - bounds[2])
     for col, step in enumerate(steps):
-        center_m = m[idx, step]
+        center_m = m_display[idx, step]
         stiffness = k_diag[idx, step]
         gamma_text = ""
         if gamma is not None:

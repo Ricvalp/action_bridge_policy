@@ -84,7 +84,7 @@ def main() -> None:
     subset = Subset(dataset, indices)
     batch = next(iter(DataLoader(subset, batch_size=len(indices), shuffle=False)))
 
-    diagnostics = collect_contact_diagnostics(model, batch, device)
+    diagnostics = collect_contact_diagnostics(model, batch, device, config=config)
     output_dir = Path(args.output_dir) if args.output_dir else default_output_dir(checkpoint)
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_contact_reference_summary(diagnostics, output_dir / "contact_reference_summary.png", example_idx=args.example_idx)

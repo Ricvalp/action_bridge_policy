@@ -29,6 +29,96 @@ def _normalization_stats(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _normalize_action_grid(grid: torch.Tensor, stats: Optional[Dict[str, Any]]) -> torch.Tensor:
+    if stats is None:
+        return grid
+    mean = torch.as_tensor(stats["action_mean"], dtype=grid.dtype, device=grid.device)
+    std = torch.as_tensor(stats["action_std"], dtype=grid.dtype, device=grid.device)
+    return (grid - mean) / std
+
+
+def _denormalize_action_tensor(tensor: torch.Tensor, stats: Optional[Dict[str, Any]]) -> torch.Tensor:
+    if stats is None:
+        return tensor
+    mean = torch.as_tensor(stats["action_mean"], dtype=tensor.dtype, device=tensor.device)
+    std = torch.as_tensor(stats["action_std"], dtype=tensor.dtype, device=tensor.device)
+    return tensor * std + mean
+
+
+def _reference_rollout_q_seq(model, batch: Dict[str, torch.Tensor], steps: int) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if not isinstance(model, ActionBridgePolicy) or not bool(getattr(model, "uses_contact_langevin", False)):
+        return None, None
+    h = model.encode_history(batch["obs_hist"], batch["act_hist"])
+    q, p = model.coordinate_adapter.init_qp_from_history(batch)
+    q_values = [q]
+    for k in range(max(0, int(steps))):
+        q, p, _ = model.reference_process.reference_step(q, p, h, k % model.chunk_horizon)
+        q_values.append(q)
+    q_seq = torch.stack(q_values, dim=1)
+    return q_seq, h
+
+
+def _contact_replan_record(
+    model,
+    batch: Dict[str, torch.Tensor],
+    pred: Dict[str, torch.Tensor],
+    config: Dict[str, Any],
+    state: np.ndarray,
+    act_hist_raw: np.ndarray,
+    time_index: int,
+    replan_index: int,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(model, ActionBridgePolicy) or not bool(getattr(model, "uses_contact_langevin", False)):
+        return None
+    if "q_seq" not in pred:
+        return None
+    stats = _normalization_stats(config)
+    eval_cfg = config.get("eval", {})
+    reference_steps = int(eval_cfg.get("sim_reference_steps", max(48, int(config.get("chunk_horizon", 16)) * 4)))
+    default_local_step = int(eval_cfg.get("sim_n_exec", config.get("inference", {}).get("n_exec", 4))) - 1
+    local_step = min(int(eval_cfg.get("sim_contact_potential_step", default_local_step)), int(config.get("chunk_horizon", 16)) - 1)
+    local_step = max(0, local_step)
+
+    h = model.encode_history(batch["obs_hist"], batch["act_hist"])
+    q_seq = pred["q_seq"].detach().cpu()[0]
+    q_seq_raw = _denormalize_action_tensor(q_seq, stats).numpy()
+
+    aux_values = []
+    for k in range(model.chunk_horizon):
+        _, aux = model.reference_process.force(pred["q_seq"][:, k], pred["p_seq"][:, k], h, k)
+        aux_values.append(aux)
+
+    def stack_aux(key: str) -> Optional[torch.Tensor]:
+        values = [item.get(key) for item in aux_values]
+        if any(value is None for value in values):
+            return None
+        return torch.stack(values, dim=1).detach().cpu()[0]
+
+    m = stack_aux("m")
+    k_diag = stack_aux("k_diag")
+    gamma = stack_aux("gamma")
+    if m is None or k_diag is None or gamma is None:
+        return None
+    m_raw = _denormalize_action_tensor(m, stats).numpy()
+
+    ref_q_seq, _ = _reference_rollout_q_seq(model, batch, reference_steps)
+    ref_q_raw = _denormalize_action_tensor(ref_q_seq.detach().cpu()[0], stats).numpy() if ref_q_seq is not None else None
+    return {
+        "time_index": int(time_index),
+        "replan_index": int(replan_index),
+        "local_step": int(min(local_step, m.shape[0] - 1)),
+        "state": np.asarray(state, dtype=np.float32).copy(),
+        "act_hist": np.asarray(act_hist_raw, dtype=np.float32).copy(),
+        "q_seq": q_seq_raw.astype(np.float32),
+        "reference_q_seq": ref_q_raw.astype(np.float32) if ref_q_raw is not None else None,
+        "m": m.numpy().astype(np.float32),
+        "m_path": m_raw.astype(np.float32),
+        "k_diag": k_diag.numpy().astype(np.float32),
+        "gamma": gamma.numpy().astype(np.float32),
+        "reference_steps": int(reference_steps),
+    }
+
+
 def _import_pyplot():
     import matplotlib
 
@@ -202,6 +292,7 @@ def rollout_pusht_sim_episode(model, config: Dict[str, Any], device: torch.devic
         frames = []
         path_kl_values = []
         boundary_values = []
+        contact_records = []
         z = None
         z_emb = None
         terminated = False
@@ -218,6 +309,18 @@ def rollout_pusht_sim_episode(model, config: Dict[str, Any], device: torch.devic
                 "act_hist": torch.from_numpy(model_act_hist[None]).to(device=device, dtype=torch.float32),
             }
             pred, z, z_emb = _generate_chunk_with_commitment(model, batch, config, z, z_emb)
+            record = _contact_replan_record(
+                model,
+                batch,
+                pred,
+                config,
+                state=state,
+                act_hist_raw=act_hist,
+                time_index=len(actions),
+                replan_index=num_replans,
+            )
+            if record is not None:
+                contact_records.append(record)
             pred_actions = pred["actions"][0].detach().cpu().numpy().astype(np.float32)
             if stats is not None:
                 pred_actions = denormalize_actions_np(pred_actions, stats)
@@ -270,6 +373,7 @@ def rollout_pusht_sim_episode(model, config: Dict[str, Any], device: torch.devic
             "num_replans": float(num_replans),
             "path_KL_energy": float(np.sum(path_kl_values)) if path_kl_values else 0.0,
             "chunk_boundary_discontinuity": float(np.mean(boundary_values)) if boundary_values else 0.0,
+            "contact_records": contact_records,
         }
     finally:
         env.close()
@@ -383,6 +487,101 @@ def plot_pusht_sim_frames(rollouts: list[Dict[str, Any]], path: Path, max_episod
     plt.close(fig)
 
 
+def _select_contact_records(records: list[Dict[str, Any]], max_panels: int) -> list[Dict[str, Any]]:
+    if max_panels <= 0 or len(records) <= max_panels:
+        return records
+    positions = np.linspace(0, len(records) - 1, num=max_panels).round().astype(int)
+    selected = []
+    seen = set()
+    for pos in positions:
+        pos = int(pos)
+        if pos in seen:
+            continue
+        selected.append(records[pos])
+        seen.add(pos)
+    return selected
+
+
+def plot_pusht_sim_contact_reference(
+    rollouts: list[Dict[str, Any]],
+    path: Path,
+    config: Dict[str, Any],
+    max_panels: int = 6,
+    grid_size: int = 90,
+) -> None:
+    selected_rollout = next((rollout for rollout in rollouts if rollout.get("contact_records")), None)
+    if selected_rollout is None:
+        return
+    records = _select_contact_records(list(selected_rollout["contact_records"]), int(max_panels))
+    if not records:
+        return
+
+    plt = _import_pyplot()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stats = _normalization_stats(config)
+    xs = torch.linspace(0.0, 512.0, int(grid_size))
+    ys = torch.linspace(0.0, 512.0, int(grid_size))
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    raw_grid = torch.stack([xx, yy], dim=-1)
+    model_grid = _normalize_action_grid(raw_grid, stats)
+
+    potentials = []
+    for record in records:
+        local_step = int(record["local_step"])
+        m = torch.as_tensor(record["m"][local_step], dtype=torch.float32)
+        stiffness = torch.as_tensor(record["k_diag"][local_step], dtype=torch.float32)
+        diff = model_grid - m
+        potentials.append(0.5 * (stiffness * diff.pow(2)).sum(dim=-1))
+    max_potential = float(torch.stack(potentials).max().item())
+    levels = torch.linspace(0.0, max(max_potential, 1e-8), 25).numpy()
+
+    cols = len(records)
+    fig, axes = plt.subplots(1, cols, figsize=(4.2 * cols, 4.2), squeeze=False, layout="constrained")
+    rollout_states = np.asarray(selected_rollout["states"], dtype=np.float32)
+    rollout_actions = np.asarray(selected_rollout["actions"], dtype=np.float32)
+    agent_path = rollout_states[:, :2]
+    block_path = rollout_states[:, 2:5]
+    goal_pose = np.array([256.0, 256.0, math.pi / 4], dtype=np.float32)
+
+    for col, (ax, record, potential) in enumerate(zip(axes.ravel(), records, potentials)):
+        image = ax.contourf(xx.numpy(), yy.numpy(), potential.numpy(), levels=levels, cmap="viridis")
+        t = int(record["time_index"])
+        local_step = int(record["local_step"])
+        state = np.asarray(record["state"], dtype=np.float32)
+        q_seq = np.asarray(record["q_seq"], dtype=np.float32)
+        m_path = np.asarray(record["m_path"], dtype=np.float32)
+        ref_q = record.get("reference_q_seq")
+        stiffness = np.asarray(record["k_diag"][local_step], dtype=np.float32)
+        gamma = np.asarray(record["gamma"][local_step], dtype=np.float32).mean()
+
+        _draw_tee(ax, goal_pose, color="tab:green", alpha=0.24, linestyle="--", label="goal T" if col == 0 else None)
+        _draw_tee(ax, state[2:5], color="0.45", alpha=0.35, label="current T" if col == 0 else None)
+        ax.plot(block_path[: t + 1, 0], block_path[: t + 1, 1], color="0.4", linewidth=1.1, alpha=0.65, label="block so far" if col == 0 else None)
+        ax.plot(agent_path[: t + 1, 0], agent_path[: t + 1, 1], color="tab:purple", linewidth=1.5, label="agent so far" if col == 0 else None)
+        if rollout_actions.size:
+            ax.scatter(rollout_actions[:t, 0], rollout_actions[:t, 1], color="white", s=6, alpha=0.6, label="executed actions" if col == 0 else None)
+        ax.plot(q_seq[:, 0], q_seq[:, 1], color="tab:orange", linestyle="--", linewidth=1.5, label="planned chunk" if col == 0 else None)
+        if ref_q is not None:
+            ref_q = np.asarray(ref_q, dtype=np.float32)
+            ax.plot(ref_q[:, 0], ref_q[:, 1], color="tab:green", linestyle="-.", linewidth=1.7, label=f"reference only ({int(record['reference_steps'])})" if col == 0 else None)
+            ax.scatter(ref_q[-1:, 0], ref_q[-1:, 1], color="tab:green", marker="s", s=28, zorder=8, label="reference end" if col == 0 else None)
+        ax.plot(m_path[:, 0], m_path[:, 1], color="tab:red", marker="x", markersize=3, linewidth=1.0, alpha=0.75, label="m path" if col == 0 else None)
+        ax.scatter([float(m_path[local_step, 0])], [float(m_path[local_step, 1])], color="red", marker="x", s=60, linewidths=2.0, zorder=8, label="m local" if col == 0 else None)
+        ax.scatter([float(state[0])], [float(state[1])], color="black", marker="o", s=28, zorder=8, label="agent now" if col == 0 else None)
+        ax.set_xlim(0, 512)
+        ax.set_ylim(512, 0)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(
+            f"replan={record['replan_index']} | t={t} | k={local_step}\n"
+            f"stiff=[{stiffness[0]:.2g},{stiffness[1]:.2g}] | gamma={gamma:.3g}",
+            fontsize=8.5,
+        )
+    axes[0, 0].legend(fontsize=6, loc="upper right")
+    fig.colorbar(image, ax=axes[0, :], fraction=0.02, pad=0.015, label="V(q,h,k)")
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
 def _frame_to_uint8(frame: np.ndarray) -> np.ndarray:
     array = np.asarray(frame)
     if array.dtype != np.uint8:
@@ -487,6 +686,13 @@ def evaluate_pusht_sim_model(model, config: Dict[str, Any], device: torch.device
             figures / "pusht_sim_frames.png",
             max_episodes=max(1, render_episodes),
             frames_per_episode=int(eval_cfg.get("sim_frames_per_episode", 6)),
+        )
+        plot_pusht_sim_contact_reference(
+            rollouts,
+            figures / "pusht_sim_contact_reference.png",
+            config,
+            max_panels=int(eval_cfg.get("sim_contact_panels", 6)),
+            grid_size=int(eval_cfg.get("sim_contact_grid_size", 90)),
         )
         gif_paths = []
         video_paths = []
