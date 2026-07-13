@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Subset
 from action_bridge.config import apply_overrides, load_config, save_config
 from action_bridge.data.pusht_adapter import denormalize_actions_tensor, denormalize_observations_tensor
 from action_bridge.eval.metrics import action_smoothness, average_metric_dicts
+from action_bridge.eval.pusht_wrong_side import plot_wrong_side_go_around_diagnostic
 from action_bridge.eval.rollout import predict_actions
 from action_bridge.eval.visualization import plot_energy_histograms
 from action_bridge.training.common import build_dataset, build_model, move_to_device, resolve_device, save_json
@@ -391,6 +392,10 @@ def evaluate_pusht_model(
                 plot_action_chunk_2d(plot_batch, plot_pred, figures / "action_chunk_2d_with_t.png", config)
             except Exception as exc:
                 summary["plot_action_chunk_2d_error"] = str(exc)
+        try:
+            summary.update(plot_wrong_side_go_around_diagnostic(model, config, device, figures))
+        except Exception as exc:
+            summary["plot_wrong_side_go_around_error"] = str(exc)
         save_json(output_dir / "metrics" / "pusht_metrics.json", summary)
     model.train()
     return summary

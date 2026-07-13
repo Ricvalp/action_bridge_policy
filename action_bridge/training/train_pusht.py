@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 
 from action_bridge.config import apply_overrides, load_config, save_config, to_config_dict
 from action_bridge.eval.eval_pusht import evaluate_pusht_model
+from action_bridge.eval.pusht_sim import evaluate_pusht_sim_model
 from action_bridge.training.common import (
     append_csv,
     build_dataset,
@@ -61,6 +62,25 @@ def periodic_pusht_eval_config(config, logging_cfg) -> ConfigDict:
     return eval_config
 
 
+def periodic_pusht_sim_eval_config(config, logging_cfg) -> ConfigDict:
+    eval_config = to_config_dict(config)
+    if "eval" not in eval_config:
+        eval_config.eval = ConfigDict()
+    eval_config.eval.sim_closed_loop = True
+    eval_config.eval.sim_episodes = int(logging_cfg.get("sim_eval_episodes", 20))
+    eval_config.eval.sim_max_steps = int(logging_cfg.get("sim_eval_max_steps", 500))
+    if logging_cfg.get("sim_eval_n_exec", None) is not None:
+        eval_config.eval.sim_n_exec = int(logging_cfg.get("sim_eval_n_exec"))
+    if logging_cfg.get("sim_eval_seed", None) is not None:
+        eval_config.eval.sim_seed = int(logging_cfg.get("sim_eval_seed"))
+    eval_config.eval.sim_render_episodes = int(logging_cfg.get("sim_eval_render_episodes", 0))
+    eval_config.eval.sim_plot_episodes = int(logging_cfg.get("sim_eval_plot_episodes", 8))
+    eval_config.eval.sim_save_gifs = bool(logging_cfg.get("sim_eval_save_gifs", False))
+    eval_config.eval.sim_save_videos = bool(logging_cfg.get("sim_eval_save_videos", False))
+    eval_config.eval.sim_collect_contact_diagnostics = bool(logging_cfg.get("sim_eval_collect_contact_diagnostics", False))
+    return eval_config
+
+
 @torch.no_grad()
 def run_periodic_pusht_eval(model, datasets: dict, config, device, run_dir: Path, step: int, wandb_run) -> dict:
     logging_cfg = config.get("logging", {})
@@ -84,6 +104,33 @@ def run_periodic_pusht_eval(model, datasets: dict, config, device, run_dir: Path
     save_json(output_dir / "eval_metadata.json", {"step": step, "split": split, "run_id": config.get("run_id")})
     log_wandb_scalars(wandb_run, metrics, step=step, prefix=f"{split}_eval")
     log_wandb_figures(wandb_run, output_dir / "figures", step=step, prefix=f"{split}_eval")
+    model.train()
+    return metrics
+
+
+@torch.no_grad()
+def run_periodic_pusht_sim_eval(model, config, device, run_dir: Path, step: int, wandb_run) -> dict:
+    logging_cfg = config.get("logging", {})
+    eval_config = periodic_pusht_sim_eval_config(config, logging_cfg)
+    output_dir = run_dir / "eval" / f"sim_step_{step:06d}"
+    try:
+        metrics = evaluate_pusht_sim_model(model, eval_config, device, output_dir=output_dir)
+    except Exception as exc:
+        if not bool(logging_cfg.get("sim_eval_continue_on_error", True)):
+            raise
+        output_dir.mkdir(parents=True, exist_ok=True)
+        metrics = {"sim_eval_error": 1.0}
+        save_json(output_dir / "metrics" / "pusht_sim_error.json", {"step": step, "error": repr(exc)})
+        append_csv(run_dir / "metrics" / "periodic_sim_eval_errors.csv", {"step": step, "error": repr(exc)})
+        print(f"Push-T sim eval failed at step {step}: {exc!r}")
+    else:
+        row = {"step": step}
+        row.update(metrics)
+        append_csv(run_dir / "metrics" / "periodic_sim_eval_metrics.csv", row)
+    save_config(eval_config, output_dir / "pusht_sim_config.json")
+    save_json(output_dir / "eval_metadata.json", {"step": step, "run_id": config.get("run_id"), "kind": "pusht_sim"})
+    log_wandb_scalars(wandb_run, metrics, step=step, prefix="sim_eval")
+    log_wandb_figures(wandb_run, output_dir / "figures", step=step, prefix="sim_eval")
     model.train()
     return metrics
 
@@ -119,6 +166,9 @@ def train(config):
     log_every = int(config.get("logging", {}).get("log_every_steps", 25))
     eval_every = int(config.get("logging", {}).get("eval_every_steps", max(25, log_every)))
     full_eval_every = int(config.get("logging", {}).get("full_eval_every_steps", 0))
+    checkpoint_every = int(config.get("logging", {}).get("checkpoint_every_steps", 10000))
+    sim_eval_every = int(config.get("logging", {}).get("sim_eval_every_steps", 0))
+    sim_eval_enabled = bool(config.get("logging", {}).get("sim_eval_enabled", False))
     best_val = float("inf")
     wandb_run = maybe_init_wandb(config, run_dir)
 
@@ -152,6 +202,12 @@ def train(config):
 
             if full_eval_every > 0 and step % full_eval_every == 0 and step != max_steps:
                 run_periodic_pusht_eval(model, datasets, config, device, run_dir, step, wandb_run)
+
+            if sim_eval_enabled and sim_eval_every > 0 and step % sim_eval_every == 0:
+                run_periodic_pusht_sim_eval(model, config, device, run_dir, step, wandb_run)
+
+            if checkpoint_every > 0 and step % checkpoint_every == 0:
+                save_checkpoint(run_dir / "checkpoints" / f"step_{step:06d}.pt", model, optimizer, config, step, best_val)
 
         save_checkpoint(run_dir / "checkpoints" / "latest.pt", model, optimizer, config, max_steps, best_val)
         metrics = evaluate_pusht_model(model, test_set, config, device, output_dir=run_dir)

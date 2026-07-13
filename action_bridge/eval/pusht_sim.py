@@ -58,6 +58,37 @@ def _reference_rollout_q_seq(model, batch: Dict[str, torch.Tensor], steps: int) 
     return q_seq, h
 
 
+def _sample_contact_latent_chunks(
+    model,
+    batch: Dict[str, torch.Tensor],
+    config: Dict[str, Any],
+    num_samples: int,
+) -> Optional[np.ndarray]:
+    if num_samples <= 0:
+        return None
+    if not isinstance(model, ActionBridgePolicy) or not bool(getattr(model, "uses_contact_langevin", False)):
+        return None
+
+    stats = _normalization_stats(config)
+    deterministic = bool(config.get("inference", {}).get("deterministic", True))
+    cpu_rng_state = torch.random.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        samples = []
+        for _ in range(int(num_samples)):
+            sample = generate_chunk(model, batch["obs_hist"], batch["act_hist"], deterministic=deterministic)
+            q_seq = sample.get("q_seq")
+            if q_seq is None:
+                return None
+            q_seq_raw = _denormalize_action_tensor(q_seq.detach().cpu()[0], stats).numpy()
+            samples.append(q_seq_raw.astype(np.float32))
+        return np.stack(samples, axis=0)
+    finally:
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state)
+
+
 def _contact_replan_record(
     model,
     batch: Dict[str, torch.Tensor],
@@ -75,6 +106,7 @@ def _contact_replan_record(
     stats = _normalization_stats(config)
     eval_cfg = config.get("eval", {})
     reference_steps = int(eval_cfg.get("sim_reference_steps", max(48, int(config.get("chunk_horizon", 16)) * 4)))
+    latent_samples = int(eval_cfg.get("sim_latent_samples", 0))
     default_local_step = int(eval_cfg.get("sim_n_exec", config.get("inference", {}).get("n_exec", 4))) - 1
     local_step = min(int(eval_cfg.get("sim_contact_potential_step", default_local_step)), int(config.get("chunk_horizon", 16)) - 1)
     local_step = max(0, local_step)
@@ -103,6 +135,7 @@ def _contact_replan_record(
 
     ref_q_seq, _ = _reference_rollout_q_seq(model, batch, reference_steps)
     ref_q_raw = _denormalize_action_tensor(ref_q_seq.detach().cpu()[0], stats).numpy() if ref_q_seq is not None else None
+    sampled_q = _sample_contact_latent_chunks(model, batch, config, latent_samples)
     return {
         "time_index": int(time_index),
         "replan_index": int(replan_index),
@@ -116,6 +149,7 @@ def _contact_replan_record(
         "k_diag": k_diag.numpy().astype(np.float32),
         "gamma": gamma.numpy().astype(np.float32),
         "reference_steps": int(reference_steps),
+        "latent_sample_q_seq": sampled_q,
     }
 
 
@@ -265,7 +299,13 @@ def _generate_chunk_with_commitment(
 
 
 @torch.no_grad()
-def rollout_pusht_sim_episode(model, config: Dict[str, Any], device: torch.device, seed: int) -> Dict[str, Any]:
+def rollout_pusht_sim_episode(
+    model,
+    config: Dict[str, Any],
+    device: torch.device,
+    seed: int,
+    collect_frames: bool = True,
+) -> Dict[str, Any]:
     eval_cfg = config.get("eval", {})
     obs_history = int(config.get("obs_history", 2))
     action_history = int(config.get("action_history", 2))
@@ -276,6 +316,7 @@ def rollout_pusht_sim_episode(model, config: Dict[str, Any], device: torch.devic
     success_threshold = float(eval_cfg.get("sim_success_threshold", 0.95))
     render_mode = str(eval_cfg.get("sim_render_mode", "rgb_array"))
     obs_type = str(eval_cfg.get("sim_obs_type", "state"))
+    collect_contact = bool(eval_cfg.get("sim_collect_contact_diagnostics", True))
 
     env = _make_pusht_env(render_mode=render_mode, obs_type=obs_type)
     low, high = _action_bounds(env)
@@ -309,18 +350,19 @@ def rollout_pusht_sim_episode(model, config: Dict[str, Any], device: torch.devic
                 "act_hist": torch.from_numpy(model_act_hist[None]).to(device=device, dtype=torch.float32),
             }
             pred, z, z_emb = _generate_chunk_with_commitment(model, batch, config, z, z_emb)
-            record = _contact_replan_record(
-                model,
-                batch,
-                pred,
-                config,
-                state=state,
-                act_hist_raw=act_hist,
-                time_index=len(actions),
-                replan_index=num_replans,
-            )
-            if record is not None:
-                contact_records.append(record)
+            if collect_contact:
+                record = _contact_replan_record(
+                    model,
+                    batch,
+                    pred,
+                    config,
+                    state=state,
+                    act_hist_raw=act_hist,
+                    time_index=len(actions),
+                    replan_index=num_replans,
+                )
+                if record is not None:
+                    contact_records.append(record)
             pred_actions = pred["actions"][0].detach().cpu().numpy().astype(np.float32)
             if stats is not None:
                 pred_actions = denormalize_actions_np(pred_actions, stats)
@@ -342,7 +384,7 @@ def rollout_pusht_sim_episode(model, config: Dict[str, Any], device: torch.devic
                 infos.append(dict(info))
                 states.append(state.copy())
                 max_reward = max(max_reward, float(reward))
-                if render_mode == "rgb_array":
+                if collect_frames and render_mode == "rgb_array":
                     try:
                         frame = env.render()
                         if frame is not None:
@@ -582,6 +624,187 @@ def plot_pusht_sim_contact_reference(
     plt.close(fig)
 
 
+def plot_pusht_sim_contact_parameters(
+    rollouts: list[Dict[str, Any]],
+    path: Path,
+    max_replans: Optional[int] = None,
+) -> None:
+    selected_rollout = next((rollout for rollout in rollouts if rollout.get("contact_records")), None)
+    if selected_rollout is None:
+        return
+    records = list(selected_rollout["contact_records"])
+    if max_replans is not None and len(records) > int(max_replans):
+        records = _select_contact_records(records, int(max_replans))
+    if not records:
+        return
+
+    plt = _import_pyplot()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    times = np.asarray([record["time_index"] for record in records], dtype=np.float32)
+    local_steps = np.asarray([record["local_step"] for record in records], dtype=np.int64)
+    k_diag = np.stack([np.asarray(record["k_diag"], dtype=np.float32) for record in records], axis=0)
+    gamma = np.stack([np.asarray(record["gamma"], dtype=np.float32) for record in records], axis=0)
+    m_path = np.stack([np.asarray(record["m_path"], dtype=np.float32) for record in records], axis=0)
+    q_seq = np.stack([np.asarray(record["q_seq"], dtype=np.float32) for record in records], axis=0)
+
+    gamma_mean = gamma.mean(axis=-1)
+    k_mean = k_diag.mean(axis=-1)
+    k_anisotropy = np.abs(k_diag[..., 0] - k_diag[..., 1])
+    m_motion = np.linalg.norm(np.diff(m_path, axis=1), axis=-1)
+    q_to_m = np.linalg.norm(q_seq[:, 1:] - m_path, axis=-1)
+    executed_gamma = gamma_mean[np.arange(len(records)), local_steps]
+    executed_k0 = k_diag[np.arange(len(records)), local_steps, 0]
+    executed_k1 = k_diag[np.arange(len(records)), local_steps, 1]
+    executed_k_mean = k_mean[np.arange(len(records)), local_steps]
+    executed_q_to_m = q_to_m[np.arange(len(records)), local_steps]
+
+    fig, axes = plt.subplots(3, 2, figsize=(13.0, 10.0), layout="constrained")
+    panels = [
+        ("gamma over chunk", gamma_mean, "gamma"),
+        ("stiffness kx over chunk", k_diag[..., 0], "kx"),
+        ("stiffness ky over chunk", k_diag[..., 1], "ky"),
+        ("stiffness anisotropy |kx-ky|", k_anisotropy, "|kx-ky|"),
+    ]
+    for ax, (title, values, label) in zip(axes[:2].ravel(), panels):
+        image = ax.imshow(values, aspect="auto", interpolation="nearest", origin="lower")
+        ax.set_title(title)
+        ax.set_ylabel("replan index")
+        ax.set_xlabel("chunk step k")
+        fig.colorbar(image, ax=ax, fraction=0.035, pad=0.02, label=label)
+
+    ax = axes[2, 0]
+    ax.plot(times, executed_gamma, color="tab:blue", linewidth=1.6, label="gamma at executed k")
+    ax.plot(times, executed_k0, color="tab:orange", linewidth=1.2, label="kx at executed k")
+    ax.plot(times, executed_k1, color="tab:green", linewidth=1.2, label="ky at executed k")
+    ax.plot(times, executed_k_mean, color="black", linewidth=1.4, alpha=0.7, label="mean k at executed k")
+    ax.set_title("Parameters actually used for the executed action")
+    ax.set_xlabel("sim step")
+    ax.legend(fontsize=8)
+
+    ax = axes[2, 1]
+    ax.plot(times, executed_q_to_m, color="tab:red", linewidth=1.5, label="|planned q - m| at executed k")
+    ax.plot(times, m_motion.mean(axis=-1), color="tab:purple", linewidth=1.3, label="mean |delta m| over chunk")
+    ax.set_title("Attractor use")
+    ax.set_xlabel("sim step")
+    ax.set_ylabel("pixels")
+    ax.legend(fontsize=8)
+
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def _records_with_latent_samples(rollouts: list[Dict[str, Any]]) -> tuple[Optional[Dict[str, Any]], list[Dict[str, Any]]]:
+    selected_rollout = next((rollout for rollout in rollouts if rollout.get("contact_records")), None)
+    if selected_rollout is None:
+        return None, []
+    records = [
+        record
+        for record in selected_rollout["contact_records"]
+        if record.get("latent_sample_q_seq") is not None and len(record.get("latent_sample_q_seq", [])) > 0
+    ]
+    return selected_rollout, records
+
+
+def plot_pusht_sim_latent_chunk_samples(
+    rollouts: list[Dict[str, Any]],
+    path: Path,
+    max_panels: int = 6,
+) -> None:
+    selected_rollout, records = _records_with_latent_samples(rollouts)
+    if selected_rollout is None or not records:
+        return
+    records = _select_contact_records(records, int(max_panels))
+    if not records:
+        return
+
+    plt = _import_pyplot()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cols = len(records)
+    fig, axes = plt.subplots(1, cols, figsize=(4.2 * cols, 4.2), squeeze=False, layout="constrained")
+    rollout_states = np.asarray(selected_rollout["states"], dtype=np.float32)
+    rollout_actions = np.asarray(selected_rollout["actions"], dtype=np.float32)
+    agent_path = rollout_states[:, :2]
+    block_path = rollout_states[:, 2:5]
+    goal_pose = np.array([256.0, 256.0, math.pi / 4], dtype=np.float32)
+
+    for col, (ax, record) in enumerate(zip(axes.ravel(), records)):
+        t = int(record["time_index"])
+        local_step = int(record["local_step"])
+        state = np.asarray(record["state"], dtype=np.float32)
+        actual_q = np.asarray(record["q_seq"], dtype=np.float32)
+        samples = np.asarray(record["latent_sample_q_seq"], dtype=np.float32)
+        ref_q = record.get("reference_q_seq")
+
+        _draw_tee(ax, goal_pose, color="tab:green", alpha=0.20, linestyle="--", label="goal T" if col == 0 else None)
+        _draw_tee(ax, state[2:5], color="0.45", alpha=0.32, label="current T" if col == 0 else None)
+        ax.plot(block_path[: t + 1, 0], block_path[: t + 1, 1], color="0.45", linewidth=1.0, alpha=0.6, label="block so far" if col == 0 else None)
+        ax.plot(agent_path[: t + 1, 0], agent_path[: t + 1, 1], color="tab:purple", linewidth=1.4, label="agent so far" if col == 0 else None)
+        if rollout_actions.size:
+            ax.scatter(rollout_actions[:t, 0], rollout_actions[:t, 1], color="0.15", s=6, alpha=0.45, label="executed actions" if col == 0 else None)
+        for sample_idx, sample_q in enumerate(samples):
+            ax.plot(
+                sample_q[:, 0],
+                sample_q[:, 1],
+                color="tab:blue",
+                linewidth=0.9,
+                alpha=0.22,
+                label="sampled z chunks" if col == 0 and sample_idx == 0 else None,
+            )
+            ax.scatter(sample_q[-1:, 0], sample_q[-1:, 1], color="tab:blue", s=8, alpha=0.22)
+        if ref_q is not None:
+            ref_q = np.asarray(ref_q, dtype=np.float32)
+            ax.plot(ref_q[:, 0], ref_q[:, 1], color="tab:green", linestyle="-.", linewidth=1.4, alpha=0.8, label="reference only" if col == 0 else None)
+        ax.plot(actual_q[:, 0], actual_q[:, 1], color="tab:orange", linestyle="--", linewidth=2.0, label="executed sampled chunk" if col == 0 else None)
+        ax.scatter([float(state[0])], [float(state[1])], color="black", marker="o", s=32, zorder=8, label="agent now" if col == 0 else None)
+        ax.set_xlim(0, 512)
+        ax.set_ylim(512, 0)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(
+            f"replan={record['replan_index']} | t={t} | k={local_step}\n"
+            f"{samples.shape[0]} sampled latents",
+            fontsize=8.5,
+        )
+    axes[0, 0].legend(fontsize=6, loc="upper right")
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def plot_pusht_sim_latent_spread(
+    rollouts: list[Dict[str, Any]],
+    path: Path,
+) -> None:
+    _, records = _records_with_latent_samples(rollouts)
+    if not records:
+        return
+    plt = _import_pyplot()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    times = np.asarray([record["time_index"] for record in records], dtype=np.float32)
+    local_steps = np.asarray([record["local_step"] for record in records], dtype=np.int64)
+    endpoint_spread = []
+    executed_step_spread = []
+    mean_path_spread = []
+    for record, local_step in zip(records, local_steps):
+        samples = np.asarray(record["latent_sample_q_seq"], dtype=np.float32)
+        mean_path = samples.mean(axis=0, keepdims=True)
+        distances = np.linalg.norm(samples - mean_path, axis=-1)
+        mean_path_spread.append(float(distances.mean()))
+        endpoint_spread.append(float(distances[:, -1].mean()))
+        executed_step_spread.append(float(distances[:, int(local_step)].mean()))
+
+    fig, ax = plt.subplots(figsize=(8.0, 4.2), layout="constrained")
+    ax.plot(times, executed_step_spread, label="spread at executed k", linewidth=1.5)
+    ax.plot(times, endpoint_spread, label="final-step spread", linewidth=1.5)
+    ax.plot(times, mean_path_spread, label="mean path spread", linewidth=1.5)
+    ax.set_xlabel("sim step")
+    ax.set_ylabel("mean distance to sample mean, pixels")
+    ax.set_title("Diversity from sampling z at each replan")
+    ax.legend(fontsize=8)
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
 def _frame_to_uint8(frame: np.ndarray) -> np.ndarray:
     array = np.asarray(frame)
     if array.dtype != np.uint8:
@@ -653,10 +876,13 @@ def evaluate_pusht_sim_model(model, config: Dict[str, Any], device: torch.device
     model.eval()
     rollouts = []
     for episode_idx in range(max(1, episodes)):
-        rollout = rollout_pusht_sim_episode(model, config, device, seed=seed0 + episode_idx)
-        if episode_idx >= render_episodes:
-            rollout = dict(rollout)
-            rollout["frames"] = []
+        rollout = rollout_pusht_sim_episode(
+            model,
+            config,
+            device,
+            seed=seed0 + episode_idx,
+            collect_frames=episode_idx < render_episodes,
+        )
         rollouts.append(rollout)
 
     success = np.asarray([item["success"] for item in rollouts], dtype=np.float32)
@@ -693,6 +919,20 @@ def evaluate_pusht_sim_model(model, config: Dict[str, Any], device: torch.device
             config,
             max_panels=int(eval_cfg.get("sim_contact_panels", 6)),
             grid_size=int(eval_cfg.get("sim_contact_grid_size", 90)),
+        )
+        plot_pusht_sim_contact_parameters(
+            rollouts,
+            figures / "pusht_sim_contact_parameters.png",
+            max_replans=eval_cfg.get("sim_contact_parameter_max_replans", None),
+        )
+        plot_pusht_sim_latent_chunk_samples(
+            rollouts,
+            figures / "pusht_sim_latent_chunk_samples.png",
+            max_panels=int(eval_cfg.get("sim_latent_sample_panels", 6)),
+        )
+        plot_pusht_sim_latent_spread(
+            rollouts,
+            figures / "pusht_sim_latent_spread.png",
         )
         gif_paths = []
         video_paths = []

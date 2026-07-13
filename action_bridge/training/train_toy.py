@@ -33,7 +33,16 @@ FIGURE_FILES = [
     "continuous_latent_scatter.png",
     "energy_histograms.png",
     "generated_same_history.png",
+    "pusht_sim_contact_parameters.png",
+    "pusht_sim_contact_reference.png",
+    "pusht_sim_frames.png",
+    "pusht_sim_latent_chunk_samples.png",
+    "pusht_sim_latent_spread.png",
+    "pusht_sim_rewards.png",
+    "pusht_sim_rollouts.png",
     "receding_horizon_action_rollout.png",
+    "wrong_side_go_around_lateral_summary.png",
+    "wrong_side_go_around_latent_chunks.png",
 ]
 
 
@@ -197,6 +206,7 @@ def train(config):
     log_every = int(config.get("logging", {}).get("log_every_steps", 25))
     eval_every = int(config.get("logging", {}).get("eval_every_steps", max(25, log_every)))
     full_eval_every = int(config.get("logging", {}).get("full_eval_every_steps", 0))
+    checkpoint_every = int(config.get("logging", {}).get("checkpoint_every_steps", 10000))
     best_val = float("inf")
     wandb_run = maybe_init_wandb(config, run_dir)
 
@@ -230,6 +240,9 @@ def train(config):
 
             if full_eval_every > 0 and step % full_eval_every == 0 and step != max_steps:
                 run_periodic_eval(model, datasets, config, device, run_dir, step, wandb_run)
+
+            if checkpoint_every > 0 and step % checkpoint_every == 0:
+                save_checkpoint(run_dir / "checkpoints" / f"step_{step:06d}.pt", model, optimizer, config, step, best_val)
 
         save_checkpoint(run_dir / "checkpoints" / "latest.pt", model, optimizer, config, max_steps, best_val)
         metrics = evaluate_toy_model(model, test_set, config, device, output_dir=run_dir)
