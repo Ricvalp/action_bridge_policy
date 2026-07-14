@@ -51,9 +51,10 @@ def _reference_rollout_q_seq(model, batch: Dict[str, torch.Tensor], steps: int) 
         return None, None
     h = model.encode_history(batch["obs_hist"], batch["act_hist"])
     q, p = model.coordinate_adapter.init_qp_from_history(batch)
+    obs_state = batch["obs_hist"][:, -1]
     q_values = [q]
     for k in range(max(0, int(steps))):
-        q, p, _ = model.reference_process.reference_step(q, p, h, k % model.chunk_horizon)
+        q, p, _ = model.reference_process.reference_step(q, p, h, k % model.chunk_horizon, obs_state=obs_state)
         q_values.append(q)
     q_seq = torch.stack(q_values, dim=1)
     return q_seq, h
@@ -217,6 +218,22 @@ def _aggregate_rollout_diagnostics(rollouts: list[Dict[str, Any]]) -> Dict[str, 
     add_distribution("control_accel_norm", control_norms)
     add_distribution("reference_control_ratio", ratio_values)
     add_distribution("damping_power", damping_power_values)
+
+    overpush = np.asarray([float(item.get("overpush", False)) for item in rollouts], dtype=np.float32)
+    contact_losses = np.asarray([float(item.get("contact_loss_count", 0.0)) for item in rollouts], dtype=np.float32)
+    dist_first_contact = np.asarray(
+        [float(item["distance_to_t_before_first_contact"]) for item in rollouts if item.get("distance_to_t_before_first_contact") is not None],
+        dtype=np.float32,
+    )
+    dist_after_final_contact = np.asarray(
+        [float(item["distance_to_target_after_final_contact"]) for item in rollouts if item.get("distance_to_target_after_final_contact") is not None],
+        dtype=np.float32,
+    )
+    metrics["overpush_rate"] = float(overpush.mean()) if overpush.size else 0.0
+    metrics["contact_loss_count_mean"] = float(contact_losses.mean()) if contact_losses.size else 0.0
+    metrics["contact_loss_count_max"] = float(contact_losses.max()) if contact_losses.size else 0.0
+    metrics["distance_to_t_before_first_contact_mean"] = float(dist_first_contact.mean()) if dist_first_contact.size else 0.0
+    metrics["distance_to_target_after_final_contact_mean"] = float(dist_after_final_contact.mean()) if dist_after_final_contact.size else 0.0
     return metrics
 
 
@@ -243,6 +260,7 @@ def _contact_replan_record(
     local_step = max(0, local_step)
 
     h = model.encode_history(batch["obs_hist"], batch["act_hist"])
+    obs_state = batch["obs_hist"][:, -1]
     q_seq = pred["q_seq"].detach().cpu()[0]
     q_seq_raw = _denormalize_action_tensor(q_seq, stats).numpy()
 
@@ -254,7 +272,7 @@ def _contact_replan_record(
     for k in range(model.chunk_horizon):
         q_k = pred["q_seq"][:, k]
         p_k = pred["p_seq"][:, k]
-        f_ref, aux = model.reference_process.force(q_k, p_k, h, k)
+        f_ref, aux = model.reference_process.force(q_k, p_k, h, k, obs_state=obs_state)
         aux_values.append(aux)
         f_ref_values.append(f_ref)
         controls = pred.get("controls")
@@ -287,6 +305,16 @@ def _contact_replan_record(
     gamma = stack_aux("gamma")
     if m is None or k_diag is None or gamma is None:
         return None
+    b_star_px = stack_aux("b_star_px")
+    n_star = stack_aux("n_star")
+    m_pre_px = stack_aux("m_pre_px")
+    m_push_px = stack_aux("m_push_px")
+    m_geo_px = stack_aux("m_geo_px")
+    rho_contact = stack_aux("rho_contact")
+    rho_goal = stack_aux("rho_goal")
+    d_contact = stack_aux("d_contact")
+    goal_err = stack_aux("goal_err")
+    delta_push = stack_aux("delta_push")
     f_ref = torch.stack(f_ref_values, dim=1).detach().cpu()[0]
     control_accel = torch.stack(control_accel_values, dim=1).detach().cpu()[0]
     f_ref_norm = torch.linalg.norm(f_ref, dim=-1)
@@ -320,6 +348,16 @@ def _contact_replan_record(
         "q_to_m": q_to_m.numpy().astype(np.float32),
         "reference_steps": int(reference_steps),
         "latent_sample_q_seq": sampled_q,
+        "b_star_px": b_star_px.numpy().astype(np.float32) if b_star_px is not None else None,
+        "n_star": n_star.numpy().astype(np.float32) if n_star is not None else None,
+        "m_pre_px": m_pre_px.numpy().astype(np.float32) if m_pre_px is not None else None,
+        "m_push_px": m_push_px.numpy().astype(np.float32) if m_push_px is not None else None,
+        "m_geo_px": m_geo_px.numpy().astype(np.float32) if m_geo_px is not None else None,
+        "rho_contact": rho_contact.numpy().astype(np.float32) if rho_contact is not None else None,
+        "rho_goal": rho_goal.numpy().astype(np.float32) if rho_goal is not None else None,
+        "d_contact": d_contact.numpy().astype(np.float32) if d_contact is not None else None,
+        "goal_err": goal_err.numpy().astype(np.float32) if goal_err is not None else None,
+        "delta_push": delta_push.numpy().astype(np.float32) if delta_push is not None else None,
     }
 
 
@@ -471,6 +509,7 @@ def _generate_contact_chunk_with_intervention(
     intervention = str(config.get("eval", {}).get("sim_intervention", "full_policy"))
     deterministic = bool(config.get("inference", {}).get("deterministic", True))
     h_emb = policy.encode_history(batch["obs_hist"], batch["act_hist"])
+    obs_state = batch["obs_hist"][:, -1]
     if z_emb is None:
         z, z_emb = policy.sample_prior_z(h_emb, deterministic_continuous=False)
 
@@ -485,7 +524,7 @@ def _generate_contact_chunk_with_intervention(
     control_accel_list = []
 
     for k in range(policy.chunk_horizon):
-        f_ref, aux = policy.reference_process.force(q, p, h_emb, k)
+        f_ref, aux = policy.reference_process.force(q, p, h_emb, k, obs_state=obs_state)
         u = policy.contact_control(q, p, h_emb, k, z_emb)
         sigma = policy.reference_process.sigma_like(q)
         control_accel = sigma * u if policy.reference_process.control_is_whitened else u
@@ -522,7 +561,14 @@ def _generate_contact_chunk_with_intervention(
         else:
             noise = (policy.reference_process.dt**0.5) * sigma * torch.randn_like(q)
         p = p + policy.reference_process.dt * (f_ref + control_accel) + noise
+        if hasattr(policy.reference_process, "_denorm_action_delta") and getattr(policy.reference_process, "max_step_norm", 0.0) > 0:
+            p_px = policy.reference_process._denorm_action_delta(p)
+            step_norm = torch.linalg.norm(p_px, dim=-1, keepdim=True)
+            scale = (float(policy.reference_process.max_step_norm) / step_norm.clamp_min(1e-8)).clamp_max(1.0)
+            p = policy.reference_process._norm_action_delta(p_px * scale)
         q = q + policy.reference_process.dt * p
+        if hasattr(policy.reference_process, "_denorm_action") and bool(getattr(policy.reference_process, "is_geometric_pusht", False)):
+            q = policy.reference_process._norm_action(policy.reference_process._denorm_action(q).clamp(0.0, 512.0))
         q_list.append(q)
         p_list.append(p)
 
@@ -708,9 +754,24 @@ def rollout_pusht_sim_episode(
 
         final_reward = rewards[-1] if rewards else 0.0
         success = bool(terminated) or max_reward >= success_threshold or (bool(infos) and _info_success(infos[-1]))
+        contacts = np.asarray([float(info.get("n_contacts", 0.0)) > 0.0 for info in infos], dtype=bool)
+        contact_loss_count = 0
+        distance_to_t_before_first_contact = None
+        distance_to_target_after_final_contact = None
+        states_np = np.asarray(states, dtype=np.float32)
+        if contacts.size:
+            contact_loss_count = int(np.logical_and(contacts[:-1], ~contacts[1:]).sum()) if contacts.size > 1 else 0
+            contact_indices = np.nonzero(contacts)[0]
+            if contact_indices.size:
+                first = int(contact_indices[0])
+                final = int(contact_indices[-1])
+                distance_to_t_before_first_contact = float(np.linalg.norm(states_np[first, :2] - states_np[first, 2:4]))
+                goal_xy = np.array([256.0, 256.0], dtype=np.float32)
+                distance_to_target_after_final_contact = float(np.linalg.norm(states_np[min(final + 1, states_np.shape[0] - 1), 2:4] - goal_xy))
+        overpush = bool(max_reward >= 0.90 and final_reward <= 0.85)
         return {
             "seed": int(seed),
-            "states": np.asarray(states, dtype=np.float32),
+            "states": states_np,
             "actions": np.asarray(actions, dtype=np.float32),
             "rewards": np.asarray(rewards, dtype=np.float32),
             "frames": frames,
@@ -723,6 +784,10 @@ def rollout_pusht_sim_episode(
             "num_replans": float(num_replans),
             "path_KL_energy": float(np.sum(path_kl_values)) if path_kl_values else 0.0,
             "chunk_boundary_discontinuity": float(np.mean(boundary_values)) if boundary_values else 0.0,
+            "overpush": overpush,
+            "contact_loss_count": float(contact_loss_count),
+            "distance_to_t_before_first_contact": distance_to_t_before_first_contact,
+            "distance_to_target_after_final_contact": distance_to_target_after_final_contact,
             "contact_records": contact_records,
         }
     finally:
@@ -1113,6 +1178,103 @@ def plot_pusht_sim_latent_spread(
     plt.close(fig)
 
 
+def plot_pusht_sim_geometric_reference(
+    rollouts: list[Dict[str, Any]],
+    path: Path,
+    max_panels: int = 8,
+) -> None:
+    selected_rollout = next(
+        (
+            rollout
+            for rollout in rollouts
+            if any(record.get("b_star_px") is not None for record in rollout.get("contact_records") or [])
+        ),
+        None,
+    )
+    if selected_rollout is None:
+        return
+    records = [
+        record
+        for record in selected_rollout.get("contact_records") or []
+        if record.get("b_star_px") is not None and record.get("m_pre_px") is not None and record.get("m_push_px") is not None
+    ]
+    records = _select_contact_records(records, int(max_panels))
+    if not records:
+        return
+
+    plt = _import_pyplot()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cols = min(4, len(records))
+    rows = int(math.ceil(len(records) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 4.5 * rows), squeeze=False, layout="constrained")
+    rollout_states = np.asarray(selected_rollout["states"], dtype=np.float32)
+    rollout_actions = np.asarray(selected_rollout["actions"], dtype=np.float32)
+    agent_path = rollout_states[:, :2]
+    block_path = rollout_states[:, 2:5]
+    goal_pose = np.array([256.0, 256.0, math.pi / 4], dtype=np.float32)
+
+    for ax, record in zip(axes.ravel(), records):
+        t = int(record["time_index"])
+        local_step = int(record["local_step"])
+        state = np.asarray(record["state"], dtype=np.float32)
+        q_seq = np.asarray(record["q_seq"], dtype=np.float32)
+        ref_q = record.get("reference_q_seq")
+        b_star = np.asarray(record["b_star_px"][local_step], dtype=np.float32)
+        n_star = np.asarray(record["n_star"][local_step], dtype=np.float32)
+        m_pre = np.asarray(record["m_pre_px"][local_step], dtype=np.float32)
+        m_push = np.asarray(record["m_push_px"][local_step], dtype=np.float32)
+        m_geo = np.asarray(record["m_geo_px"][local_step], dtype=np.float32)
+        rho_contact = float(np.asarray(record["rho_contact"], dtype=np.float32)[local_step])
+        rho_goal = float(np.asarray(record["rho_goal"], dtype=np.float32)[local_step])
+        d_contact = float(np.asarray(record["d_contact"], dtype=np.float32)[local_step])
+        delta_push = float(np.asarray(record["delta_push"], dtype=np.float32)[local_step])
+        stiffness = np.asarray(record["k_diag"][local_step], dtype=np.float32)
+        gamma = float(np.asarray(record["gamma"][local_step], dtype=np.float32).mean())
+
+        _draw_tee(ax, goal_pose, color="tab:green", alpha=0.22, linestyle="--", label="goal T")
+        _draw_tee(ax, state[2:5], color="0.45", alpha=0.32, label="current T")
+        ax.plot(block_path[: t + 1, 0], block_path[: t + 1, 1], color="0.45", linewidth=1.0, alpha=0.6, label="block so far")
+        ax.plot(agent_path[: t + 1, 0], agent_path[: t + 1, 1], color="tab:purple", linewidth=1.4, label="agent so far")
+        if rollout_actions.size:
+            ax.scatter(rollout_actions[:t, 0], rollout_actions[:t, 1], color="0.15", s=7, alpha=0.45, label="commanded targets")
+        ax.plot(q_seq[:, 0], q_seq[:, 1], color="tab:orange", linestyle="--", linewidth=1.6, label="planned chunk")
+        if ref_q is not None:
+            ref_q = np.asarray(ref_q, dtype=np.float32)
+            ax.plot(ref_q[:, 0], ref_q[:, 1], color="tab:green", linestyle="-.", linewidth=1.5, label="reference only")
+
+        ax.scatter([b_star[0]], [b_star[1]], color="tab:red", s=42, marker="o", zorder=8, label="b*")
+        ax.arrow(
+            float(b_star[0]),
+            float(b_star[1]),
+            float(28.0 * n_star[0]),
+            float(28.0 * n_star[1]),
+            color="tab:red",
+            width=0.7,
+            head_width=6.0,
+            length_includes_head=True,
+            zorder=8,
+        )
+        ax.scatter([m_pre[0]], [m_pre[1]], color="tab:blue", marker="s", s=46, zorder=8, label="m_pre")
+        ax.scatter([m_push[0]], [m_push[1]], color="tab:orange", marker="D", s=44, zorder=8, label="m_push")
+        ax.scatter([m_geo[0]], [m_geo[1]], color="black", marker="x", s=55, linewidths=2.0, zorder=9, label="m_geo")
+        ax.scatter([float(state[0])], [float(state[1])], color="black", marker="o", s=28, zorder=9, label="pusher now")
+        ax.set_xlim(0, 512)
+        ax.set_ylim(512, 0)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(
+            f"replan={record['replan_index']} | t={t} | k={local_step}\n"
+            f"rho_c={rho_contact:.2f}, rho_g={rho_goal:.2f}, d={d_contact:.1f}, dp={delta_push:.1f}\n"
+            f"K={float(np.mean(stiffness)):.3f}, gamma={gamma:.3f}",
+            fontsize=8.2,
+        )
+
+    for ax in axes.ravel()[len(records) :]:
+        ax.axis("off")
+    axes[0, 0].legend(fontsize=5.8, loc="upper right")
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
 def plot_pusht_sim_reference_field_diagnostics(rollouts: list[Dict[str, Any]], path: Path) -> None:
     rows = []
     goal_xy = np.array([256.0, 256.0], dtype=np.float32)
@@ -1254,6 +1416,10 @@ def _rollout_summary(rollout: Dict[str, Any], episode_idx: int) -> Dict[str, Any
         "num_replans": float(rollout["num_replans"]),
         "path_KL_energy": float(rollout["path_KL_energy"]),
         "chunk_boundary_discontinuity": float(rollout["chunk_boundary_discontinuity"]),
+        "overpush": bool(rollout.get("overpush", False)),
+        "contact_loss_count": float(rollout.get("contact_loss_count", 0.0)),
+        "distance_to_t_before_first_contact": rollout.get("distance_to_t_before_first_contact"),
+        "distance_to_target_after_final_contact": rollout.get("distance_to_target_after_final_contact"),
         "num_contact_records": int(len(rollout.get("contact_records") or [])),
         "num_frames": int(len(rollout.get("frames") or [])),
     }
@@ -1284,6 +1450,16 @@ def _save_contact_records_npz(records: list[Dict[str, Any]], path: Path) -> None
         "reference_control_ratio",
         "damping_power",
         "q_to_m",
+        "b_star_px",
+        "n_star",
+        "m_pre_px",
+        "m_push_px",
+        "m_geo_px",
+        "rho_contact",
+        "rho_goal",
+        "d_contact",
+        "goal_err",
+        "delta_push",
         "latent_sample_q_seq",
     ]
     for idx, record in enumerate(records):
@@ -1484,6 +1660,11 @@ def evaluate_pusht_sim_model(model, config: Dict[str, Any], device: torch.device
             rollouts,
             figures / "pusht_sim_latent_spread.png",
         )
+        plot_pusht_sim_geometric_reference(
+            rollouts,
+            figures / "pusht_sim_geometric_reference.png",
+            max_panels=int(eval_cfg.get("sim_geometric_panels", 8)),
+        )
         plot_pusht_sim_reference_field_diagnostics(
             rollouts,
             figures / "pusht_sim_reference_field_diagnostics.png",
@@ -1506,6 +1687,10 @@ def evaluate_pusht_sim_model(model, config: Dict[str, Any], device: torch.device
                         "num_replans": item["num_replans"],
                         "path_KL_energy": item["path_KL_energy"],
                         "chunk_boundary_discontinuity": item["chunk_boundary_discontinuity"],
+                        "overpush": item.get("overpush", False),
+                        "contact_loss_count": item.get("contact_loss_count", 0.0),
+                        "distance_to_t_before_first_contact": item.get("distance_to_t_before_first_contact"),
+                        "distance_to_target_after_final_contact": item.get("distance_to_target_after_final_contact"),
                     }
                     for item in rollouts
                 ],

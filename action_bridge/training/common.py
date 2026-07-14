@@ -105,7 +105,11 @@ def build_model(config: Dict):
         model_config=model_cfg,
     )
     if policy_type == "action_bridge":
-        return ActionBridgePolicy(reference_config=dict(config.get("reference", {})), **args)
+        reference_config = dict(config.get("reference", {}))
+        data_cfg = dict(config.get("data", {}))
+        if data_cfg.get("normalization_stats", None) is not None and "normalization_stats" not in reference_config:
+            reference_config["normalization_stats"] = data_cfg.get("normalization_stats")
+        return ActionBridgePolicy(reference_config=reference_config, **args)
     if policy_type in {"direct_bc", "bc_smooth"}:
         return DirectChunkBCPolicy(**args)
     if policy_type in {"autoregressive_bc", "ar_bc"}:

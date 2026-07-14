@@ -206,11 +206,12 @@ class ActionBridgePolicy(nn.Module):
         h_emb: torch.Tensor,
         k: int,
         z_emb: Optional[torch.Tensor],
+        obs_state: Optional[torch.Tensor] = None,
         deterministic: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         if not self.uses_contact_langevin:
             raise RuntimeError("contact_step is only available for contact_langevin references.")
-        f_ref, aux = self.reference_process.force(q, p, h_emb, k)
+        f_ref, aux = self.reference_process.force(q, p, h_emb, k, obs_state=obs_state)
         u = self.contact_control(q, p, h_emb, k, z_emb)
         sigma = self.reference_process.sigma_like(q)
         if self.reference_process.control_is_whitened:
@@ -222,7 +223,15 @@ class ActionBridgePolicy(nn.Module):
         else:
             noise = (self.reference_process.dt**0.5) * sigma * torch.randn_like(q)
         p_next = p + self.reference_process.dt * (f_ref + control_accel) + noise
+        if hasattr(self.reference_process, "_denorm_action_delta") and getattr(self.reference_process, "max_step_norm", 0.0) > 0:
+            p_px = self.reference_process._denorm_action_delta(p_next)
+            step_norm = torch.linalg.norm(p_px, dim=-1, keepdim=True)
+            scale = (float(self.reference_process.max_step_norm) / step_norm.clamp_min(1e-8)).clamp_max(1.0)
+            p_next = self.reference_process._norm_action_delta(p_px * scale)
         q_next = q + self.reference_process.dt * p_next
+        if hasattr(self.reference_process, "_denorm_action") and bool(getattr(self.reference_process, "is_geometric_pusht", False)):
+            q_next_px = self.reference_process._denorm_action(q_next).clamp(0.0, 512.0)
+            q_next = self.reference_process._norm_action(q_next_px)
         return q_next, p_next, u, aux
 
     def prior_logits(self, h_emb: torch.Tensor) -> torch.Tensor:

@@ -350,8 +350,9 @@ def collect_closed_loop_contact_diagnostics(
         m_values = []
         k_values = []
         gamma_values = []
+        obs_state = obs_hist[:, -1]
         for k in range(chunk_horizon):
-            _, aux = model.reference_process.force(q_seq[:, k], p_seq[:, k], h_emb, k)
+            _, aux = model.reference_process.force(q_seq[:, k], p_seq[:, k], h_emb, k, obs_state=obs_state)
             if aux["m"] is None or aux["k_diag"] is None:
                 raise ValueError("Closed-loop contact potential plots require reference.potential_type=quadratic.")
             m_values.append(aux["m"])
@@ -365,7 +366,7 @@ def collect_closed_loop_contact_diagnostics(
         ref_q_values = [ref_q]
         for step in range(ref_steps):
             ref_k = min(step, chunk_horizon - 1) if reference_time_mode == "hold_last" else step
-            ref_q, ref_p, _ = model.reference_process.reference_step(ref_q, ref_p, h_emb, ref_k)
+            ref_q, ref_p, _ = model.reference_process.reference_step(ref_q, ref_p, h_emb, ref_k, obs_state=obs_state)
             ref_q_values.append(ref_q)
         ref_q_long = torch.stack(ref_q_values, dim=1)
         if model.coordinate_adapter.coordinate_mode in {"absolute_from_delta", "absolute_action"}:
@@ -453,6 +454,7 @@ def collect_contact_diagnostics(
     ref = model.reference_process
     adapter = model.coordinate_adapter
     h = model.encode_history(obs_hist, act_hist)
+    obs_state = obs_hist[:, -1]
     z, z_emb = model.sample_prior_z(h, deterministic_continuous=False)
     controlled = generate_chunk(model, obs_hist, act_hist, deterministic=True, z=z, z_emb=z_emb)
 
@@ -461,7 +463,7 @@ def collect_contact_diagnostics(
     ref_p = [p]
     aux_values = []
     for k in range(model.chunk_horizon):
-        q, p, aux = ref.reference_step(q, p, h, k)
+        q, p, aux = ref.reference_step(q, p, h, k, obs_state=obs_state)
         ref_q.append(q)
         ref_p.append(p)
         aux_values.append(aux)
@@ -472,7 +474,7 @@ def collect_contact_diagnostics(
     q_seq = controlled["q_seq"]
     p_seq = controlled["p_seq"]
     for k in range(model.chunk_horizon):
-        _, aux = ref.force(q_seq[:, k], p_seq[:, k], h, k)
+        _, aux = ref.force(q_seq[:, k], p_seq[:, k], h, k, obs_state=obs_state)
         controlled_aux.append(aux)
 
     def stack_aux(key: str):

@@ -116,10 +116,11 @@ def contact_path_losses_conditioned(
     gamma_values = []
     k_values = []
     m_values = []
+    obs_state = batch["obs_hist"][:, -1]
     for k in range(future_actions.shape[1]):
         q = q_seq[:, k]
         p = p_seq[:, k]
-        q_pred, p_pred, u, aux = policy.contact_step(q, p, h_emb, k, z_emb, deterministic=True)
+        q_pred, p_pred, u, aux = policy.contact_step(q, p, h_emb, k, z_emb, obs_state=obs_state, deterministic=True)
         sigma = ref.sigma_like(q)
         loss_p = loss_p + 0.5 * ((p_seq[:, k + 1] - p_pred) / sigma).pow(2).sum(dim=-1)
         loss_q = loss_q + 0.5 * ((q_seq[:, k + 1] - q_pred) / sigma).pow(2).sum(dim=-1)
@@ -197,9 +198,10 @@ def contact_unrolled_mse_conditioned(
     future_actions = batch["future_actions"]
     adapter = policy.coordinate_adapter
     q, p = adapter.init_qp_from_history(batch)
+    obs_state = batch["obs_hist"][:, -1]
     mse = torch.zeros(future_actions.shape[0], device=future_actions.device, dtype=future_actions.dtype)
     for k in range(future_actions.shape[1]):
-        q_next, p_next, _, _ = policy.contact_step(q, p, h_emb, k, z_emb, deterministic=True)
+        q_next, p_next, _, _ = policy.contact_step(q, p, h_emb, k, z_emb, obs_state=obs_state, deterministic=True)
         raw_pred = adapter.decode_step(q, q_next)
         mse = mse + (future_actions[:, k] - raw_pred).pow(2).sum(dim=-1)
         q, p = q_next, p_next
