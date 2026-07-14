@@ -14,16 +14,29 @@ from action_bridge.eval.pusht_sim import evaluate_pusht_sim_model
 from action_bridge.training.common import build_model, resolve_device, save_json, seed_everything
 
 
+def timestamp_prefix() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def has_timestamp_prefix(path: Path) -> bool:
+    name = path.name
+    return len(name) >= 16 and name[:8].isdigit() and name[8] == "_" and name[9:15].isdigit() and name[15] == "_"
+
+
+def timestamped_output_dir(path: Path, stamp: str) -> Path:
+    if has_timestamp_prefix(path):
+        return path
+    return path.parent / f"{stamp}_{path.name}"
+
+
 def default_output_dir(checkpoint: Path) -> Path:
     try:
         run_dir = checkpoint.parents[1]
         if checkpoint.parent.name == "checkpoints":
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            return run_dir / "eval" / f"pusht_sim_{stamp}"
+            return run_dir / "eval" / f"pusht_sim_{checkpoint.stem}"
     except IndexError:
         pass
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path("outputs") / "eval" / f"pusht_sim_{stamp}"
+    return Path("outputs") / "eval" / f"pusht_sim_{checkpoint.stem}"
 
 
 def main() -> None:
@@ -40,6 +53,12 @@ def main() -> None:
     parser.add_argument("--save-videos", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--video-fps", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--timestamp-output-dir",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prefix the eval output directory name with YYYYMMDD_HHMMSS.",
+    )
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
 
@@ -77,6 +96,8 @@ def main() -> None:
     model.eval()
 
     output_dir = Path(args.output_dir) if args.output_dir else default_output_dir(checkpoint)
+    if args.timestamp_output_dir:
+        output_dir = timestamped_output_dir(output_dir, timestamp_prefix())
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics = evaluate_pusht_sim_model(model, config, device, output_dir=output_dir)
     save_json(output_dir / "metrics" / "pusht_sim_summary.json", metrics)

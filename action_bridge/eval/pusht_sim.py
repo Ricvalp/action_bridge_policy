@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from action_bridge.data.pusht_adapter import denormalize_actions_np, normalize_actions_np, normalize_observations_np
 from action_bridge.eval.rollout import generate_chunk, predict_actions
@@ -89,6 +90,136 @@ def _sample_contact_latent_chunks(
             torch.cuda.set_rng_state_all(cuda_rng_state)
 
 
+def _path_smoothness_stats(paths: list[np.ndarray], prefix: str) -> Dict[str, float]:
+    speeds = []
+    accels = []
+    jerks = []
+    for path in paths:
+        arr = np.asarray(path, dtype=np.float32)
+        if arr.shape[0] >= 2:
+            speeds.append(np.linalg.norm(np.diff(arr, axis=0), axis=-1))
+        if arr.shape[0] >= 3:
+            accels.append(np.linalg.norm(np.diff(arr, n=2, axis=0), axis=-1))
+        if arr.shape[0] >= 4:
+            jerks.append(np.linalg.norm(np.diff(arr, n=3, axis=0), axis=-1))
+
+    def summarize(name: str, values: list[np.ndarray]) -> Dict[str, float]:
+        if not values:
+            return {
+                f"{prefix}_{name}_mean": 0.0,
+                f"{prefix}_{name}_p95": 0.0,
+                f"{prefix}_{name}_max": 0.0,
+            }
+        flat = np.concatenate([np.asarray(item, dtype=np.float32).reshape(-1) for item in values])
+        if flat.size == 0:
+            return {
+                f"{prefix}_{name}_mean": 0.0,
+                f"{prefix}_{name}_p95": 0.0,
+                f"{prefix}_{name}_max": 0.0,
+            }
+        return {
+            f"{prefix}_{name}_mean": float(np.mean(flat)),
+            f"{prefix}_{name}_p95": float(np.percentile(flat, 95)),
+            f"{prefix}_{name}_max": float(np.max(flat)),
+        }
+
+    return {
+        **summarize("velocity", speeds),
+        **summarize("acceleration", accels),
+        **summarize("jerk", jerks),
+    }
+
+
+def _aggregate_rollout_diagnostics(rollouts: list[Dict[str, Any]]) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    action_paths = [np.asarray(item["actions"], dtype=np.float32) for item in rollouts if len(item.get("actions", [])) > 0]
+    agent_paths = [np.asarray(item["states"], dtype=np.float32)[:, :2] for item in rollouts if len(item.get("states", [])) > 0]
+    metrics.update(_path_smoothness_stats(action_paths, "action"))
+    metrics.update(_path_smoothness_stats(agent_paths, "agent"))
+
+    mismatches = []
+    for rollout in rollouts:
+        actions = np.asarray(rollout.get("actions", []), dtype=np.float32)
+        states = np.asarray(rollout.get("states", []), dtype=np.float32)
+        if actions.size == 0 or states.shape[0] < 2:
+            continue
+        count = min(actions.shape[0], states.shape[0] - 1)
+        mismatches.append(np.linalg.norm(actions[:count] - states[1 : count + 1, :2], axis=-1))
+    if mismatches:
+        mismatch = np.concatenate(mismatches)
+        metrics.update(
+            {
+                "pusher_action_mismatch_mean": float(np.mean(mismatch)),
+                "pusher_action_mismatch_p95": float(np.percentile(mismatch, 95)),
+                "pusher_action_mismatch_max": float(np.max(mismatch)),
+            }
+        )
+    else:
+        metrics.update({"pusher_action_mismatch_mean": 0.0, "pusher_action_mismatch_p95": 0.0, "pusher_action_mismatch_max": 0.0})
+
+    gamma_values = []
+    k_values = []
+    q_to_m_values = []
+    f_ref_norms = []
+    control_norms = []
+    ratio_values = []
+    damping_power_values = []
+    for rollout in rollouts:
+        for record in rollout.get("contact_records") or []:
+            gamma = record.get("gamma")
+            if gamma is not None:
+                gamma_values.append(np.asarray(gamma, dtype=np.float32).reshape(-1))
+            k_diag = record.get("k_diag")
+            if k_diag is not None:
+                k_values.append(np.asarray(k_diag, dtype=np.float32).reshape(-1))
+            q_to_m = record.get("q_to_m")
+            if q_to_m is not None:
+                q_to_m_values.append(np.asarray(q_to_m, dtype=np.float32).reshape(-1))
+            f_ref_norm = record.get("f_ref_norm")
+            if f_ref_norm is not None:
+                f_ref_norms.append(np.asarray(f_ref_norm, dtype=np.float32).reshape(-1))
+            control_norm = record.get("control_accel_norm")
+            if control_norm is not None:
+                control_norms.append(np.asarray(control_norm, dtype=np.float32).reshape(-1))
+            ratio = record.get("reference_control_ratio")
+            if ratio is not None:
+                ratio_values.append(np.asarray(ratio, dtype=np.float32).reshape(-1))
+            damping_power = record.get("damping_power")
+            if damping_power is not None:
+                damping_power_values.append(np.asarray(damping_power, dtype=np.float32).reshape(-1))
+
+    def add_distribution(name: str, values: list[np.ndarray]) -> None:
+        if not values:
+            metrics[f"{name}_mean"] = 0.0
+            metrics[f"{name}_std"] = 0.0
+            metrics[f"{name}_p05"] = 0.0
+            metrics[f"{name}_p50"] = 0.0
+            metrics[f"{name}_p95"] = 0.0
+            return
+        flat = np.concatenate(values).astype(np.float32)
+        if flat.size == 0:
+            metrics[f"{name}_mean"] = 0.0
+            metrics[f"{name}_std"] = 0.0
+            metrics[f"{name}_p05"] = 0.0
+            metrics[f"{name}_p50"] = 0.0
+            metrics[f"{name}_p95"] = 0.0
+            return
+        metrics[f"{name}_mean"] = float(np.mean(flat))
+        metrics[f"{name}_std"] = float(np.std(flat))
+        metrics[f"{name}_p05"] = float(np.percentile(flat, 5))
+        metrics[f"{name}_p50"] = float(np.percentile(flat, 50))
+        metrics[f"{name}_p95"] = float(np.percentile(flat, 95))
+
+    add_distribution("gamma", gamma_values)
+    add_distribution("k_diag", k_values)
+    add_distribution("q_to_m", q_to_m_values)
+    add_distribution("f_ref_norm", f_ref_norms)
+    add_distribution("control_accel_norm", control_norms)
+    add_distribution("reference_control_ratio", ratio_values)
+    add_distribution("damping_power", damping_power_values)
+    return metrics
+
+
 def _contact_replan_record(
     model,
     batch: Dict[str, torch.Tensor],
@@ -116,9 +247,34 @@ def _contact_replan_record(
     q_seq_raw = _denormalize_action_tensor(q_seq, stats).numpy()
 
     aux_values = []
+    f_ref_values = []
+    control_accel_values = []
+    damping_power_values = []
+    q_to_m_values = []
     for k in range(model.chunk_horizon):
-        _, aux = model.reference_process.force(pred["q_seq"][:, k], pred["p_seq"][:, k], h, k)
+        q_k = pred["q_seq"][:, k]
+        p_k = pred["p_seq"][:, k]
+        f_ref, aux = model.reference_process.force(q_k, p_k, h, k)
         aux_values.append(aux)
+        f_ref_values.append(f_ref)
+        controls = pred.get("controls")
+        if controls is not None:
+            u = controls[:, k]
+            sigma = model.reference_process.sigma_like(q_k)
+            control_accel = sigma * u if model.reference_process.control_is_whitened else u
+        else:
+            control_accel = torch.zeros_like(q_k)
+        control_accel_values.append(control_accel)
+        gamma_k = aux.get("gamma")
+        if gamma_k is not None:
+            damping_power_values.append((gamma_k * p_k.pow(2)).sum(dim=-1))
+        else:
+            damping_power_values.append(torch.zeros(q_k.shape[0], dtype=q_k.dtype, device=q_k.device))
+        m_k = aux.get("m")
+        if m_k is not None:
+            q_to_m_values.append(torch.linalg.norm(q_k - m_k, dim=-1))
+        else:
+            q_to_m_values.append(torch.zeros(q_k.shape[0], dtype=q_k.dtype, device=q_k.device))
 
     def stack_aux(key: str) -> Optional[torch.Tensor]:
         values = [item.get(key) for item in aux_values]
@@ -131,6 +287,13 @@ def _contact_replan_record(
     gamma = stack_aux("gamma")
     if m is None or k_diag is None or gamma is None:
         return None
+    f_ref = torch.stack(f_ref_values, dim=1).detach().cpu()[0]
+    control_accel = torch.stack(control_accel_values, dim=1).detach().cpu()[0]
+    f_ref_norm = torch.linalg.norm(f_ref, dim=-1)
+    control_accel_norm = torch.linalg.norm(control_accel, dim=-1)
+    reference_control_ratio = f_ref_norm / (f_ref_norm + control_accel_norm).clamp_min(1e-8)
+    damping_power = torch.stack(damping_power_values, dim=1).detach().cpu()[0]
+    q_to_m = torch.stack(q_to_m_values, dim=1).detach().cpu()[0]
     m_raw = _denormalize_action_tensor(m, stats).numpy()
 
     ref_q_seq, _ = _reference_rollout_q_seq(model, batch, reference_steps)
@@ -148,6 +311,13 @@ def _contact_replan_record(
         "m_path": m_raw.astype(np.float32),
         "k_diag": k_diag.numpy().astype(np.float32),
         "gamma": gamma.numpy().astype(np.float32),
+        "f_ref": f_ref.numpy().astype(np.float32),
+        "control_accel": control_accel.numpy().astype(np.float32),
+        "f_ref_norm": f_ref_norm.numpy().astype(np.float32),
+        "control_accel_norm": control_accel_norm.numpy().astype(np.float32),
+        "reference_control_ratio": reference_control_ratio.numpy().astype(np.float32),
+        "damping_power": damping_power.numpy().astype(np.float32),
+        "q_to_m": q_to_m.numpy().astype(np.float32),
         "reference_steps": int(reference_steps),
         "latent_sample_q_seq": sampled_q,
     }
@@ -264,6 +434,115 @@ def _action_bounds(env) -> tuple[np.ndarray, np.ndarray]:
     return np.asarray(low, dtype=np.float32), np.asarray(high, dtype=np.float32)
 
 
+def _sample_eval_latent(
+    model: ActionBridgePolicy,
+    batch: Dict[str, torch.Tensor],
+    config: Dict[str, Any],
+    z: Optional[torch.Tensor],
+    z_emb: Optional[torch.Tensor],
+) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+    h_emb = model.encode_history(batch["obs_hist"], batch["act_hist"])
+    latent_mode = str(config.get("eval", {}).get("sim_latent_mode", "default"))
+    if model.latent_type == "categorical":
+        if latent_mode in {"prior_mean", "argmax"}:
+            return model.sample_prior_z(h_emb, mode="argmax")
+        if latent_mode in {"episode_sample", "episode_sticky"} and z_emb is not None:
+            return z, z_emb
+        return model.sample_prior_z(h_emb, mode="sample")
+    if model.latent_type == "continuous":
+        if latent_mode == "prior_mean":
+            return model.sample_prior_z(h_emb, deterministic_continuous=True)
+        if latent_mode in {"episode_sample", "episode_sticky"} and z_emb is not None:
+            return z, z_emb
+        return model.sample_prior_z(h_emb, deterministic_continuous=False)
+    return None, model.zero_z_embedding(h_emb.shape[0], h_emb.device, h_emb.dtype)
+
+
+@torch.no_grad()
+def _generate_contact_chunk_with_intervention(
+    policy: ActionBridgePolicy,
+    batch: Dict[str, torch.Tensor],
+    config: Dict[str, Any],
+    z: Optional[torch.Tensor],
+    z_emb: Optional[torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    if not bool(getattr(policy, "uses_contact_langevin", False)):
+        raise RuntimeError("Contact interventions require a contact_langevin ActionBridgePolicy.")
+    intervention = str(config.get("eval", {}).get("sim_intervention", "full_policy"))
+    deterministic = bool(config.get("inference", {}).get("deterministic", True))
+    h_emb = policy.encode_history(batch["obs_hist"], batch["act_hist"])
+    if z_emb is None:
+        z, z_emb = policy.sample_prior_z(h_emb, deterministic_continuous=False)
+
+    adapter = policy.coordinate_adapter
+    q, p = adapter.init_qp_from_history({"obs_hist": batch["obs_hist"], "act_hist": batch["act_hist"]})
+    q_list = [q]
+    p_list = [p]
+    controls = []
+    path_kl_steps = []
+    path_kl = torch.zeros(batch["obs_hist"].shape[0], device=batch["obs_hist"].device, dtype=batch["obs_hist"].dtype)
+    f_ref_list = []
+    control_accel_list = []
+
+    for k in range(policy.chunk_horizon):
+        f_ref, aux = policy.reference_process.force(q, p, h_emb, k)
+        u = policy.contact_control(q, p, h_emb, k, z_emb)
+        sigma = policy.reference_process.sigma_like(q)
+        control_accel = sigma * u if policy.reference_process.control_is_whitened else u
+        u_for_kl = u
+
+        if intervention == "reference_only":
+            control_accel = torch.zeros_like(control_accel)
+            u_for_kl = torch.zeros_like(u)
+        elif intervention == "control_only":
+            f_ref = torch.zeros_like(f_ref)
+        elif intervention == "no_damping":
+            grad_v = aux.get("grad_v")
+            f_ref = -grad_v if grad_v is not None else torch.zeros_like(f_ref)
+        elif intervention == "no_potential":
+            gamma = aux.get("gamma")
+            f_ref = -gamma * p if gamma is not None else torch.zeros_like(f_ref)
+        elif intervention in {"full_policy", "full"}:
+            pass
+        else:
+            raise ValueError(f"Unknown sim_intervention {intervention!r}.")
+
+        if policy.reference_process.control_is_whitened:
+            step_path_kl = 0.5 * policy.reference_process.dt * u_for_kl.pow(2).sum(dim=-1)
+        else:
+            step_path_kl = 0.5 * policy.reference_process.dt * (u_for_kl / sigma).pow(2).sum(dim=-1)
+        path_kl = path_kl + step_path_kl
+        path_kl_steps.append(step_path_kl)
+        controls.append(u_for_kl)
+        f_ref_list.append(f_ref)
+        control_accel_list.append(control_accel)
+
+        if deterministic or policy.reference_process.deterministic_inference:
+            noise = torch.zeros_like(q)
+        else:
+            noise = (policy.reference_process.dt**0.5) * sigma * torch.randn_like(q)
+        p = p + policy.reference_process.dt * (f_ref + control_accel) + noise
+        q = q + policy.reference_process.dt * p
+        q_list.append(q)
+        p_list.append(p)
+
+    q_seq = torch.stack(q_list, dim=1)
+    actions = adapter.decode_raw_actions(q_seq)
+    return {
+        "actions": actions,
+        "means": actions,
+        "controls": torch.stack(controls, dim=1),
+        "q_seq": q_seq,
+        "p_seq": torch.stack(p_list, dim=1),
+        "z": z,
+        "z_emb": z_emb,
+        "path_kl_energy": path_kl,
+        "path_kl_steps": torch.stack(path_kl_steps, dim=1),
+        "f_ref": torch.stack(f_ref_list, dim=1),
+        "control_accel": torch.stack(control_accel_list, dim=1),
+    }
+
+
 def _generate_chunk_with_commitment(
     model,
     batch: Dict[str, torch.Tensor],
@@ -275,9 +554,31 @@ def _generate_chunk_with_commitment(
     if not isinstance(model, ActionBridgePolicy):
         return predict_actions(model, batch, deterministic=deterministic), z, z_emb
 
+    eval_cfg = config.get("eval", {})
+    intervention = str(eval_cfg.get("sim_intervention", "full_policy"))
+    latent_mode = str(eval_cfg.get("sim_latent_mode", "default"))
+    uses_intervention = intervention not in {"full_policy", "full"}
+
+    def run_with_latent(z_value: Optional[torch.Tensor], z_emb_value: Optional[torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if uses_intervention:
+            return _generate_contact_chunk_with_intervention(model, batch, config, z_value, z_emb_value)
+        return generate_chunk(
+            model,
+            batch["obs_hist"],
+            batch["act_hist"],
+            deterministic=deterministic,
+            z=z_value,
+            z_emb=z_emb_value,
+        )
+
+    if latent_mode != "default":
+        z, z_emb = _sample_eval_latent(model, batch, config, z, z_emb)
+        pred = run_with_latent(z, z_emb)
+        return pred, pred.get("z"), pred.get("z_emb")
+
     commitment = str(config.get("inference", {}).get("latent_commitment", "chunk"))
     if commitment == "episode" and z_emb is not None:
-        pred = generate_chunk(model, batch["obs_hist"], batch["act_hist"], deterministic=deterministic, z=z, z_emb=z_emb)
+        pred = run_with_latent(z, z_emb)
     elif commitment == "sticky":
         pred = generate_chunk(
             model,
@@ -290,8 +591,15 @@ def _generate_chunk_with_commitment(
             rho_z=float(config.get("eval", {}).get("rho_z", 1.0)),
         )
         z = pred.get("z")
+        z_emb = pred.get("z_emb")
+        if uses_intervention:
+            pred = run_with_latent(z, z_emb)
     else:
-        pred = generate_chunk(model, batch["obs_hist"], batch["act_hist"], deterministic=deterministic)
+        if uses_intervention:
+            z, z_emb = _sample_eval_latent(model, batch, config, z, z_emb)
+            pred = run_with_latent(z, z_emb)
+        else:
+            pred = generate_chunk(model, batch["obs_hist"], batch["act_hist"], deterministic=deterministic)
     if commitment == "episode" and z_emb is None:
         z = pred.get("z")
         z_emb = pred.get("z_emb")
@@ -805,6 +1113,113 @@ def plot_pusht_sim_latent_spread(
     plt.close(fig)
 
 
+def plot_pusht_sim_reference_field_diagnostics(rollouts: list[Dict[str, Any]], path: Path) -> None:
+    rows = []
+    goal_xy = np.array([256.0, 256.0], dtype=np.float32)
+    for rollout in rollouts:
+        success = bool(rollout.get("success", False))
+        for record in rollout.get("contact_records") or []:
+            state = np.asarray(record["state"], dtype=np.float32)
+            pusher_block_dist = float(np.linalg.norm(state[:2] - state[2:4]))
+            block_goal_dist = float(np.linalg.norm(state[2:4] - goal_xy))
+            gamma = np.asarray(record.get("gamma"), dtype=np.float32)
+            k_diag = np.asarray(record.get("k_diag"), dtype=np.float32)
+            f_ref_norm = np.asarray(record.get("f_ref_norm"), dtype=np.float32)
+            control_norm = np.asarray(record.get("control_accel_norm"), dtype=np.float32)
+            ratio = np.asarray(record.get("reference_control_ratio"), dtype=np.float32)
+            damping_power = np.asarray(record.get("damping_power"), dtype=np.float32)
+            q_to_m = np.asarray(record.get("q_to_m"), dtype=np.float32)
+            if gamma.size == 0 or k_diag.size == 0:
+                continue
+            horizon = gamma.shape[0]
+            for k in range(horizon):
+                rows.append(
+                    {
+                        "k": int(k),
+                        "success": success,
+                        "pusher_block_dist": pusher_block_dist,
+                        "block_goal_dist": block_goal_dist,
+                        "gamma": float(np.mean(gamma[k])),
+                        "k_mean": float(np.mean(k_diag[k])),
+                        "f_ref_norm": float(f_ref_norm[k]) if f_ref_norm.size > k else 0.0,
+                        "control_norm": float(control_norm[k]) if control_norm.size > k else 0.0,
+                        "ratio": float(ratio[k]) if ratio.size > k else 0.0,
+                        "damping_power": float(damping_power[k]) if damping_power.size > k else 0.0,
+                        "q_to_m": float(q_to_m[k]) if q_to_m.size > k else 0.0,
+                    }
+                )
+    if not rows:
+        return
+
+    plt = _import_pyplot()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    k_values = np.asarray([row["k"] for row in rows], dtype=np.int64)
+    max_k = int(k_values.max())
+
+    def by_k(name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        means = []
+        lows = []
+        highs = []
+        for k in range(max_k + 1):
+            values = np.asarray([row[name] for row in rows if row["k"] == k], dtype=np.float32)
+            if values.size == 0:
+                means.append(0.0)
+                lows.append(0.0)
+                highs.append(0.0)
+            else:
+                means.append(float(np.mean(values)))
+                lows.append(float(np.percentile(values, 10)))
+                highs.append(float(np.percentile(values, 90)))
+        return np.arange(max_k + 1), np.asarray(means), np.asarray([lows, highs])
+
+    fig, axes = plt.subplots(3, 2, figsize=(13.0, 11.0), layout="constrained")
+    panels = [
+        ("gamma vs chunk step", "gamma", "gamma"),
+        ("mean stiffness K vs chunk step", "k_mean", "K"),
+        ("reference/control norm ratio vs chunk step", "ratio", "ratio"),
+        ("distance to attractor vs chunk step", "q_to_m", "|q - m|"),
+    ]
+    for ax, (title, key, ylabel) in zip(axes[:2].ravel(), panels):
+        xs, mean, band = by_k(key)
+        ax.plot(xs, mean, linewidth=1.8)
+        ax.fill_between(xs, band[0], band[1], alpha=0.22)
+        ax.set_title(title)
+        ax.set_xlabel("chunk step k")
+        ax.set_ylabel(ylabel)
+
+    ax = axes[2, 0]
+    xs, f_mean, f_band = by_k("f_ref_norm")
+    _, c_mean, c_band = by_k("control_norm")
+    ax.plot(xs, f_mean, linewidth=1.7, label="||f_R||")
+    ax.fill_between(xs, f_band[0], f_band[1], alpha=0.18)
+    ax.plot(xs, c_mean, linewidth=1.7, label="||sigma u||")
+    ax.fill_between(xs, c_band[0], c_band[1], alpha=0.18)
+    ax.set_title("reference and control magnitudes")
+    ax.set_xlabel("chunk step k")
+    ax.legend(fontsize=8)
+
+    ax = axes[2, 1]
+    for success, color, label in [(False, "tab:red", "failure"), (True, "tab:green", "success")]:
+        subset = [row for row in rows if bool(row["success"]) == success]
+        if not subset:
+            continue
+        ax.scatter(
+            [row["pusher_block_dist"] for row in subset],
+            [row["ratio"] for row in subset],
+            s=9,
+            alpha=0.35,
+            color=color,
+            label=label,
+        )
+    ax.set_title("reference/control ratio vs pusher-block distance")
+    ax.set_xlabel("pusher-block distance, pixels")
+    ax.set_ylabel("ratio")
+    ax.legend(fontsize=8)
+
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
 def _frame_to_uint8(frame: np.ndarray) -> np.ndarray:
     array = np.asarray(frame)
     if array.dtype != np.uint8:
@@ -818,52 +1233,145 @@ def _frame_to_uint8(frame: np.ndarray) -> np.ndarray:
     return array
 
 
-def save_pusht_sim_gifs(rollouts: list[Dict[str, Any]], directory: Path, fps: float = 10.0) -> list[str]:
-    """Save one animated GIF per rollout that has collected RGB frames."""
+def _rollout_status(rollout: Dict[str, Any]) -> str:
+    return "success" if bool(rollout["success"]) else "fail"
 
+
+def _rollout_artifact_stem(rollout: Dict[str, Any], episode_idx: int) -> str:
+    return f"episode_{episode_idx:03d}_seed_{int(rollout['seed'])}_{_rollout_status(rollout)}"
+
+
+def _rollout_summary(rollout: Dict[str, Any], episode_idx: int) -> Dict[str, Any]:
+    return {
+        "episode_index": int(episode_idx),
+        "seed": int(rollout["seed"]),
+        "success": bool(rollout["success"]),
+        "terminated": bool(rollout["terminated"]),
+        "truncated": bool(rollout["truncated"]),
+        "max_reward": float(rollout["max_reward"]),
+        "final_reward": float(rollout["final_reward"]),
+        "episode_length": float(rollout["episode_length"]),
+        "num_replans": float(rollout["num_replans"]),
+        "path_KL_energy": float(rollout["path_KL_energy"]),
+        "chunk_boundary_discontinuity": float(rollout["chunk_boundary_discontinuity"]),
+        "num_contact_records": int(len(rollout.get("contact_records") or [])),
+        "num_frames": int(len(rollout.get("frames") or [])),
+    }
+
+
+def _save_contact_records_npz(records: list[Dict[str, Any]], path: Path) -> None:
+    if not records:
+        return
+    arrays: Dict[str, np.ndarray] = {
+        "time_index": np.asarray([int(record["time_index"]) for record in records], dtype=np.int64),
+        "replan_index": np.asarray([int(record["replan_index"]) for record in records], dtype=np.int64),
+        "local_step": np.asarray([int(record["local_step"]) for record in records], dtype=np.int64),
+        "reference_steps": np.asarray([int(record.get("reference_steps", 0)) for record in records], dtype=np.int64),
+    }
+    array_keys = [
+        "state",
+        "act_hist",
+        "q_seq",
+        "reference_q_seq",
+        "m",
+        "m_path",
+        "k_diag",
+        "gamma",
+        "f_ref",
+        "control_accel",
+        "f_ref_norm",
+        "control_accel_norm",
+        "reference_control_ratio",
+        "damping_power",
+        "q_to_m",
+        "latent_sample_q_seq",
+    ]
+    for idx, record in enumerate(records):
+        for key in array_keys:
+            value = record.get(key)
+            if value is not None:
+                arrays[f"record_{idx:03d}_{key}"] = np.asarray(value)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **arrays)
+
+
+def save_pusht_sim_rollout_artifacts(rollout: Dict[str, Any], output_dir: Path, episode_idx: int) -> Path:
+    """Write raw artifacts for one rollout as soon as the episode finishes."""
+
+    episode_dir = output_dir / "rollouts" / _rollout_artifact_stem(rollout, episode_idx)
+    episode_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        episode_dir / "trajectory.npz",
+        states=np.asarray(rollout["states"], dtype=np.float32),
+        actions=np.asarray(rollout["actions"], dtype=np.float32),
+        rewards=np.asarray(rollout["rewards"], dtype=np.float32),
+    )
+    save_json(episode_dir / "metadata.json", _rollout_summary(rollout, episode_idx))
+    _save_contact_records_npz(rollout.get("contact_records") or [], episode_dir / "contact_records.npz")
+    return episode_dir
+
+
+def save_pusht_sim_gif(rollout: Dict[str, Any], episode_idx: int, directory: Path, fps: float = 10.0) -> Optional[str]:
+    """Save one animated GIF for one rollout if it has collected RGB frames."""
+
+    frames = rollout.get("frames") or []
+    if not frames:
+        return None
     from PIL import Image
 
     directory.mkdir(parents=True, exist_ok=True)
     duration_ms = max(1, int(round(1000.0 / max(float(fps), 1e-6))))
+    pil_frames = [Image.fromarray(_frame_to_uint8(frame)) for frame in frames]
+    path = directory / f"{_rollout_artifact_stem(rollout, episode_idx)}.gif"
+    pil_frames[0].save(
+        path,
+        save_all=True,
+        append_images=pil_frames[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=False,
+    )
+    return str(path)
+
+
+def save_pusht_sim_video(rollout: Dict[str, Any], episode_idx: int, directory: Path, fps: float = 10.0) -> Optional[str]:
+    """Save one MP4 video for one rollout when imageio is available."""
+
+    frames = rollout.get("frames") or []
+    if not frames:
+        return None
+    try:
+        import imageio.v3 as iio
+    except ImportError:
+        return None
+
+    directory.mkdir(parents=True, exist_ok=True)
+    array = np.stack([_frame_to_uint8(frame) for frame in frames], axis=0)
+    path = directory / f"{_rollout_artifact_stem(rollout, episode_idx)}.mp4"
+    iio.imwrite(path, array, fps=float(fps))
+    return str(path)
+
+
+def save_pusht_sim_gifs(rollouts: list[Dict[str, Any]], directory: Path, fps: float = 10.0) -> list[str]:
+    """Save one animated GIF per rollout that has collected RGB frames."""
+
     written = []
-    for idx, rollout in enumerate(rollouts):
-        frames = rollout.get("frames") or []
-        if not frames:
-            continue
-        pil_frames = [Image.fromarray(_frame_to_uint8(frame)) for frame in frames]
-        status = "success" if rollout["success"] else "fail"
-        path = directory / f"episode_{idx:03d}_seed_{int(rollout['seed'])}_{status}.gif"
-        pil_frames[0].save(
-            path,
-            save_all=True,
-            append_images=pil_frames[1:],
-            duration=duration_ms,
-            loop=0,
-            optimize=False,
-        )
-        written.append(str(path))
+    for idx, rollout in enumerate(tqdm(rollouts, desc="Saving Push-T GIFs", unit="gif", dynamic_ncols=True)):
+        path = save_pusht_sim_gif(rollout, idx, directory, fps=fps)
+        if path is not None:
+            written.append(path)
     return written
 
 
 def save_pusht_sim_videos(rollouts: list[Dict[str, Any]], directory: Path, fps: float = 10.0) -> list[str]:
     """Save MP4 videos when imageio is available."""
 
-    try:
-        import imageio.v3 as iio
-    except ImportError:
-        return []
-
-    directory.mkdir(parents=True, exist_ok=True)
     written = []
-    for idx, rollout in enumerate(rollouts):
-        frames = rollout.get("frames") or []
-        if not frames:
-            continue
-        array = np.stack([_frame_to_uint8(frame) for frame in frames], axis=0)
-        status = "success" if rollout["success"] else "fail"
-        path = directory / f"episode_{idx:03d}_seed_{int(rollout['seed'])}_{status}.mp4"
-        iio.imwrite(path, array, fps=float(fps))
-        written.append(str(path))
+    for idx, rollout in enumerate(tqdm(rollouts, desc="Saving Push-T videos", unit="video", dynamic_ncols=True)):
+        path = save_pusht_sim_video(rollout, idx, directory, fps=fps)
+        if path is not None:
+            written.append(path)
     return written
 
 
@@ -875,7 +1383,15 @@ def evaluate_pusht_sim_model(model, config: Dict[str, Any], device: torch.device
     render_episodes = int(eval_cfg.get("sim_render_episodes", 0))
     model.eval()
     rollouts = []
-    for episode_idx in range(max(1, episodes)):
+    gif_paths: list[str] = []
+    video_paths: list[str] = []
+    episode_iter = tqdm(
+        range(max(1, episodes)),
+        desc="Push-T sim rollouts",
+        unit="episode",
+        dynamic_ncols=True,
+    )
+    for episode_idx in episode_iter:
         rollout = rollout_pusht_sim_episode(
             model,
             config,
@@ -884,6 +1400,39 @@ def evaluate_pusht_sim_model(model, config: Dict[str, Any], device: torch.device
             collect_frames=episode_idx < render_episodes,
         )
         rollouts.append(rollout)
+        if output_dir is not None:
+            save_pusht_sim_rollout_artifacts(rollout, output_dir, episode_idx)
+            if bool(eval_cfg.get("sim_save_gifs", True)):
+                gif_path = save_pusht_sim_gif(
+                    rollout,
+                    episode_idx,
+                    output_dir / "figures" / "pusht_sim_gifs",
+                    fps=float(eval_cfg.get("sim_gif_fps", 10.0)),
+                )
+                if gif_path is not None:
+                    gif_paths.append(gif_path)
+            if bool(eval_cfg.get("sim_save_videos", False)):
+                video_path = save_pusht_sim_video(
+                    rollout,
+                    episode_idx,
+                    output_dir / "figures" / "pusht_sim_videos",
+                    fps=float(eval_cfg.get("sim_video_fps", 10.0)),
+                )
+                if video_path is not None:
+                    video_paths.append(video_path)
+            save_json(
+                output_dir / "metrics" / "pusht_sim_partial.json",
+                {
+                    "completed_episodes": len(rollouts),
+                    "requested_episodes": max(1, episodes),
+                    "rollouts": [_rollout_summary(item, idx) for idx, item in enumerate(rollouts)],
+                },
+            )
+        episode_iter.set_postfix(
+            success=int(bool(rollout["success"])),
+            max_reward=f"{float(rollout['max_reward']):.3f}",
+            length=int(rollout["episode_length"]),
+        )
 
     success = np.asarray([item["success"] for item in rollouts], dtype=np.float32)
     max_rewards = np.asarray([item["max_reward"] for item in rollouts], dtype=np.float32)
@@ -902,6 +1451,7 @@ def evaluate_pusht_sim_model(model, config: Dict[str, Any], device: torch.device
         "sim_chunk_boundary_discontinuity": float(boundary.mean()),
         "sim_episodes": float(len(rollouts)),
     }
+    metrics.update(_aggregate_rollout_diagnostics(rollouts))
 
     if output_dir is not None:
         figures = output_dir / "figures"
@@ -934,20 +1484,10 @@ def evaluate_pusht_sim_model(model, config: Dict[str, Any], device: torch.device
             rollouts,
             figures / "pusht_sim_latent_spread.png",
         )
-        gif_paths = []
-        video_paths = []
-        if bool(eval_cfg.get("sim_save_gifs", True)):
-            gif_paths = save_pusht_sim_gifs(
-                rollouts,
-                figures / "pusht_sim_gifs",
-                fps=float(eval_cfg.get("sim_gif_fps", 10.0)),
-            )
-        if bool(eval_cfg.get("sim_save_videos", False)):
-            video_paths = save_pusht_sim_videos(
-                rollouts,
-                figures / "pusht_sim_videos",
-                fps=float(eval_cfg.get("sim_video_fps", 10.0)),
-            )
+        plot_pusht_sim_reference_field_diagnostics(
+            rollouts,
+            figures / "pusht_sim_reference_field_diagnostics.png",
+        )
         save_json(
             output_dir / "metrics" / "pusht_sim_metrics.json",
             {
