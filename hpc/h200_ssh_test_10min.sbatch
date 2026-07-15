@@ -1,22 +1,4 @@
 #!/bin/bash
-#
-# Reserve one H200 for 10 minutes so you can test whether direct SSH to the
-# allocated compute node is allowed on your cluster.
-#
-# Submit with:
-#   sbatch hpc/h200_ssh_test_10min.sbatch
-#
-# Then watch the allocation with:
-#   squeue -u "$USER"
-#
-# If the job is running, get the node name with:
-#   squeue -j <JOB_ID> -o "%.18i %.9P %.8j %.8u %.2t %.10M %.6D %R"
-#
-# Try SSH:
-#   ssh <NODE_NAME>
-#
-# If direct SSH is blocked, try the Slurm-supported interactive shell:
-#   srun --jobid=<JOB_ID> --pty bash
 
 #SBATCH --job-name=h200-ssh-test
 #SBATCH --nodes=1
@@ -29,8 +11,7 @@
 #SBATCH --error=logs/slurm/%x-%j.err
 
 # Uncomment and edit these if your cluster requires them.
-##SBATCH --partition=<h200_partition>
-##SBATCH --account=<account_name>
+##SBATCH --partition=hpl
 
 set -euo pipefail
 
