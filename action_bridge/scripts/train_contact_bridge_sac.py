@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 
 from action_bridge.config import apply_overrides, load_config, save_config, to_plain_dict
 from action_bridge.eval.pusht_sim import evaluate_pusht_sim_model
-from action_bridge.rl.collection import collect_pusht_episode
+from action_bridge.rl.collection import collect_pusht_episode, collect_pusht_vector
 from action_bridge.rl.costs import compute_bc_cost, compute_ref_cost_mean, linear_schedule
 from action_bridge.rl.critics import DoubleChunkQ, soft_update
 from action_bridge.rl.replay import ChunkReplayBuffer, ReplayBatch
@@ -272,22 +272,43 @@ def train(config) -> Path:
         prefill_episodes = int(rl_cfg.get("prefill_bc_episodes", 200))
         gamma_rl = float(rl_cfg.get("gamma", 0.99))
         max_steps = int(rl_cfg.get("eval_max_steps", 500))
-        for ep in tqdm(range(prefill_episodes), desc="BC replay prefill", unit="episode"):
-            metrics = collect_pusht_episode(
+        num_envs = max(1, int(rl_cfg.get("num_envs", 1)))
+        if num_envs > 1:
+            metrics = collect_pusht_vector(
                 bc_policy,
                 bc_policy,
                 config,
                 device,
                 replay,
-                seed=int(config.get("seed", 0)) + ep,
+                seed=int(config.get("seed", 0)),
+                num_envs=num_envs,
                 n_exec=n_exec,
                 gamma_rl=gamma_rl,
                 stochastic_latent=True,
-                max_steps=max_steps,
+                max_episode_steps=max_steps,
+                target_episodes=prefill_episodes,
                 success_bonus=float(rl_cfg.get("success_bonus", 0.0)),
+                show_progress=True,
+                progress_desc="BC replay prefill",
             )
-            if ep % max(1, int(rl_cfg.get("log_every_prefill_episodes", 10))) == 0:
-                append_csv(run_dir / "metrics" / "prefill_metrics.csv", {"episode": ep, "replay_size": len(replay), **metrics})
+            append_csv(run_dir / "metrics" / "prefill_metrics.csv", {"episode": prefill_episodes, "replay_size": len(replay), **metrics})
+        else:
+            for ep in tqdm(range(prefill_episodes), desc="BC replay prefill", unit="episode"):
+                metrics = collect_pusht_episode(
+                    bc_policy,
+                    bc_policy,
+                    config,
+                    device,
+                    replay,
+                    seed=int(config.get("seed", 0)) + ep,
+                    n_exec=n_exec,
+                    gamma_rl=gamma_rl,
+                    stochastic_latent=True,
+                    max_steps=max_steps,
+                    success_bonus=float(rl_cfg.get("success_bonus", 0.0)),
+                )
+                if ep % max(1, int(rl_cfg.get("log_every_prefill_episodes", 10))) == 0:
+                    append_csv(run_dir / "metrics" / "prefill_metrics.csv", {"episode": ep, "replay_size": len(replay), **metrics})
 
         critic_pretrain_steps = int(rl_cfg.get("critic_pretrain_steps", 50000))
         batch_size = int(rl_cfg.get("batch_size", 256))
@@ -321,26 +342,48 @@ def train(config) -> Path:
         pbar = tqdm(total=total_env_steps, desc="Online ContactBridgeSAC", unit="env_step")
         episode_idx = 0
         while env_steps < total_env_steps:
-            collect_metrics = collect_pusht_episode(
-                policy,
-                bc_policy,
-                config,
-                device,
-                replay,
-                seed=int(config.get("seed", 0)) + 100000 + episode_idx,
-                n_exec=n_exec,
-                gamma_rl=gamma_rl,
-                stochastic_latent=bool(rl_cfg.get("stochastic_latent_collection", True)),
-                max_steps=max_steps,
-                success_bonus=float(rl_cfg.get("success_bonus", 0.0)),
-            )
-            episode_idx += 1
-            steps_this_episode = int(collect_metrics.get("episode_length", 0.0))
-            env_steps += steps_this_episode
-            pbar.update(max(0, steps_this_episode))
+            if num_envs > 1:
+                episodes_per_iter = rl_cfg.get("collect_episodes_per_iter", None)
+                episodes_per_iter = num_envs if episodes_per_iter is None else max(1, int(episodes_per_iter))
+                collect_metrics = collect_pusht_vector(
+                    policy,
+                    bc_policy,
+                    config,
+                    device,
+                    replay,
+                    seed=int(config.get("seed", 0)) + 100000 + episode_idx * num_envs,
+                    num_envs=num_envs,
+                    n_exec=n_exec,
+                    gamma_rl=gamma_rl,
+                    stochastic_latent=bool(rl_cfg.get("stochastic_latent_collection", True)),
+                    max_episode_steps=max_steps,
+                    target_episodes=episodes_per_iter,
+                    success_bonus=float(rl_cfg.get("success_bonus", 0.0)),
+                )
+                episodes_collected = int(collect_metrics.get("episodes", episodes_per_iter))
+                episode_idx += episodes_collected
+                steps_collected = int(collect_metrics.get("env_steps", 0.0))
+            else:
+                collect_metrics = collect_pusht_episode(
+                    policy,
+                    bc_policy,
+                    config,
+                    device,
+                    replay,
+                    seed=int(config.get("seed", 0)) + 100000 + episode_idx,
+                    n_exec=n_exec,
+                    gamma_rl=gamma_rl,
+                    stochastic_latent=bool(rl_cfg.get("stochastic_latent_collection", True)),
+                    max_steps=max_steps,
+                    success_bonus=float(rl_cfg.get("success_bonus", 0.0)),
+                )
+                episode_idx += 1
+                steps_collected = int(collect_metrics.get("episode_length", 0.0))
+            env_steps += steps_collected
+            pbar.update(max(0, steps_collected))
             append_csv(run_dir / "metrics" / "online_collection_metrics.csv", {"env_steps": env_steps, "episode": episode_idx, "replay_size": len(replay), **collect_metrics})
 
-            updates = max(1, int(round(float(rl_cfg.get("updates_per_env_step", 1.0)) * max(1, steps_this_episode))))
+            updates = max(1, int(round(float(rl_cfg.get("updates_per_env_step", 1.0)) * max(1, steps_collected))))
             for _ in range(updates):
                 update_steps += 1
                 batch = replay.sample(batch_size, device)

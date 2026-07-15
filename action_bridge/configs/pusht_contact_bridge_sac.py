@@ -15,9 +15,11 @@ def get_config():
     config.rl.gamma = 0.99
     config.rl.replay_size = 1000000
     config.rl.batch_size = 256
+    config.rl.num_envs = 1
     config.rl.prefill_bc_episodes = 200
     config.rl.critic_pretrain_steps = 50000
     config.rl.total_env_steps = 200000
+    config.rl.collect_episodes_per_iter = None
     config.rl.updates_per_env_step = 1.0
     config.rl.actor_update_delay = 2
     config.rl.success_bonus = 0.0
