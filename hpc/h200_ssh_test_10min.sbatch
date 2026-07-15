@@ -12,7 +12,7 @@
 #SBATCH --error=logs/slurm/%x-%j.err
 
 # Uncomment and edit only if your cluster explicitly requires an account.
-##SBATCH --account=<account_name>
+##SBATCH --account=rvalperga
 
 set -euo pipefail
 
