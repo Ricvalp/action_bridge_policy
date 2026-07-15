@@ -6,12 +6,13 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=00:10:00
+#SBATCH --partition=gpuq
 #SBATCH --gres=gpu:h200:1
 #SBATCH --output=logs/slurm/%x-%j.out
 #SBATCH --error=logs/slurm/%x-%j.err
 
-# Uncomment and edit these if your cluster requires them.
-##SBATCH --partition=hpl
+# Uncomment and edit only if your cluster explicitly requires an account.
+##SBATCH --account=<account_name>
 
 set -euo pipefail
 
