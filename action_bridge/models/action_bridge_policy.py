@@ -264,6 +264,155 @@ class ActionBridgePolicy(nn.Module):
             return self.latent.sample_prior(h_emb, deterministic=deterministic_continuous)
         return None, self.zero_z_embedding(h_emb.shape[0], h_emb.device, h_emb.dtype)
 
+    def _sample_prior_z_for_rl(
+        self,
+        h_emb: torch.Tensor,
+        deterministic: bool,
+        sample_latent: bool,
+        z_override: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]]:
+        info: Dict[str, torch.Tensor] = {}
+        if self.latent_type == "continuous":
+            mu, logvar = self.latent.prior_params(h_emb)
+            log_std = 0.5 * logvar
+            if z_override is not None:
+                z = z_override.to(device=h_emb.device, dtype=h_emb.dtype)
+            elif deterministic or not sample_latent:
+                z = mu
+            else:
+                z = self.latent.reparameterize(mu, logvar)
+            info["prior_mean"] = mu
+            info["prior_log_std"] = log_std
+            info["prior_logvar"] = logvar
+            return z, self.latent.embed(z), info
+        if self.latent_type == "categorical":
+            logits = self.latent.prior_logits(h_emb)
+            if z_override is not None:
+                z = z_override.to(device=h_emb.device).long()
+            elif deterministic or not sample_latent:
+                z = logits.argmax(dim=-1)
+            else:
+                z = torch.distributions.Categorical(logits=logits).sample()
+            info["prior_logits"] = logits
+            return z, self.latent.embed_ids(z), info
+        z_emb = self.zero_z_embedding(h_emb.shape[0], h_emb.device, h_emb.dtype)
+        return None, z_emb, info
+
+    def forward_rl(
+        self,
+        obs_hist: torch.Tensor,
+        act_hist: torch.Tensor,
+        deterministic: bool = False,
+        sample_latent: bool = True,
+        sample_dynamics_noise: bool = False,
+        z_override: Optional[torch.Tensor] = None,
+        return_info: bool = True,
+    ):
+        """Differentiable rollout for chunk-level RL fine-tuning.
+
+        Existing evaluation uses ``generate_chunk`` under ``torch.no_grad``.
+        This method mirrors the contact-Langevin generation path but preserves
+        gradients through latent sampling and the residual control network.
+        """
+
+        h_emb = self.encode_history(obs_hist, act_hist)
+        z, z_emb, latent_info = self._sample_prior_z_for_rl(
+            h_emb,
+            deterministic=deterministic,
+            sample_latent=sample_latent,
+            z_override=z_override,
+        )
+        if bool(getattr(self, "uses_contact_langevin", False)):
+            adapter = self.coordinate_adapter
+            q, p = adapter.init_qp_from_history({"obs_hist": obs_hist, "act_hist": act_hist})
+            obs_state = obs_hist[:, -1]
+            q_values = [q]
+            p_values = [p]
+            u_values = []
+            ref_values = []
+            path_kl_values = []
+            gamma_values = []
+            k_values = []
+            m_values = []
+            for k in range(self.chunk_horizon):
+                f_ref, aux = self.reference_process.force(q, p, h_emb, k, obs_state=obs_state)
+                u = self.contact_control(q, p, h_emb, k, z_emb)
+                sigma = self.reference_process.sigma_like(q)
+                control_accel = sigma * u if self.reference_process.control_is_whitened else u
+                if sample_dynamics_noise and not deterministic and not self.reference_process.deterministic_inference:
+                    noise = (self.reference_process.dt**0.5) * sigma * torch.randn_like(q)
+                else:
+                    noise = torch.zeros_like(q)
+                p = p + self.reference_process.dt * (f_ref + control_accel) + noise
+                if hasattr(self.reference_process, "_denorm_action_delta") and getattr(self.reference_process, "max_step_norm", 0.0) > 0:
+                    p_px = self.reference_process._denorm_action_delta(p)
+                    step_norm = torch.linalg.norm(p_px, dim=-1, keepdim=True)
+                    scale = (float(self.reference_process.max_step_norm) / step_norm.clamp_min(1e-8)).clamp_max(1.0)
+                    p = self.reference_process._norm_action_delta(p_px * scale)
+                q = q + self.reference_process.dt * p
+                if hasattr(self.reference_process, "_denorm_action") and bool(getattr(self.reference_process, "is_geometric_pusht", False)):
+                    q = self.reference_process._norm_action(self.reference_process._denorm_action(q).clamp(0.0, 512.0))
+                if self.reference_process.control_is_whitened:
+                    path_kl_step = 0.5 * self.reference_process.dt * u.pow(2).sum(dim=-1)
+                else:
+                    path_kl_step = 0.5 * self.reference_process.dt * (u / sigma).pow(2).sum(dim=-1)
+                q_values.append(q)
+                p_values.append(p)
+                u_values.append(u)
+                ref_values.append(f_ref)
+                path_kl_values.append(path_kl_step)
+                if aux.get("gamma") is not None:
+                    gamma_values.append(aux["gamma"])
+                if aux.get("k_diag") is not None:
+                    k_values.append(aux["k_diag"])
+                if aux.get("m") is not None:
+                    m_values.append(aux["m"])
+            q_seq = torch.stack(q_values, dim=1)
+            p_seq = torch.stack(p_values, dim=1)
+            actions = adapter.decode_raw_actions(q_seq)
+            info = {
+                "z": z,
+                "z_emb": z_emb,
+                "q_seq": q_seq,
+                "p_seq": p_seq,
+                "u_seq": torch.stack(u_values, dim=1),
+                "ref_accel_seq": torch.stack(ref_values, dim=1),
+                "path_kl_seq": torch.stack(path_kl_values, dim=1),
+            }
+            info["path_kl"] = info["path_kl_seq"].sum(dim=-1)
+            if gamma_values:
+                info["gamma_seq"] = torch.stack(gamma_values, dim=1)
+            if k_values:
+                info["k_diag_seq"] = torch.stack(k_values, dim=1)
+            if m_values:
+                info["attractor_seq"] = torch.stack(m_values, dim=1)
+            info.update(latent_info)
+            return (actions, info) if return_info else actions
+
+        a_prevprev = act_hist[:, -2]
+        a_prev = act_hist[:, -1]
+        actions = []
+        means = []
+        controls = []
+        path_kl_steps = []
+        for k in range(self.chunk_horizon):
+            action, mu, mu_r, u = self.step(a_prev, a_prevprev, h_emb, k, z_emb, deterministic=deterministic or not sample_dynamics_noise)
+            sigma = self.reference_process(a_prev, a_prevprev, h_emb, k)[1].exp().clamp_min(1e-6)
+            path_kl_steps.append(0.5 * (u / sigma).pow(2).sum(dim=-1))
+            actions.append(action)
+            means.append(mu)
+            controls.append(u)
+            a_prevprev, a_prev = a_prev, action
+        info = {
+            "z": z,
+            "z_emb": z_emb,
+            "u_seq": torch.stack(controls, dim=1),
+            "path_kl_seq": torch.stack(path_kl_steps, dim=1),
+        }
+        info["path_kl"] = info["path_kl_seq"].sum(dim=-1)
+        info.update(latent_info)
+        return (torch.stack(actions, dim=1), info) if return_info else torch.stack(actions, dim=1)
+
     def step(
         self,
         a_prev: torch.Tensor,
