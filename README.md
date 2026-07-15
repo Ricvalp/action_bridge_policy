@@ -7,10 +7,25 @@ This sandbox implements a toy-first research pilot for action chunks as stochast
 From this directory:
 
 ```bash
-uv sync --extra test
+uv sync --extra cpu --extra test
 ```
 
-or with pip:
+Choose the PyTorch backend explicitly for each machine:
+
+```bash
+# MacBook / CPU-only evaluation
+uv sync --extra cpu --extra test --locked
+
+# Linux GPU nodes; pick the CUDA build that matches the machine
+uv sync --extra cu118 --extra test --locked
+uv sync --extra cu126 --extra test --locked
+uv sync --extra cu128 --extra test --locked
+uv sync --extra cu130 --extra test --locked
+```
+
+Only one of `cpu`, `cu118`, `cu126`, `cu128`, or `cu130` should be enabled in a given environment. Use `uv lock` locally after dependency changes, then use `uv sync --locked` on experiment machines so they do not rewrite `uv.lock`.
+
+If uv is unavailable, create a virtualenv and install dependencies manually. For PyTorch, use the install command appropriate for the target machine from the PyTorch selector.
 
 ```bash
 python -m venv .venv

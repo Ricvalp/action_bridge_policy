@@ -7,14 +7,63 @@ dependencies = [
   "matplotlib>=3.7",
   "ml-collections>=0.1.1",
   "numpy>=1.24",
-  "torch>=2.0",
   "tqdm>=4.66",
   "wandb>=0.16",
   "zarr>=2.16",
 ]
 
 [project.optional-dependencies]
+cpu = ["torch>=2.0"]
+cu118 = ["torch>=2.0"]
+cu126 = ["torch>=2.0"]
+cu128 = ["torch>=2.0"]
+cu130 = ["torch>=2.0"]
 test = ["pytest>=8.0"]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "cu118" },
+    { extra = "cu126" },
+    { extra = "cu128" },
+    { extra = "cu130" },
+  ],
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu118", extra = "cu118" },
+  { index = "pytorch-cu126", extra = "cu126" },
+  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu130", extra = "cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
