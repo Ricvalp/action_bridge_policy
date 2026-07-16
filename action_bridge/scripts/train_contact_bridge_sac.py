@@ -23,6 +23,16 @@ from action_bridge.training.common import append_csv, build_model, make_run_dir,
 from action_bridge.training.train_toy import log_wandb_figures, log_wandb_scalars, maybe_init_wandb
 
 
+def configure_wandb_metrics(wandb_run) -> None:
+    if wandb_run is None:
+        return
+    try:
+        wandb_run.define_metric("sim_eval/env_steps")
+        wandb_run.define_metric("sim_eval/*", step_metric="sim_eval/env_steps")
+    except Exception:
+        pass
+
+
 def load_bc_actor(checkpoint: Path, config) -> tuple[torch.nn.Module, Dict]:
     raw = torch.load(checkpoint, map_location="cpu")
     ckpt_config = apply_overrides(raw["config"], [])
@@ -202,7 +212,7 @@ def actor_alpha_update(
     }
 
 
-def run_eval(policy, config, device, run_dir: Path, env_steps: int, wandb_run) -> Dict[str, float]:
+def run_eval(policy, config, device, run_dir: Path, env_steps: int, wandb_run, wandb_step: int) -> Dict[str, float]:
     eval_config = deepcopy(config)
     rl_cfg = eval_config.get("rl", {})
     if "eval" not in eval_config:
@@ -223,8 +233,10 @@ def run_eval(policy, config, device, run_dir: Path, env_steps: int, wandb_run) -
         metrics = {"sim_eval_error": 1.0}
         save_json(output_dir / "metrics" / "pusht_sim_error.json", {"env_steps": env_steps, "error": repr(exc)})
     append_csv(run_dir / "metrics" / "sim_eval_metrics.csv", {"env_steps": env_steps, **metrics})
-    log_wandb_scalars(wandb_run, metrics, step=env_steps, prefix="sim_eval")
-    log_wandb_figures(wandb_run, output_dir / "figures", step=env_steps, prefix="sim_eval")
+    log_metrics = {"env_steps": float(env_steps)}
+    log_metrics.update(metrics)
+    log_wandb_scalars(wandb_run, log_metrics, step=wandb_step, prefix="sim_eval")
+    log_wandb_figures(wandb_run, output_dir / "figures", step=wandb_step, prefix="sim_eval")
     policy.train()
     return metrics
 
@@ -267,6 +279,7 @@ def train(config) -> Path:
     run_dir = make_run_dir(config)
     save_config(config, run_dir / "config.json")
     wandb_run = maybe_init_wandb(config, run_dir)
+    configure_wandb_metrics(wandb_run)
 
     try:
         prefill_episodes = int(rl_cfg.get("prefill_bc_episodes", 200))
@@ -334,6 +347,7 @@ def train(config) -> Path:
                 append_csv(run_dir / "metrics" / "rl_train_metrics.csv", row)
                 log_wandb_scalars(wandb_run, row, step=step, prefix="rl")
 
+        wandb_online_step_offset = critic_pretrain_steps
         env_steps = 0
         update_steps = 0
         last_eval = -1
@@ -430,11 +444,11 @@ def train(config) -> Path:
                     row.update(tensor_metrics_to_float(critic_out))
                     row.update(tensor_metrics_to_float(actor_out))
                     append_csv(run_dir / "metrics" / "rl_train_metrics.csv", row)
-                    log_wandb_scalars(wandb_run, row, step=env_steps, prefix="rl")
+                    log_wandb_scalars(wandb_run, row, step=wandb_online_step_offset + env_steps, prefix="rl")
 
             if env_steps - last_eval >= int(rl_cfg.get("eval_every_env_steps", 5000)):
                 last_eval = env_steps
-                run_eval(policy, config, device, run_dir, env_steps, wandb_run)
+                run_eval(policy, config, device, run_dir, env_steps, wandb_run, wandb_step=wandb_online_step_offset + env_steps)
             if env_steps - last_ckpt >= int(rl_cfg.get("checkpoint_every_env_steps", 10000)):
                 last_ckpt = env_steps
                 save_rl_checkpoint(run_dir / "checkpoints" / f"env_step_{env_steps:08d}.pt", policy, bc_policy, critics, critic_target, actor_optim, critic_optim, alpha_optim, log_alpha, config, env_steps, update_steps)
@@ -442,7 +456,7 @@ def train(config) -> Path:
         pbar.close()
         save_rl_checkpoint(run_dir / "checkpoints" / "latest.pt", policy, bc_policy, critics, critic_target, actor_optim, critic_optim, alpha_optim, log_alpha, config, env_steps, update_steps)
         replay.save_npz(run_dir / "replay_final.npz")
-        run_eval(policy, config, device, run_dir, env_steps, wandb_run)
+        run_eval(policy, config, device, run_dir, env_steps, wandb_run, wandb_step=wandb_online_step_offset + env_steps)
         print(f"Run directory: {run_dir}")
         return run_dir
     finally:
