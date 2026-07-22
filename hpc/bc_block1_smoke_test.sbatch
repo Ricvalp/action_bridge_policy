@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=bc_block1_small
+#SBATCH --job-name=bc_block1_smoke
 #SBATCH --partition=gpuq
 #SBATCH --gres=gpu:h200:1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=128G
-#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=00:10:00
 #SBATCH --output=hpc/logs/%x_%j.out
 #SBATCH --error=hpc/logs/%x_%j.err
 
@@ -15,53 +15,53 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "${PROJECT_DIR}"
 
-mkdir -p outputs/slurm outputs/hpc_logs
+mkdir -p hpc/logs outputs/slurm outputs/hpc_logs
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
 export TOKENIZERS_PARALLELISM=false
 
 SEED="${SEED:-0}"
 DEVICE="${DEVICE:-cuda}"
-RUN_SUFFIX="${RUN_SUFFIX:-$(date +%Y%m%d_%H%M%S)}"
+RUN_SUFFIX="${RUN_SUFFIX:-smoke_$(date +%Y%m%d_%H%M%S)}"
 DATASET_PATH="${PUSHT_DATASET_PATH:-data/pusht/pusht_cchi_v7_replay.zarr}"
 DATA_BACKEND="${DATA_BACKEND:-auto}"
-WANDB_PROJECT="${WANDB_PROJECT:-action-bridge-policy-bc-ablation}"
-WANDB_GROUP="${WANDB_GROUP:-block1_small_capacity_seed${SEED}}"
+WANDB_PROJECT="${WANDB_PROJECT:-action-bridge-policy-bc-ablation-smoke}"
+WANDB_GROUP="${WANDB_GROUP:-block1_smoke_seed${SEED}}"
 
 COMMON_OVERRIDES=(
   "obs_dim=5"
   "data.dataset_path=${DATASET_PATH}"
   "data.backend=${DATA_BACKEND}"
-  "optim.batch_size=512"
-  "optim.max_steps=300000"
-  "logging.log_every_steps=100"
-  "logging.eval_every_steps=1000"
-  "logging.checkpoint_every_steps=10000"
-  "logging.full_eval_every_steps=10000"
+  "optim.batch_size=64"
+  "optim.max_steps=12"
+  "logging.log_every_steps=1"
+  "logging.eval_every_steps=4"
+  "logging.checkpoint_every_steps=4"
+  "logging.full_eval_every_steps=4"
   "logging.full_eval_split=val"
-  "logging.full_eval_max_batches=4"
-  "logging.full_eval_closed_loop_episodes=64"
-  "logging.full_eval_num_samples=32"
+  "logging.full_eval_max_batches=1"
+  "logging.full_eval_closed_loop_episodes=4"
+  "logging.full_eval_num_samples=4"
   "logging.sim_eval_enabled=true"
   "logging.sim_eval_async=true"
   "logging.sim_eval_device=cpu"
   "logging.sim_eval_num_workers=2"
   "logging.sim_eval_worker_threads=1"
   "logging.sim_eval_max_pending=1"
-  "logging.sim_eval_every_steps=10000"
-  "logging.sim_eval_episodes=50"
-  "logging.sim_eval_max_steps=500"
+  "logging.sim_eval_every_steps=4"
+  "logging.sim_eval_episodes=4"
+  "logging.sim_eval_max_steps=40"
   "logging.sim_eval_n_exec=8"
-  "logging.sim_eval_render_episodes=0"
-  "logging.sim_eval_save_gifs=false"
+  "logging.sim_eval_render_episodes=1"
+  "logging.sim_eval_save_gifs=true"
   "logging.sim_eval_collect_contact_diagnostics=false"
-  "logging.sim_eval_continue_on_error=true"
+  "logging.sim_eval_continue_on_error=false"
   "logging.wandb.enabled=true"
   "logging.wandb.project=${WANDB_PROJECT}"
   "logging.wandb.group=${WANDB_GROUP}"
-  "logging.wandb.tags=[\"bc_ablation\",\"block1\",\"small_capacity\"]"
+  "logging.wandb.tags=[\"smoke\",\"bc_ablation\",\"block1\",\"async_sim_eval\"]"
 )
 
 SMALL_CONTACT_OVERRIDES=(
@@ -115,9 +115,9 @@ echo "Dataset: ${DATASET_PATH}"
 echo "W&B project/group: ${WANDB_PROJECT}/${WANDB_GROUP}"
 nvidia-smi || true
 
-run_exp "bc_block1_contact_small" "pusht_lowdim_contact_quadratic" "${SMALL_CONTACT_OVERRIDES[@]}"
-run_exp "bc_block1_ar_small" "pusht_lowdim_small_ar_bc" "${SMALL_BC_OVERRIDES[@]}" "model.policy_type=autoregressive_bc"
-run_exp "bc_block1_direct_small" "pusht_lowdim_small_ar_bc" "${SMALL_BC_OVERRIDES[@]}" "model.policy_type=direct_bc"
+run_exp "smoke_block1_contact_small" "pusht_lowdim_contact_quadratic" "${SMALL_CONTACT_OVERRIDES[@]}"
+run_exp "smoke_block1_ar_small" "pusht_lowdim_small_ar_bc" "${SMALL_BC_OVERRIDES[@]}" "model.policy_type=autoregressive_bc"
+run_exp "smoke_block1_direct_small" "pusht_lowdim_small_ar_bc" "${SMALL_BC_OVERRIDES[@]}" "model.policy_type=direct_bc"
 
 status=0
 for i in "${!pids[@]}"; do
@@ -125,6 +125,15 @@ for i in "${!pids[@]}"; do
     echo "=== FAILED ${names[$i]} ==="
     status=1
   fi
+done
+
+echo "Smoke run directories:"
+for name in "${names[@]}"; do
+  echo "  outputs/${name}"
+  test -f "outputs/${name}/checkpoints/latest.pt"
+  test -f "outputs/${name}/metrics/train_metrics.csv"
+  test -f "outputs/${name}/metrics/val_metrics.csv"
+  test -f "outputs/${name}/metrics/periodic_sim_eval_metrics.csv"
 done
 
 exit "${status}"
