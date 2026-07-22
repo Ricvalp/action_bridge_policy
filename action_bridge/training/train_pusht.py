@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from typing import Optional
 
 import torch
 from ml_collections import ConfigDict
@@ -30,6 +31,7 @@ from action_bridge.training.common import (
 )
 from action_bridge.training.losses import model_loss
 from action_bridge.training.train_toy import (
+    FIGURE_FILES,
     log_wandb_figures,
     log_wandb_scalars,
     maybe_init_wandb,
@@ -92,6 +94,34 @@ def _sim_eval_metric_path(output_dir: Path) -> Path:
     return output_dir / "metrics" / "pusht_sim_metrics.json"
 
 
+def define_pusht_wandb_metrics(wandb_run) -> None:
+    if wandb_run is None:
+        return
+    wandb_run.define_metric("sim_eval/train_step")
+    wandb_run.define_metric("sim_eval/*", step_metric="sim_eval/train_step")
+
+
+def log_wandb_sim_eval(wandb_run, metrics: dict, figures_dir: Optional[Path], train_step: int) -> None:
+    if wandb_run is None:
+        return
+    import wandb
+
+    payload = {
+        "sim_eval/train_step": int(train_step),
+        **{
+            f"sim_eval/{key}": value
+            for key, value in metrics.items()
+            if isinstance(value, (float, int)) and not isinstance(value, bool)
+        },
+    }
+    if figures_dir is not None:
+        for filename in FIGURE_FILES:
+            path = figures_dir / filename
+            if path.exists():
+                payload[f"sim_eval/{path.stem}"] = wandb.Image(str(path))
+    wandb_run.log(payload)
+
+
 class AsyncPushtSimEvalManager:
     def __init__(self, config, run_dir: Path, wandb_run):
         self.config = config
@@ -122,8 +152,7 @@ class AsyncPushtSimEvalManager:
                 row = {"step": step}
                 row.update(metrics)
                 append_csv(self.run_dir / "metrics" / "periodic_sim_eval_metrics.csv", row)
-                log_wandb_scalars(self.wandb_run, metrics, step=step, prefix="sim_eval")
-                log_wandb_figures(self.wandb_run, output_dir / "figures", step=step, prefix="sim_eval")
+                log_wandb_sim_eval(self.wandb_run, metrics, output_dir / "figures", train_step=step)
                 print(f"Async Push-T sim eval finished at step {step}: {metrics}")
             else:
                 metrics = {"sim_eval_error": 1.0, "sim_eval_return_code": float(return_code)}
@@ -131,7 +160,7 @@ class AsyncPushtSimEvalManager:
                     self.run_dir / "metrics" / "periodic_sim_eval_errors.csv",
                     {"step": step, "return_code": return_code, "log_path": str(job["log_path"])},
                 )
-                log_wandb_scalars(self.wandb_run, metrics, step=step, prefix="sim_eval")
+                log_wandb_sim_eval(self.wandb_run, metrics, figures_dir=None, train_step=step)
                 print(f"Async Push-T sim eval failed at step {step}; see {job['log_path']}")
         self.pending = remaining
 
@@ -247,8 +276,7 @@ def run_periodic_pusht_sim_eval(model, config, device, run_dir: Path, step: int,
         append_csv(run_dir / "metrics" / "periodic_sim_eval_metrics.csv", row)
     save_config(eval_config, output_dir / "pusht_sim_config.json")
     save_json(output_dir / "eval_metadata.json", {"step": step, "run_id": config.get("run_id"), "kind": "pusht_sim"})
-    log_wandb_scalars(wandb_run, metrics, step=step, prefix="sim_eval")
-    log_wandb_figures(wandb_run, output_dir / "figures", step=step, prefix="sim_eval")
+    log_wandb_sim_eval(wandb_run, metrics, output_dir / "figures", train_step=step)
     model.train()
     return metrics
 
@@ -290,6 +318,7 @@ def train(config):
     sim_eval_async = bool(config.get("logging", {}).get("sim_eval_async", False))
     best_val = float("inf")
     wandb_run = maybe_init_wandb(config, run_dir)
+    define_pusht_wandb_metrics(wandb_run)
     async_sim_eval = AsyncPushtSimEvalManager(config, run_dir, wandb_run) if sim_eval_enabled and sim_eval_async else None
 
     try:
