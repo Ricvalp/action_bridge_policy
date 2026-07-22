@@ -11,29 +11,25 @@
 
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="${PROJECT_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:?Submit this job with sbatch from the action_bridge_policy directory.}}"
 cd "${PROJECT_DIR}"
+test -d action_bridge || { echo "Expected to run from action_bridge_policy; got ${PROJECT_DIR}" >&2; exit 2; }
 
-mkdir -p outputs/slurm outputs/hpc_logs
+mkdir -p outputs/hpc_logs
 
-export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
-export TOKENIZERS_PARALLELISM=false
 
 SEED="${SEED:-0}"
-DEVICE="${DEVICE:-cuda}"
 RUN_SUFFIX="${RUN_SUFFIX:-$(date +%Y%m%d_%H%M%S)}"
 DATASET_PATH="${PUSHT_DATASET_PATH:-data/pusht/pusht_cchi_v7_replay.zarr}"
-DATA_BACKEND="${DATA_BACKEND:-auto}"
 WANDB_PROJECT="${WANDB_PROJECT:-action-bridge-policy-bc-ablation}"
 WANDB_GROUP="${WANDB_GROUP:-block2_reference_ablation_seed${SEED}}"
 
 COMMON_OVERRIDES=(
   "obs_dim=5"
   "data.dataset_path=${DATASET_PATH}"
-  "data.backend=${DATA_BACKEND}"
+  "data.backend=auto"
   "model.hidden_dim=1024"
   "model.h_emb_dim=1024"
   "model.encoder_depth=4"
@@ -63,10 +59,6 @@ COMMON_OVERRIDES=(
   "logging.sim_eval_episodes=50"
   "logging.sim_eval_max_steps=500"
   "logging.sim_eval_n_exec=8"
-  "logging.sim_eval_render_episodes=0"
-  "logging.sim_eval_save_gifs=false"
-  "logging.sim_eval_collect_contact_diagnostics=false"
-  "logging.sim_eval_continue_on_error=true"
   "logging.wandb.enabled=true"
   "logging.wandb.project=${WANDB_PROJECT}"
   "logging.wandb.group=${WANDB_GROUP}"
@@ -88,7 +80,7 @@ run_exp() {
       --config-name pusht_lowdim_contact_quadratic \
       run_id="${run_id}" \
       seed="${SEED}" \
-      device="${DEVICE}" \
+      device=cuda \
       "${COMMON_OVERRIDES[@]}" \
       "$@" \
       > "outputs/hpc_logs/${run_id}.log" 2>&1
@@ -100,7 +92,6 @@ run_exp() {
 echo "Project: ${PROJECT_DIR}"
 echo "Dataset: ${DATASET_PATH}"
 echo "W&B project/group: ${WANDB_PROJECT}/${WANDB_GROUP}"
-nvidia-smi || true
 
 run_exp "bc_block2_full_contact"
 run_exp "bc_block2_no_damping" \
