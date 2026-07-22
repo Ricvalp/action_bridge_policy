@@ -16,6 +16,11 @@ def _logging_config() -> ConfigDict:
     config.full_eval_closed_loop_episodes = 32
     config.full_eval_num_samples = 16
     config.sim_eval_enabled = False
+    config.sim_eval_async = False
+    config.sim_eval_device = "cpu"
+    config.sim_eval_num_workers = 1
+    config.sim_eval_worker_threads = 1
+    config.sim_eval_max_pending = 1
     config.sim_eval_every_steps = 5000
     config.sim_eval_episodes = 20
     config.sim_eval_max_steps = 500

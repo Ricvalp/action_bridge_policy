@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import torch
 from ml_collections import ConfigDict
@@ -79,6 +83,120 @@ def periodic_pusht_sim_eval_config(config, logging_cfg) -> ConfigDict:
     eval_config.eval.sim_save_videos = bool(logging_cfg.get("sim_eval_save_videos", False))
     eval_config.eval.sim_collect_contact_diagnostics = bool(logging_cfg.get("sim_eval_collect_contact_diagnostics", False))
     return eval_config
+
+
+def _sim_eval_metric_path(output_dir: Path) -> Path:
+    summary = output_dir / "metrics" / "pusht_sim_summary.json"
+    if summary.exists():
+        return summary
+    return output_dir / "metrics" / "pusht_sim_metrics.json"
+
+
+class AsyncPushtSimEvalManager:
+    def __init__(self, config, run_dir: Path, wandb_run):
+        self.config = config
+        self.run_dir = run_dir
+        self.wandb_run = wandb_run
+        self.pending = []
+
+    def poll(self, wait: bool = False) -> None:
+        remaining = []
+        for job in self.pending:
+            proc = job["proc"]
+            if wait:
+                return_code = proc.wait()
+            else:
+                return_code = proc.poll()
+                if return_code is None:
+                    remaining.append(job)
+                    continue
+            step = int(job["step"])
+            output_dir = Path(job["output_dir"])
+            if return_code == 0:
+                metrics_path = _sim_eval_metric_path(output_dir)
+                if metrics_path.exists():
+                    with metrics_path.open("r", encoding="utf-8") as f:
+                        metrics = json.load(f)
+                else:
+                    metrics = {"sim_eval_error": 1.0, "sim_eval_missing_metrics": 1.0}
+                row = {"step": step}
+                row.update(metrics)
+                append_csv(self.run_dir / "metrics" / "periodic_sim_eval_metrics.csv", row)
+                log_wandb_scalars(self.wandb_run, metrics, step=step, prefix="sim_eval")
+                log_wandb_figures(self.wandb_run, output_dir / "figures", step=step, prefix="sim_eval")
+                print(f"Async Push-T sim eval finished at step {step}: {metrics}")
+            else:
+                metrics = {"sim_eval_error": 1.0, "sim_eval_return_code": float(return_code)}
+                append_csv(
+                    self.run_dir / "metrics" / "periodic_sim_eval_errors.csv",
+                    {"step": step, "return_code": return_code, "log_path": str(job["log_path"])},
+                )
+                log_wandb_scalars(self.wandb_run, metrics, step=step, prefix="sim_eval")
+                print(f"Async Push-T sim eval failed at step {step}; see {job['log_path']}")
+        self.pending = remaining
+
+    def submit(self, model, optimizer, config, step: int, best_val: float) -> None:
+        self.poll(wait=False)
+        logging_cfg = config.get("logging", {})
+        max_pending = int(logging_cfg.get("sim_eval_max_pending", 1))
+        if len(self.pending) >= max(1, max_pending):
+            append_csv(
+                self.run_dir / "metrics" / "periodic_sim_eval_skipped.csv",
+                {"step": step, "pending": len(self.pending), "max_pending": max_pending},
+            )
+            print(f"Skipping async Push-T sim eval at step {step}: {len(self.pending)} pending job(s).")
+            return
+
+        checkpoint_path = self.run_dir / "checkpoints" / f"sim_eval_step_{step:06d}.pt"
+        save_checkpoint(checkpoint_path, model, optimizer, config, step, best_val)
+        output_dir = self.run_dir / "eval" / f"sim_step_{step:06d}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        log_path = output_dir / "async_eval.log"
+        eval_config = periodic_pusht_sim_eval_config(config, logging_cfg)
+        save_config(eval_config, output_dir / "pusht_sim_config_requested.json")
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "action_bridge.scripts.eval_pusht_sim",
+            "--checkpoint",
+            str(checkpoint_path),
+            "--output-dir",
+            str(output_dir),
+            "--device",
+            str(logging_cfg.get("sim_eval_device", "cpu")),
+            "--episodes",
+            str(eval_config.eval.sim_episodes),
+            "--max-steps",
+            str(eval_config.eval.sim_max_steps),
+            "--n-exec",
+            str(eval_config.eval.get("sim_n_exec", config.get("inference", {}).get("n_exec", config.get("chunk_horizon", 16)))),
+            "--render-episodes",
+            str(eval_config.eval.sim_render_episodes),
+            "--num-workers",
+            str(int(logging_cfg.get("sim_eval_num_workers", 1))),
+            "--worker-threads",
+            str(int(logging_cfg.get("sim_eval_worker_threads", 1))),
+            "--no-timestamp-output-dir",
+        ]
+        if bool(eval_config.eval.get("sim_save_gifs", False)):
+            cmd.append("--save-gifs")
+        else:
+            cmd.append("--no-save-gifs")
+        if bool(eval_config.eval.get("sim_save_videos", False)):
+            cmd.append("--save-videos")
+        else:
+            cmd.append("--no-save-videos")
+        if eval_config.eval.get("sim_seed", None) is not None:
+            cmd.extend(["--seed", str(int(eval_config.eval.sim_seed))])
+
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = str(int(logging_cfg.get("sim_eval_worker_threads", 1)))
+        env["MKL_NUM_THREADS"] = str(int(logging_cfg.get("sim_eval_worker_threads", 1)))
+        with log_path.open("w", encoding="utf-8") as log_file:
+            proc = subprocess.Popen(cmd, cwd=str(Path.cwd()), env=env, stdout=log_file, stderr=subprocess.STDOUT)
+        self.pending.append({"step": step, "proc": proc, "output_dir": output_dir, "log_path": log_path})
+        print(f"Launched async Push-T sim eval at step {step}: {output_dir}")
 
 
 @torch.no_grad()
@@ -169,11 +287,15 @@ def train(config):
     checkpoint_every = int(config.get("logging", {}).get("checkpoint_every_steps", 10000))
     sim_eval_every = int(config.get("logging", {}).get("sim_eval_every_steps", 0))
     sim_eval_enabled = bool(config.get("logging", {}).get("sim_eval_enabled", False))
+    sim_eval_async = bool(config.get("logging", {}).get("sim_eval_async", False))
     best_val = float("inf")
     wandb_run = maybe_init_wandb(config, run_dir)
+    async_sim_eval = AsyncPushtSimEvalManager(config, run_dir, wandb_run) if sim_eval_enabled and sim_eval_async else None
 
     try:
         for step in range(1, max_steps + 1):
+            if async_sim_eval is not None and (step == 1 or step % log_every == 0):
+                async_sim_eval.poll(wait=False)
             model.train()
             batch = move_to_device(next(batches), device)
             out = model_loss(model, batch, config.get("loss", {}), global_step=step)
@@ -204,7 +326,10 @@ def train(config):
                 run_periodic_pusht_eval(model, datasets, config, device, run_dir, step, wandb_run)
 
             if sim_eval_enabled and sim_eval_every > 0 and step % sim_eval_every == 0:
-                run_periodic_pusht_sim_eval(model, config, device, run_dir, step, wandb_run)
+                if async_sim_eval is not None:
+                    async_sim_eval.submit(model, optimizer, config, step, best_val)
+                else:
+                    run_periodic_pusht_sim_eval(model, config, device, run_dir, step, wandb_run)
 
             if checkpoint_every > 0 and step % checkpoint_every == 0:
                 save_checkpoint(run_dir / "checkpoints" / f"step_{step:06d}.pt", model, optimizer, config, step, best_val)
@@ -218,6 +343,8 @@ def train(config):
         print(metrics)
         return run_dir
     finally:
+        if async_sim_eval is not None:
+            async_sim_eval.poll(wait=True)
         if wandb_run is not None:
             wandb_run.finish()
 

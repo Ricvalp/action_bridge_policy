@@ -10,7 +10,9 @@ import torch
 from ml_collections import ConfigDict
 
 from action_bridge.config import apply_overrides, save_config
+from action_bridge.config import to_plain_dict
 from action_bridge.eval.pusht_sim import evaluate_pusht_sim_model
+from action_bridge.eval.pusht_sim_parallel import evaluate_pusht_sim_checkpoint_parallel
 from action_bridge.training.common import build_model, resolve_device, save_json, seed_everything
 
 
@@ -53,6 +55,8 @@ def main() -> None:
     parser.add_argument("--save-videos", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--video-fps", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--worker-threads", type=int, default=1)
     parser.add_argument(
         "--timestamp-output-dir",
         action=argparse.BooleanOptionalAction,
@@ -89,17 +93,28 @@ def main() -> None:
     if args.seed is not None:
         config.eval.sim_seed = int(args.seed)
 
-    seed_everything(int(config.get("eval", {}).get("sim_seed", config.get("seed", 0))))
-    device = resolve_device(str(config.get("device", "cpu")))
-    model = build_model(config).to(device)
-    model.load_state_dict(raw["model_state"])
-    model.eval()
-
     output_dir = Path(args.output_dir) if args.output_dir else default_output_dir(checkpoint)
     if args.timestamp_output_dir:
         output_dir = timestamped_output_dir(output_dir, timestamp_prefix())
     output_dir.mkdir(parents=True, exist_ok=True)
-    metrics = evaluate_pusht_sim_model(model, config, device, output_dir=output_dir)
+
+    seed_everything(int(config.get("eval", {}).get("sim_seed", config.get("seed", 0))))
+    device_name = str(config.get("device", "cpu"))
+    if int(args.num_workers) > 1:
+        metrics = evaluate_pusht_sim_checkpoint_parallel(
+            checkpoint=checkpoint,
+            config=to_plain_dict(config),
+            device_name=device_name,
+            output_dir=output_dir,
+            num_workers=int(args.num_workers),
+            worker_threads=int(args.worker_threads),
+        )
+    else:
+        device = resolve_device(device_name)
+        model = build_model(config).to(device)
+        model.load_state_dict(raw["model_state"])
+        model.eval()
+        metrics = evaluate_pusht_sim_model(model, config, device, output_dir=output_dir)
     save_json(output_dir / "metrics" / "pusht_sim_summary.json", metrics)
     save_config(config, output_dir / "pusht_sim_config.json")
     print(f"Push-T sim eval written to: {output_dir}")
