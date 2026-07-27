@@ -82,6 +82,11 @@ def wandb_config(config) -> dict:
     return to_plain_dict(raw)
 
 
+def wandb_log_images_enabled(config) -> bool:
+    cfg = wandb_config(config)
+    return bool(cfg.get("log_images", True))
+
+
 def maybe_init_wandb(config, run_dir: Path):
     cfg = wandb_config(config)
     if not bool(cfg.get("enabled", False)):
@@ -115,8 +120,8 @@ def log_wandb_scalars(wandb_run, metrics: dict, step: int, prefix: str) -> None:
         wandb_run.log(payload, step=step)
 
 
-def log_wandb_figures(wandb_run, figures_dir: Path, step: int, prefix: str) -> None:
-    if wandb_run is None:
+def log_wandb_figures(wandb_run, figures_dir: Path, step: int, prefix: str, log_images: bool = True) -> None:
+    if wandb_run is None or not log_images:
         return
     import wandb
 
@@ -174,7 +179,7 @@ def run_periodic_eval(model, datasets: dict, config, device, run_dir: Path, step
     save_config(eval_config, output_dir / "eval_config.json")
     save_json(output_dir / "eval_metadata.json", {"step": step, "split": split, "run_id": config.get("run_id")})
     log_wandb_scalars(wandb_run, metrics, step=step, prefix=f"{split}_eval")
-    log_wandb_figures(wandb_run, output_dir / "figures", step=step, prefix=f"{split}_eval")
+    log_wandb_figures(wandb_run, output_dir / "figures", step=step, prefix=f"{split}_eval", log_images=wandb_log_images_enabled(config))
     model.train()
     return metrics
 
@@ -209,6 +214,7 @@ def train(config):
     checkpoint_every = int(config.get("logging", {}).get("checkpoint_every_steps", 10000))
     best_val = float("inf")
     wandb_run = maybe_init_wandb(config, run_dir)
+    log_wandb_images = wandb_log_images_enabled(config)
 
     try:
         for step in range(1, max_steps + 1):
@@ -248,7 +254,7 @@ def train(config):
         metrics = evaluate_toy_model(model, test_set, config, device, output_dir=run_dir)
         save_json(run_dir / "metrics" / "test_metrics.json", metrics)
         log_wandb_scalars(wandb_run, metrics, step=max_steps, prefix="test")
-        log_wandb_figures(wandb_run, run_dir / "figures", step=max_steps, prefix="test")
+        log_wandb_figures(wandb_run, run_dir / "figures", step=max_steps, prefix="test", log_images=log_wandb_images)
         print(f"Run directory: {run_dir}")
         print(metrics)
         return run_dir

@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Optional
@@ -34,6 +35,7 @@ from action_bridge.training.train_toy import (
     FIGURE_FILES,
     log_wandb_figures,
     log_wandb_scalars,
+    wandb_log_images_enabled,
     maybe_init_wandb,
     periodic_eval_max_batches,
     save_checkpoint,
@@ -101,7 +103,7 @@ def define_pusht_wandb_metrics(wandb_run) -> None:
     wandb_run.define_metric("sim_eval/*", step_metric="sim_eval/train_step")
 
 
-def log_wandb_sim_eval(wandb_run, metrics: dict, figures_dir: Optional[Path], train_step: int) -> None:
+def log_wandb_sim_eval(wandb_run, metrics: dict, figures_dir: Optional[Path], train_step: int, log_images: bool = True) -> None:
     if wandb_run is None:
         return
     import wandb
@@ -114,7 +116,7 @@ def log_wandb_sim_eval(wandb_run, metrics: dict, figures_dir: Optional[Path], tr
             if isinstance(value, (float, int)) and not isinstance(value, bool)
         },
     }
-    if figures_dir is not None:
+    if log_images and figures_dir is not None:
         for filename in FIGURE_FILES:
             path = figures_dir / filename
             if path.exists():
@@ -128,6 +130,41 @@ class AsyncPushtSimEvalManager:
         self.run_dir = run_dir
         self.wandb_run = wandb_run
         self.pending = []
+        logging_cfg = config.get("logging", {})
+        self.keep_sim_eval_checkpoints = bool(logging_cfg.get("sim_eval_keep_checkpoints", True))
+        self.log_wandb_images = wandb_log_images_enabled(config)
+        self.best_sim_success = float("-inf")
+
+    def _cleanup_checkpoint(self, checkpoint_path: Optional[Path]) -> None:
+        if self.keep_sim_eval_checkpoints or checkpoint_path is None:
+            return
+        try:
+            checkpoint_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _maybe_update_best_sim_success(self, metrics: dict, checkpoint_path: Optional[Path], step: int) -> None:
+        if checkpoint_path is None or not checkpoint_path.exists():
+            return
+        success = metrics.get("sim_success_rate", None)
+        if not isinstance(success, (float, int)) or isinstance(success, bool):
+            return
+        success = float(success)
+        if success <= self.best_sim_success:
+            return
+        self.best_sim_success = success
+        best_path = self.run_dir / "checkpoints" / "best_sim_success.pt"
+        best_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(checkpoint_path, best_path)
+        metadata = {
+            "step": step,
+            "sim_success_rate": success,
+            "checkpoint": str(best_path),
+            "source_checkpoint": str(checkpoint_path),
+            "metrics": metrics,
+        }
+        save_json(self.run_dir / "metrics" / "best_sim_success.json", metadata)
+        print(f"New best async Push-T sim success at step {step}: {success:.4f} -> {best_path}")
 
     def poll(self, wait: bool = False) -> None:
         remaining = []
@@ -142,6 +179,7 @@ class AsyncPushtSimEvalManager:
                     continue
             step = int(job["step"])
             output_dir = Path(job["output_dir"])
+            checkpoint_path = Path(job["checkpoint_path"]) if job.get("checkpoint_path") else None
             if return_code == 0:
                 metrics_path = _sim_eval_metric_path(output_dir)
                 if metrics_path.exists():
@@ -152,7 +190,9 @@ class AsyncPushtSimEvalManager:
                 row = {"step": step}
                 row.update(metrics)
                 append_csv(self.run_dir / "metrics" / "periodic_sim_eval_metrics.csv", row)
-                log_wandb_sim_eval(self.wandb_run, metrics, output_dir / "figures", train_step=step)
+                self._maybe_update_best_sim_success(metrics, checkpoint_path, step)
+                log_wandb_sim_eval(self.wandb_run, metrics, output_dir / "figures", train_step=step, log_images=self.log_wandb_images)
+                self._cleanup_checkpoint(checkpoint_path)
                 print(f"Async Push-T sim eval finished at step {step}: {metrics}")
             else:
                 metrics = {"sim_eval_error": 1.0, "sim_eval_return_code": float(return_code)}
@@ -160,7 +200,8 @@ class AsyncPushtSimEvalManager:
                     self.run_dir / "metrics" / "periodic_sim_eval_errors.csv",
                     {"step": step, "return_code": return_code, "log_path": str(job["log_path"])},
                 )
-                log_wandb_sim_eval(self.wandb_run, metrics, figures_dir=None, train_step=step)
+                log_wandb_sim_eval(self.wandb_run, metrics, figures_dir=None, train_step=step, log_images=self.log_wandb_images)
+                self._cleanup_checkpoint(checkpoint_path)
                 print(f"Async Push-T sim eval failed at step {step}; see {job['log_path']}")
         self.pending = remaining
 
@@ -224,7 +265,15 @@ class AsyncPushtSimEvalManager:
         env["MKL_NUM_THREADS"] = str(int(logging_cfg.get("sim_eval_worker_threads", 1)))
         with log_path.open("w", encoding="utf-8") as log_file:
             proc = subprocess.Popen(cmd, cwd=str(Path.cwd()), env=env, stdout=log_file, stderr=subprocess.STDOUT)
-        self.pending.append({"step": step, "proc": proc, "output_dir": output_dir, "log_path": log_path})
+        self.pending.append(
+            {
+                "step": step,
+                "proc": proc,
+                "output_dir": output_dir,
+                "log_path": log_path,
+                "checkpoint_path": checkpoint_path,
+            }
+        )
         print(f"Launched async Push-T sim eval at step {step}: {output_dir}")
 
 
@@ -250,7 +299,7 @@ def run_periodic_pusht_eval(model, datasets: dict, config, device, run_dir: Path
     save_config(eval_config, output_dir / "eval_config.json")
     save_json(output_dir / "eval_metadata.json", {"step": step, "split": split, "run_id": config.get("run_id")})
     log_wandb_scalars(wandb_run, metrics, step=step, prefix=f"{split}_eval")
-    log_wandb_figures(wandb_run, output_dir / "figures", step=step, prefix=f"{split}_eval")
+    log_wandb_figures(wandb_run, output_dir / "figures", step=step, prefix=f"{split}_eval", log_images=wandb_log_images_enabled(config))
     model.train()
     return metrics
 
@@ -276,7 +325,7 @@ def run_periodic_pusht_sim_eval(model, config, device, run_dir: Path, step: int,
         append_csv(run_dir / "metrics" / "periodic_sim_eval_metrics.csv", row)
     save_config(eval_config, output_dir / "pusht_sim_config.json")
     save_json(output_dir / "eval_metadata.json", {"step": step, "run_id": config.get("run_id"), "kind": "pusht_sim"})
-    log_wandb_sim_eval(wandb_run, metrics, output_dir / "figures", train_step=step)
+    log_wandb_sim_eval(wandb_run, metrics, output_dir / "figures", train_step=step, log_images=wandb_log_images_enabled(config))
     model.train()
     return metrics
 
@@ -319,6 +368,7 @@ def train(config):
     best_val = float("inf")
     wandb_run = maybe_init_wandb(config, run_dir)
     define_pusht_wandb_metrics(wandb_run)
+    log_wandb_images = wandb_log_images_enabled(config)
     async_sim_eval = AsyncPushtSimEvalManager(config, run_dir, wandb_run) if sim_eval_enabled and sim_eval_async else None
 
     try:
@@ -367,7 +417,7 @@ def train(config):
         metrics = evaluate_pusht_model(model, test_set, config, device, output_dir=run_dir)
         save_json(run_dir / "metrics" / "test_metrics.json", metrics)
         log_wandb_scalars(wandb_run, metrics, step=max_steps, prefix="test")
-        log_wandb_figures(wandb_run, run_dir / "figures", step=max_steps, prefix="test")
+        log_wandb_figures(wandb_run, run_dir / "figures", step=max_steps, prefix="test", log_images=log_wandb_images)
         print(f"Run directory: {run_dir}")
         print(metrics)
         return run_dir

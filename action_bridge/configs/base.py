@@ -32,6 +32,7 @@ def _logging_config() -> ConfigDict:
     config.sim_eval_save_videos = False
     config.sim_eval_collect_contact_diagnostics = False
     config.sim_eval_continue_on_error = True
+    config.sim_eval_keep_checkpoints = True
     config.wandb = ConfigDict()
     config.wandb.enabled = False
     config.wandb.project = "action-bridge-policy"
@@ -41,6 +42,7 @@ def _logging_config() -> ConfigDict:
     config.wandb.group = None
     config.wandb.tags = []
     config.wandb.log_model = False
+    config.wandb.log_images = True
     return config
 
 

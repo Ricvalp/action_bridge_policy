@@ -20,7 +20,7 @@ from action_bridge.rl.costs import compute_bc_cost, compute_ref_cost_mean, linea
 from action_bridge.rl.critics import DoubleChunkQ, soft_update
 from action_bridge.rl.replay import ChunkReplayBuffer, ReplayBatch
 from action_bridge.training.common import append_csv, build_model, make_run_dir, resolve_device, save_json, seed_everything, tensor_metrics_to_float
-from action_bridge.training.train_toy import log_wandb_figures, log_wandb_scalars, maybe_init_wandb
+from action_bridge.training.train_toy import log_wandb_figures, log_wandb_scalars, maybe_init_wandb, wandb_log_images_enabled
 
 
 def configure_wandb_metrics(wandb_run) -> None:
@@ -236,7 +236,7 @@ def run_eval(policy, config, device, run_dir: Path, env_steps: int, wandb_run, w
     log_metrics = {"env_steps": float(env_steps)}
     log_metrics.update(metrics)
     log_wandb_scalars(wandb_run, log_metrics, step=wandb_step, prefix="sim_eval")
-    log_wandb_figures(wandb_run, output_dir / "figures", step=wandb_step, prefix="sim_eval")
+    log_wandb_figures(wandb_run, output_dir / "figures", step=wandb_step, prefix="sim_eval", log_images=wandb_log_images_enabled(config))
     policy.train()
     return metrics
 
