@@ -176,6 +176,7 @@ def load_config_from_checkpoint(checkpoint: Path | str) -> ConfigDict:
         raise KeyError(f"Checkpoint does not contain a training config: {checkpoint}")
     config = to_config_dict(raw["config"])
     config["resume_from"] = str(checkpoint)
+    config["resume_checkpoint_step"] = int(raw.get("step", 0))
     config["resume"] = True
     wandb_run_id = raw.get("wandb_run_id")
     if wandb_run_id:

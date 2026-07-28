@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
 
 import torch
@@ -111,6 +112,28 @@ def _infer_wandb_run_id(run_dir: Path) -> str | None:
     return None
 
 
+def _max_logged_step(run_dir: Path) -> int:
+    max_step = 0
+    for path in [
+        run_dir / "metrics" / "train_metrics.csv",
+        run_dir / "metrics" / "val_metrics.csv",
+        run_dir / "metrics" / "periodic_eval_metrics.csv",
+        run_dir / "metrics" / "periodic_sim_eval_metrics.csv",
+    ]:
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    try:
+                        max_step = max(max_step, int(float(row.get("step", 0))))
+                    except (TypeError, ValueError):
+                        continue
+        except OSError:
+            continue
+    return max_step
+
+
 def attach_wandb_run_metadata(config, wandb_run) -> None:
     if wandb_run is None:
         return
@@ -143,7 +166,17 @@ def maybe_init_wandb(config, run_dir: Path):
         wandb_id = _infer_wandb_run_id(run_dir)
     resume_mode = None
     if config.get("resume_from") and resume_same_run and wandb_id:
-        resume_mode = cfg.get("resume_mode", "allow")
+        checkpoint_step = int(config.get("resume_checkpoint_step", 0))
+        max_logged_step = _max_logged_step(run_dir)
+        if max_logged_step > checkpoint_step and not bool(cfg.get("allow_older_checkpoint_same_run", False)):
+            print(
+                "W&B same-run resume disabled: checkpoint step "
+                f"{checkpoint_step} is older than already logged step {max_logged_step}. "
+                "Starting a fresh W&B run for this branch. Set "
+                "logging.wandb.allow_older_checkpoint_same_run=true to force the old behavior."
+            )
+        else:
+            resume_mode = cfg.get("resume_mode", "allow")
 
     init_kwargs = dict(
         project=cfg.get("project") or "action-bridge-policy",

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=bc_contact_z4_resume_best
+#SBATCH --job-name=bc_contact_z4_resume_latest
 #SBATCH --partition=gpuq
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
@@ -24,7 +24,7 @@ export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 export WANDB_HTTP_TIMEOUT="${WANDB_HTTP_TIMEOUT:-120}"
 export WANDB_CONSOLE="${WANDB_CONSOLE:-off}"
 
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-outputs/bc_contact_medium_z4_batch512_seed0_20260727_183922/checkpoints/best_sim_success.pt}"
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-outputs/bc_contact_medium_z4_batch512_seed0_20260727_183922/checkpoints/latest.pt}"
 DATASET_PATH="${PUSHT_DATASET_PATH:-data/pusht/pusht_cchi_v7_replay.zarr}"
 MAX_STEPS="${MAX_STEPS:-500000}"
 WANDB_PROJECT="${WANDB_PROJECT:-action-bridge-policy-bc-ablation}"
@@ -33,7 +33,7 @@ WANDB_RUN_ID="${WANDB_RUN_ID:-39sbdwqi}"
 
 test -f "${CHECKPOINT_PATH}" || { echo "Missing checkpoint: ${CHECKPOINT_PATH}" >&2; exit 2; }
 RUN_NAME="$(basename "$(dirname "$(dirname "${CHECKPOINT_PATH}")")")"
-LOG_NAME="resume_best_sim_${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
+LOG_NAME="resume_latest_${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
 
 echo "Project: ${PROJECT_DIR}"
 echo "Checkpoint: ${CHECKPOINT_PATH}"
