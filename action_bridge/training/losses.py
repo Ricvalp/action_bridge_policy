@@ -51,6 +51,31 @@ def scheduled_loss_weight(loss_config: Dict, key: str, global_step: int) -> floa
     return linear_warmup(global_step, 0.0, target, warmup)
 
 
+def _repeat_tensor_for_samples(tensor: torch.Tensor, n_samples: int) -> torch.Tensor:
+    if n_samples <= 1:
+        return tensor
+    return tensor[:, None, ...].expand(-1, n_samples, *tensor.shape[1:]).reshape(
+        tensor.shape[0] * n_samples,
+        *tensor.shape[1:],
+    )
+
+
+def _repeat_batch_for_samples(
+    batch: Dict[str, torch.Tensor],
+    n_samples: int,
+    batch_size: int,
+) -> Dict[str, torch.Tensor]:
+    if n_samples <= 1:
+        return batch
+    repeated = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == batch_size:
+            repeated[key] = _repeat_tensor_for_samples(value, n_samples)
+        else:
+            repeated[key] = value
+    return repeated
+
+
 def bridge_path_losses_conditioned(
     policy: ActionBridgePolicy,
     h_emb: torch.Tensor,
@@ -333,20 +358,36 @@ def contact_bridge_loss(
         mu_q, logvar_q = policy.latent.posterior_params(h_emb, future_actions)
         raw_latent_kl = gaussian_kl(mu_q, logvar_q, mu_p, logvar_p)
         latent_kl_loss = raw_latent_kl.clamp_min(free_nats).mean() if free_nats > 0 else raw_latent_kl.mean()
-        n_samples = int(loss_config.get("num_z_samples_train", 1))
-        totals = []
-        unroll_total = future_actions.new_zeros(())
-        for _ in range(max(1, n_samples)):
-            z = policy.latent.reparameterize(mu_q, logvar_q)
+        n_samples = max(1, int(loss_config.get("num_z_samples_train", 1)))
+        vectorize_z = bool(loss_config.get("vectorize_z_samples_train", False)) and n_samples > 1
+        if vectorize_z:
+            h_emb_z = _repeat_tensor_for_samples(h_emb, n_samples)
+            batch_z = _repeat_batch_for_samples(batch, n_samples, future_actions.shape[0])
+            z = policy.latent.reparameterize(
+                _repeat_tensor_for_samples(mu_q, n_samples),
+                _repeat_tensor_for_samples(logvar_q, n_samples),
+            )
             z_emb = policy.latent.embed(z)
-            totals.append(aggregate(contact_path_losses_conditioned(policy, h_emb, batch, z_emb)))
-            if lambda_unroll > 0.0:
-                unroll_total = unroll_total + contact_unrolled_mse_conditioned(policy, h_emb, batch, z_emb).mean()
-        denom = float(max(1, n_samples))
-        metrics = {}
-        for key in totals[0]:
-            metrics[key] = sum(item[key] for item in totals) / denom
-        metrics["unroll_mse"] = unroll_total / denom if lambda_unroll > 0.0 else future_actions.new_zeros(())
+            metrics = aggregate(contact_path_losses_conditioned(policy, h_emb_z, batch_z, z_emb))
+            metrics["unroll_mse"] = (
+                contact_unrolled_mse_conditioned(policy, h_emb_z, batch_z, z_emb).mean()
+                if lambda_unroll > 0.0
+                else future_actions.new_zeros(())
+            )
+        else:
+            totals = []
+            unroll_total = future_actions.new_zeros(())
+            for _ in range(n_samples):
+                z = policy.latent.reparameterize(mu_q, logvar_q)
+                z_emb = policy.latent.embed(z)
+                totals.append(aggregate(contact_path_losses_conditioned(policy, h_emb, batch, z_emb)))
+                if lambda_unroll > 0.0:
+                    unroll_total = unroll_total + contact_unrolled_mse_conditioned(policy, h_emb, batch, z_emb).mean()
+            denom = float(n_samples)
+            metrics = {}
+            for key in totals[0]:
+                metrics[key] = sum(item[key] for item in totals) / denom
+            metrics["unroll_mse"] = unroll_total / denom if lambda_unroll > 0.0 else future_actions.new_zeros(())
         metrics["lambda_unroll"] = future_actions.new_tensor(lambda_unroll)
         base_loss = metrics["nll"] + ref.beta_kl * metrics["path_kl"]
         ref_reg_loss = ref.lambda_ref_reg * metrics["ref_reg"]
@@ -477,25 +518,45 @@ def bridge_loss(
         mu_q, logvar_q = policy.latent.posterior_params(h_emb, future_actions)
         raw_latent_kl = gaussian_kl(mu_q, logvar_q, mu_p, logvar_p)
         latent_kl_loss = raw_latent_kl.clamp_min(free_nats).mean() if free_nats > 0 else raw_latent_kl.mean()
-        n_samples = int(loss_config.get("num_z_samples_train", 1))
-        nll_total = future_actions.new_zeros(())
-        path_kl_total = future_actions.new_zeros(())
-        mse_total = future_actions.new_zeros(())
-        unroll_total = future_actions.new_zeros(())
-        for _ in range(max(1, n_samples)):
-            z = policy.latent.reparameterize(mu_q, logvar_q)
+        n_samples = max(1, int(loss_config.get("num_z_samples_train", 1)))
+        vectorize_z = bool(loss_config.get("vectorize_z_samples_train", False)) and n_samples > 1
+        if vectorize_z:
+            h_emb_z = _repeat_tensor_for_samples(h_emb, n_samples)
+            act_hist_z = _repeat_tensor_for_samples(act_hist, n_samples)
+            future_actions_z = _repeat_tensor_for_samples(future_actions, n_samples)
+            z = policy.latent.reparameterize(
+                _repeat_tensor_for_samples(mu_q, n_samples),
+                _repeat_tensor_for_samples(logvar_q, n_samples),
+            )
             z_emb = policy.latent.embed(z)
-            out = bridge_path_losses_conditioned(policy, h_emb, act_hist, future_actions, z_emb, tube_noise_std=tube_std)
-            nll_total = nll_total + out["nll"].mean()
-            path_kl_total = path_kl_total + out["path_kl"].mean()
-            mse_total = mse_total + out["mse"].mean()
-            if lambda_unroll > 0.0:
-                unroll_total = unroll_total + bridge_unrolled_mse_conditioned(policy, h_emb, act_hist, future_actions, z_emb).mean()
-        denom = float(max(1, n_samples))
-        nll = nll_total / denom
-        path_kl = path_kl_total / denom
-        action_mse = mse_total / denom
-        unroll_mse = unroll_total / denom if lambda_unroll > 0.0 else future_actions.new_zeros(())
+            out = bridge_path_losses_conditioned(policy, h_emb_z, act_hist_z, future_actions_z, z_emb, tube_noise_std=tube_std)
+            nll = out["nll"].mean()
+            path_kl = out["path_kl"].mean()
+            action_mse = out["mse"].mean()
+            unroll_mse = (
+                bridge_unrolled_mse_conditioned(policy, h_emb_z, act_hist_z, future_actions_z, z_emb).mean()
+                if lambda_unroll > 0.0
+                else future_actions.new_zeros(())
+            )
+        else:
+            nll_total = future_actions.new_zeros(())
+            path_kl_total = future_actions.new_zeros(())
+            mse_total = future_actions.new_zeros(())
+            unroll_total = future_actions.new_zeros(())
+            for _ in range(n_samples):
+                z = policy.latent.reparameterize(mu_q, logvar_q)
+                z_emb = policy.latent.embed(z)
+                out = bridge_path_losses_conditioned(policy, h_emb, act_hist, future_actions, z_emb, tube_noise_std=tube_std)
+                nll_total = nll_total + out["nll"].mean()
+                path_kl_total = path_kl_total + out["path_kl"].mean()
+                mse_total = mse_total + out["mse"].mean()
+                if lambda_unroll > 0.0:
+                    unroll_total = unroll_total + bridge_unrolled_mse_conditioned(policy, h_emb, act_hist, future_actions, z_emb).mean()
+            denom = float(n_samples)
+            nll = nll_total / denom
+            path_kl = path_kl_total / denom
+            action_mse = mse_total / denom
+            unroll_mse = unroll_total / denom if lambda_unroll > 0.0 else future_actions.new_zeros(())
         loss = nll + beta_r * path_kl + lambda_unroll * unroll_mse + beta_z * latent_kl_loss
         posterior_entropy = 0.5 * (1.0 + torch.log(torch.tensor(2.0 * torch.pi, device=future_actions.device)) + logvar_q).sum(dim=-1).mean()
         prior_entropy = 0.5 * (1.0 + torch.log(torch.tensor(2.0 * torch.pi, device=future_actions.device)) + logvar_p).sum(dim=-1).mean()

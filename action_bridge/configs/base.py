@@ -134,6 +134,7 @@ def _toy_loss(latent_type: str) -> ConfigDict:
     config.tube_noise_warmup_steps = 5000
     if latent_type == "continuous":
         config.num_z_samples_train = 1
+        config.vectorize_z_samples_train = False
     return config
 
 
@@ -288,6 +289,7 @@ def pusht_lowdim_config(latent_type: str) -> ConfigDict:
     config.loss.lambda_unroll_warmup_steps = 5000
     if latent_type == "continuous":
         config.loss.num_z_samples_train = 1
+        config.loss.vectorize_z_samples_train = False
     config.optim = ConfigDict()
     config.optim.lr = 0.0002
     config.optim.batch_size = 256

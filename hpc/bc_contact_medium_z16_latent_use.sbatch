@@ -59,6 +59,7 @@ uv run python -m action_bridge.training.train_pusht \
   loss.beta_z_warmup_steps=100000 \
   loss.free_nats=0.0 \
   loss.num_z_samples_train=4 \
+  loss.vectorize_z_samples_train=true \
   optim.batch_size=512 \
   optim.max_steps=300000 \
   logging.log_every_steps=100 \
