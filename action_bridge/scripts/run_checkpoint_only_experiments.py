@@ -22,6 +22,7 @@ from action_bridge.config import apply_overrides, save_config
 from action_bridge.data.pusht_adapter import denormalize_actions_tensor, normalize_actions_tensor, normalize_observations_tensor
 from action_bridge.eval.rollout import generate_chunk
 from action_bridge.eval.pusht_sim import evaluate_pusht_sim_model
+from action_bridge.eval.pusht_sim_parallel import evaluate_pusht_sim_checkpoint_parallel
 from action_bridge.eval.pusht_wrong_side import _draw_tee, _synthetic_wrong_side_states, plot_wrong_side_go_around_diagnostic
 from action_bridge.models.action_bridge_policy import ActionBridgePolicy
 from action_bridge.training.common import build_model, resolve_device, save_json, seed_everything
@@ -145,6 +146,33 @@ def experiment_variants(base_n_exec: int) -> list[Dict[str, Any]]:
             }
         )
     return variants
+
+
+def parse_variant_filters(raw: str | None) -> set[str]:
+    if raw is None or not raw.strip():
+        return set()
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def variant_keys(variant: Dict[str, Any]) -> set[str]:
+    group = str(variant["group"])
+    name = str(variant["name"])
+    return {name, f"{group}/{name}", f"{group}__{name}"}
+
+
+def filter_variants(variants: list[Dict[str, Any]], raw_filters: str | None) -> list[Dict[str, Any]]:
+    filters = parse_variant_filters(raw_filters)
+    if not filters:
+        return variants
+    selected = [variant for variant in variants if variant_keys(variant) & filters]
+    matched = set()
+    for variant in selected:
+        matched.update(variant_keys(variant) & filters)
+    missing = sorted(filters - matched)
+    if missing:
+        available = sorted({key for variant in variants for key in variant_keys(variant)})
+        raise ValueError(f"Unknown checkpoint-only variant(s): {missing}. Available variants: {available}")
+    return selected
 
 
 def write_summary_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
@@ -291,6 +319,14 @@ def main() -> None:
     parser.add_argument("--wrong-side-samples", type=int, default=32)
     parser.add_argument("--latent-sweep-states", type=int, default=4)
     parser.add_argument("--latent-sweep-std-scale", type=float, default=2.0)
+    parser.add_argument(
+        "--variants",
+        default=None,
+        help="Comma-separated subset of variants to run. Use names like full_policy or group/name.",
+    )
+    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--worker-threads", type=int, default=1)
+    parser.add_argument("--skip-extra-diagnostics", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
@@ -309,6 +345,7 @@ def main() -> None:
     model = build_model(base_config).to(device)
     model.load_state_dict(raw["model_state"])
     model.eval()
+    variants = filter_variants(experiment_variants(int(args.n_exec)), args.variants)
 
     save_config(base_config, output_dir / "checkpoint_config.json")
     save_json(
@@ -321,20 +358,34 @@ def main() -> None:
             "base_n_exec": int(args.n_exec),
             "render_episodes": int(args.render_episodes),
             "seed": int(args.seed),
+            "num_workers": int(args.num_workers),
+            "worker_threads": int(args.worker_threads),
+            "skip_extra_diagnostics": bool(args.skip_extra_diagnostics),
+            "variants": [{"group": item["group"], "name": item["name"], "description": item["description"]} for item in variants],
             "overrides": list(args.overrides),
         },
     )
 
     rows = []
     failures = []
-    for idx, variant in enumerate(experiment_variants(int(args.n_exec)), start=1):
+    for idx, variant in enumerate(variants, start=1):
         variant_dir = output_dir / f"{variant['group']}__{variant['name']}"
         print(f"\n[{idx}] Running {variant['group']} / {variant['name']} -> {variant_dir}")
         config = make_eval_config(base_config, args, variant)
         save_config(config, variant_dir / "pusht_sim_config.json")
         save_json(variant_dir / "variant.json", variant)
         try:
-            metrics = evaluate_pusht_sim_model(model, config, device, output_dir=variant_dir)
+            if int(args.num_workers) > 1:
+                metrics = evaluate_pusht_sim_checkpoint_parallel(
+                    checkpoint=checkpoint,
+                    config=config,
+                    device_name=str(config.get("device", "cpu")),
+                    output_dir=variant_dir,
+                    num_workers=int(args.num_workers),
+                    worker_threads=int(args.worker_threads),
+                )
+            else:
+                metrics = evaluate_pusht_sim_model(model, config, device, output_dir=variant_dir)
             row = {
                 "group": variant["group"],
                 "name": variant["name"],
@@ -357,6 +408,17 @@ def main() -> None:
             if not args.continue_on_error:
                 raise
             print(f"FAILED {variant['name']}: {exc!r}")
+
+    if args.skip_extra_diagnostics:
+        save_json(output_dir / "summary.json", {"rows": rows, "failures": failures})
+        write_summary_csv(output_dir / "summary.csv", rows)
+        print(f"\nCheckpoint-only experiments written to: {output_dir}")
+        print(f"Completed variants: {len(rows)} | failures: {len(failures)}")
+        if failures:
+            print("Failures:")
+            for failure in failures:
+                print(f"  - {failure['group']} / {failure['name']}: {failure['error']}")
+        return
 
     wrong_side_dir = output_dir / "latent_causal_use__wrong_side_go_around"
     print(f"\nRunning wrong-side go-around latent diagnostic -> {wrong_side_dir}")
