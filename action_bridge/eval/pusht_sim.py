@@ -533,6 +533,11 @@ def _generate_contact_chunk_with_intervention(
         if intervention == "reference_only":
             control_accel = torch.zeros_like(control_accel)
             u_for_kl = torch.zeros_like(u)
+        elif intervention == "potential_only":
+            control_accel = torch.zeros_like(control_accel)
+            u_for_kl = torch.zeros_like(u)
+            grad_v = aux.get("grad_v")
+            f_ref = -grad_v if grad_v is not None else torch.zeros_like(f_ref)
         elif intervention == "control_only":
             f_ref = torch.zeros_like(f_ref)
         elif intervention == "no_damping":

@@ -95,6 +95,7 @@ def experiment_variants(base_n_exec: int) -> list[Dict[str, Any]]:
     reference_interventions = [
         ("full_policy", "full_policy"),
         ("reference_only", "reference_only"),
+        ("potential_only", "potential_only"),
         ("control_only", "control_only"),
         ("no_damping", "no_damping"),
         ("no_potential", "no_potential"),
