@@ -10,3 +10,6 @@ outputs/
 
 *.DS_Store
 logs/
+
+checkpoints/
+eval/
