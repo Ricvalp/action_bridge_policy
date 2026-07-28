@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import copy
+from multiprocessing import Manager
 from pathlib import Path
+from queue import Empty
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -64,6 +66,7 @@ def _run_worker(
     episode_count: int,
     worker_idx: int,
     worker_threads: int,
+    progress_queue=None,
 ) -> Dict[str, Any]:
     if worker_threads > 0:
         torch.set_num_threads(int(worker_threads))
@@ -128,6 +131,19 @@ def _run_worker(
                     "rollouts": [_rollout_summary(item["rollout"], item["episode_index"]) for item in rollouts],
                 },
             )
+        if progress_queue is not None:
+            try:
+                progress_queue.put(
+                    {
+                        "episode_index": int(episode_idx),
+                        "worker": int(worker_idx),
+                        "success": bool(rollout["success"]),
+                        "max_reward": float(rollout["max_reward"]),
+                        "episode_length": int(rollout["episode_length"]),
+                    }
+                )
+            except Exception:
+                pass
 
     return {"worker": worker_idx, "rollouts": rollouts, "gif_paths": gif_paths, "video_paths": video_paths}
 
@@ -209,6 +225,51 @@ def _write_aggregate_artifacts(
     )
 
 
+def _drain_progress_queue(progress_queue, progress_bar, reported_episodes: set[int]) -> None:
+    while True:
+        try:
+            message = progress_queue.get_nowait()
+        except Empty:
+            break
+        except Exception:
+            break
+        episode_index = int(message.get("episode_index", -1))
+        if episode_index in reported_episodes:
+            continue
+        reported_episodes.add(episode_index)
+        progress_bar.update(1)
+        progress_bar.set_postfix(
+            worker=int(message.get("worker", -1)),
+            success=int(bool(message.get("success", False))),
+            max_reward=f"{float(message.get('max_reward', 0.0)):.3f}",
+            length=int(message.get("episode_length", 0)),
+        )
+
+
+def _collect_worker_result(
+    result: Dict[str, Any],
+    rollouts_by_index: dict[int, Dict[str, Any]],
+    gif_paths: list[str],
+    video_paths: list[str],
+    episodes: int,
+    output_dir: Optional[Path],
+) -> None:
+    for item in result["rollouts"]:
+        rollouts_by_index[int(item["episode_index"])] = item["rollout"]
+    gif_paths.extend(result.get("gif_paths", []))
+    video_paths.extend(result.get("video_paths", []))
+    if output_dir is not None:
+        ordered_partial = [rollouts_by_index[idx] for idx in sorted(rollouts_by_index)]
+        save_json(
+            output_dir / "metrics" / "pusht_sim_partial.json",
+            {
+                "completed_episodes": len(ordered_partial),
+                "requested_episodes": episodes,
+                "rollouts": [_rollout_summary(item, idx) for idx, item in enumerate(ordered_partial)],
+            },
+        )
+
+
 def evaluate_pusht_sim_checkpoint_parallel(
     checkpoint: Path,
     config: Dict[str, Any],
@@ -230,38 +291,36 @@ def evaluate_pusht_sim_checkpoint_parallel(
     rollouts_by_index: dict[int, Dict[str, Any]] = {}
     gif_paths: list[str] = []
     video_paths: list[str] = []
-    with ProcessPoolExecutor(max_workers=len(shards)) as executor:
-        futures = [
-            executor.submit(
-                _run_worker,
-                str(checkpoint),
-                config_plain,
-                device_name,
-                str(output_dir) if output_dir is not None else None,
-                start,
-                count,
-                worker_idx,
-                int(worker_threads),
-            )
-            for worker_idx, (start, count) in enumerate(shards)
-        ]
-        iterator = tqdm(as_completed(futures), total=len(futures), desc="Push-T sim workers", unit="worker", dynamic_ncols=True)
-        for future in iterator:
-            result = future.result()
-            for item in result["rollouts"]:
-                rollouts_by_index[int(item["episode_index"])] = item["rollout"]
-            gif_paths.extend(result.get("gif_paths", []))
-            video_paths.extend(result.get("video_paths", []))
-            if output_dir is not None:
-                ordered_partial = [rollouts_by_index[idx] for idx in sorted(rollouts_by_index)]
-                save_json(
-                    output_dir / "metrics" / "pusht_sim_partial.json",
-                    {
-                        "completed_episodes": len(ordered_partial),
-                        "requested_episodes": episodes,
-                        "rollouts": [_rollout_summary(item, idx) for idx, item in enumerate(ordered_partial)],
-                    },
+    reported_episodes: set[int] = set()
+    with Manager() as manager:
+        progress_queue = manager.Queue()
+        with ProcessPoolExecutor(max_workers=len(shards)) as executor:
+            pending = {
+                executor.submit(
+                    _run_worker,
+                    str(checkpoint),
+                    config_plain,
+                    device_name,
+                    str(output_dir) if output_dir is not None else None,
+                    start,
+                    count,
+                    worker_idx,
+                    int(worker_threads),
+                    progress_queue,
                 )
+                for worker_idx, (start, count) in enumerate(shards)
+            }
+            with tqdm(total=episodes, desc="Push-T sim episodes", unit="episode", dynamic_ncols=True) as progress_bar:
+                while pending:
+                    done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+                    _drain_progress_queue(progress_queue, progress_bar, reported_episodes)
+                    for future in done:
+                        result = future.result()
+                        _collect_worker_result(result, rollouts_by_index, gif_paths, video_paths, episodes, output_dir)
+                _drain_progress_queue(progress_queue, progress_bar, reported_episodes)
+                missing = max(0, len(rollouts_by_index) - len(reported_episodes))
+                if missing:
+                    progress_bar.update(missing)
 
     rollouts = [rollouts_by_index[idx] for idx in sorted(rollouts_by_index)]
     metrics = _aggregate_metrics(rollouts)
