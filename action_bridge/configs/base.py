@@ -132,6 +132,17 @@ def _toy_loss(latent_type: str) -> ConfigDict:
     config.tube_noise_std_start = 0.0
     config.tube_noise_std_end = 0.02
     config.tube_noise_warmup_steps = 5000
+    config.contact_objective = "standard"
+    config.passive_target = "damped_continuation"
+    config.passive_alpha_max = 1.0
+    config.passive_eps = 1e-8
+    config.lambda_ref = 0.0
+    config.lambda_ref_warmup_steps = 0
+    config.lambda_slow = 0.0
+    config.lambda_slow_warmup_steps = 0
+    config.lambda_diss = 0.0
+    config.lambda_diss_warmup_steps = 0
+    config.ema_decay = 0.995
     if latent_type == "continuous":
         config.num_z_samples_train = 1
         config.vectorize_z_samples_train = False
@@ -287,6 +298,17 @@ def pusht_lowdim_config(latent_type: str) -> ConfigDict:
     config.loss.tube_noise_warmup_steps = 10000
     config.loss.lambda_unroll = 1.0
     config.loss.lambda_unroll_warmup_steps = 5000
+    config.loss.contact_objective = "standard"
+    config.loss.passive_target = "damped_continuation"
+    config.loss.passive_alpha_max = 1.0
+    config.loss.passive_eps = 1e-8
+    config.loss.lambda_ref = 0.0
+    config.loss.lambda_ref_warmup_steps = 0
+    config.loss.lambda_slow = 0.0
+    config.loss.lambda_slow_warmup_steps = 0
+    config.loss.lambda_diss = 0.0
+    config.loss.lambda_diss_warmup_steps = 0
+    config.loss.ema_decay = 0.995
     if latent_type == "continuous":
         config.loss.num_z_samples_train = 1
         config.loss.vectorize_z_samples_train = False

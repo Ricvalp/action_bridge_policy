@@ -97,6 +97,9 @@ def build_dataset(config: Dict, split: str):
 def build_model(config: Dict):
     model_cfg = dict(config.get("model", {}))
     policy_type = model_cfg.get("policy_type", "action_bridge")
+    loss_cfg = dict(config.get("loss", {}))
+    if str(loss_cfg.get("contact_objective", "standard")) == "stopgrad_reference":
+        model_cfg["enable_reference_ema"] = True
     args = dict(
         obs_dim=int(config.get("obs_dim", 4)),
         action_dim=int(config.get("action_dim", 2)),

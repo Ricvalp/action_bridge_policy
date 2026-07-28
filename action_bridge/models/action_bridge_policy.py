@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -116,6 +117,8 @@ class ActionBridgePolicy(nn.Module):
         )
         self.reference_process: ReferenceProcess = build_reference(reference_config, action_dim=action_dim, h_emb_dim=h_emb_dim)
         self.uses_contact_langevin = bool(getattr(self.reference_process, "is_contact_langevin", False))
+        if bool(model_config.get("enable_reference_ema", False)):
+            self.init_reference_ema()
         self.coordinate_adapter = ActionCoordinateAdapter(
             coordinate_mode=str(reference_config.get("coordinate_mode", "raw_action")),
             dt=float(reference_config.get("dt", 1.0)),
@@ -169,6 +172,31 @@ class ActionBridgePolicy(nn.Module):
 
     def encode_history(self, obs_hist: torch.Tensor, act_hist: torch.Tensor) -> torch.Tensor:
         return self.history_encoder(obs_hist, act_hist)
+
+    def init_reference_ema(self):
+        self.reference_process_ema: ReferenceProcess = copy.deepcopy(self.reference_process)
+        for param in self.reference_process_ema.parameters():
+            param.requires_grad_(False)
+        self.reference_process_ema.eval()
+        return self.reference_process_ema
+
+    def ema_reference(self):
+        if not hasattr(self, "reference_process_ema"):
+            return self.init_reference_ema()
+        return self.reference_process_ema
+
+    @torch.no_grad()
+    def update_reference_ema(self, decay: float = 0.995) -> None:
+        ema = self.ema_reference()
+        rho = float(decay)
+        for ema_param, param in zip(ema.parameters(), self.reference_process.parameters()):
+            ema_param.data.mul_(rho).add_(param.data, alpha=1.0 - rho)
+        for ema_buffer, buffer in zip(ema.buffers(), self.reference_process.buffers()):
+            if torch.is_floating_point(ema_buffer):
+                ema_buffer.data.mul_(rho).add_(buffer.data, alpha=1.0 - rho)
+            else:
+                ema_buffer.data.copy_(buffer.data)
+        ema.eval()
 
     def zero_z_embedding(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         return torch.zeros(batch_size, self.z_embed_dim, device=device, dtype=dtype)

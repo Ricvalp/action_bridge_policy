@@ -38,6 +38,7 @@ from action_bridge.training.train_toy import (
     attach_wandb_run_metadata,
     log_wandb_figures,
     log_wandb_scalars,
+    maybe_update_reference_ema,
     wandb_log_images_enabled,
     maybe_init_wandb,
     periodic_eval_max_batches,
@@ -400,6 +401,7 @@ def train(config):
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            maybe_update_reference_ema(model, config)
 
             if step % log_every == 0 or step == 1:
                 row = {"step": step}

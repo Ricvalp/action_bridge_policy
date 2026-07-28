@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
+
+import math
+import numpy as np
 
 import torch
 
+from action_bridge.data.action_coordinates import ActionCoordinateAdapter
+from action_bridge.data.pusht_adapter import denormalize_actions_tensor, denormalize_observations_tensor
 from action_bridge.eval.rollout import actions_to_positions
+from action_bridge.training.passive_targets import passive_target_from_batch
 
 
 def _import_pyplot():
@@ -46,6 +52,72 @@ def _batch_goal(batch: Dict[str, torch.Tensor]) -> Optional[torch.Tensor]:
     if goal.ndim == 1:
         return goal[None]
     return goal
+
+
+def _normalization_stats(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    data_cfg = config.get("data", {})
+    stats = data_cfg.get("normalization_stats")
+    if bool(data_cfg.get("normalize", False)) and stats is not None:
+        return stats
+    return None
+
+
+def _maybe_denormalize_actions(actions: torch.Tensor, config: Dict[str, Any]) -> torch.Tensor:
+    stats = _normalization_stats(config)
+    if stats is None:
+        return actions
+    return denormalize_actions_tensor(actions, stats)
+
+
+def _maybe_denormalize_observations(obs: torch.Tensor, config: Dict[str, Any]) -> torch.Tensor:
+    stats = _normalization_stats(config)
+    if stats is None:
+        return obs
+    return denormalize_observations_tensor(obs, stats)
+
+
+def _tee_polygons(pose: np.ndarray, scale: float = 30.0) -> list[np.ndarray]:
+    x, y, theta = float(pose[0]), float(pose[1]), float(pose[2])
+    length = 4.0
+    local_polys = [
+        np.array(
+            [
+                [-length * scale / 2, scale],
+                [length * scale / 2, scale],
+                [length * scale / 2, 0.0],
+                [-length * scale / 2, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.array(
+            [
+                [-scale / 2, scale],
+                [-scale / 2, length * scale],
+                [scale / 2, length * scale],
+                [scale / 2, scale],
+            ],
+            dtype=np.float32,
+        ),
+    ]
+    rotation = np.array([[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]], dtype=np.float32)
+    return [poly @ rotation.T + np.array([x, y], dtype=np.float32) for poly in local_polys]
+
+
+def _draw_tee(ax, pose: np.ndarray, color: str, alpha: float, label: Optional[str] = None, linestyle: str = "-") -> None:
+    from matplotlib.patches import Polygon
+
+    for idx, poly in enumerate(_tee_polygons(pose)):
+        patch = Polygon(
+            poly,
+            closed=True,
+            facecolor=color if linestyle == "-" else "none",
+            edgecolor=color,
+            linewidth=1.4,
+            linestyle=linestyle,
+            alpha=alpha,
+            label=label if idx == 0 else None,
+        )
+        ax.add_patch(patch)
 
 
 def plot_dataset_samples(dataset, path: Path, max_items: int = 24) -> None:
@@ -109,6 +181,87 @@ def plot_generated_samples(
     ax.set_title(title)
     if goals is not None:
         ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def plot_projected_demo_damped_continuation(
+    batch: Dict[str, Any],
+    path: Path,
+    config: Dict[str, Any],
+    max_items: int = 6,
+) -> None:
+    """Show the passive target used by the stop-gradient reference objective.
+
+    The projection is computed in the model/reference coordinates, then decoded
+    back to raw actions for plotting. For Push-T lowdim absolute-action runs,
+    this makes the plot directly comparable to the logged action chunk.
+    """
+
+    plt = _import_pyplot()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    action_dim = int(config.get("action_dim", batch["future_actions"].shape[-1]))
+    reference_cfg = config.get("reference", {})
+    adapter = ActionCoordinateAdapter(
+        coordinate_mode=str(reference_cfg.get("coordinate_mode", "raw_action")),
+        dt=float(reference_cfg.get("dt", 1.0)),
+        action_dim=action_dim,
+    )
+    passive = passive_target_from_batch(
+        adapter,
+        batch,
+        target_type=str(config.get("loss", {}).get("passive_target", "damped_continuation")),
+        alpha_max=float(config.get("loss", {}).get("passive_alpha_max", 1.0)),
+        eps=float(config.get("loss", {}).get("passive_eps", 1e-8)),
+    )
+
+    count = min(max_items, int(batch["future_actions"].shape[0]))
+    if count <= 0:
+        return
+    cols = min(3, count)
+    rows = int(math.ceil(count / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.4 * cols, 4.35 * rows), squeeze=False)
+    target = _maybe_denormalize_actions(batch["future_actions"], config).detach().cpu().numpy()
+    projected = _maybe_denormalize_actions(passive["projected_raw_actions"], config).detach().cpu().numpy()
+    act_hist = _maybe_denormalize_actions(batch["act_hist"], config).detach().cpu().numpy()
+    obs_hist = batch.get("obs_hist")
+    obs_np = None
+    if torch.is_tensor(obs_hist):
+        obs_np = _maybe_denormalize_observations(obs_hist, config).detach().cpu().numpy()
+    alpha = passive["alpha"].detach().cpu().numpy()
+    residual = passive["residual_next_velocity"].detach().cpu()
+    residual_norm = torch.linalg.norm(residual, dim=-1).mean(dim=-1).numpy()
+    goal_pose = np.array([256.0, 256.0, math.pi / 4], dtype=np.float32)
+
+    for flat_idx, ax in enumerate(axes.ravel()):
+        if flat_idx >= count:
+            ax.axis("off")
+            continue
+        state = obs_np[flat_idx, -1] if obs_np is not None else None
+        if state is not None and state.shape[-1] >= 5:
+            _draw_tee(ax, goal_pose, color="tab:green", alpha=0.28, label="goal T", linestyle="--")
+            _draw_tee(ax, state[2:5], color="0.35", alpha=0.32, label="current T")
+            ax.scatter(state[0], state[1], color="tab:purple", s=28, marker="o", label="agent")
+        ax.plot(act_hist[flat_idx, :, 0], act_hist[flat_idx, :, 1], color="0.55", marker="o", markersize=3, linewidth=1.0, label="history")
+        ax.plot(target[flat_idx, :, 0], target[flat_idx, :, 1], color="black", marker="o", markersize=3, linewidth=1.5, label="expert chunk")
+        ax.plot(
+            projected[flat_idx, :, 0],
+            projected[flat_idx, :, 1],
+            color="tab:orange",
+            marker="x",
+            markersize=4,
+            linewidth=1.5,
+            label="passive projection",
+        )
+        if state is not None and state.shape[-1] >= 5:
+            ax.set_xlim(0, 512)
+            ax.set_ylim(512, 0)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(f"alpha {alpha[flat_idx].mean():.2f}, residual |p| {residual_norm[flat_idx]:.2f}")
+        if flat_idx == 0:
+            ax.legend(fontsize=7, loc="upper right")
+    fig.suptitle("Damped-continuation passive target from demonstrations", y=0.995)
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     plt.close(fig)

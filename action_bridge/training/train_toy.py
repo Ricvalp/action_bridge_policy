@@ -43,6 +43,7 @@ FIGURE_FILES = [
     "pusht_sim_latent_spread.png",
     "pusht_sim_rewards.png",
     "pusht_sim_rollouts.png",
+    "projected_demo_damped_continuation.png",
     "receding_horizon_action_rollout.png",
     "wrong_side_go_around_lateral_summary.png",
     "wrong_side_go_around_latent_chunks.png",
@@ -92,6 +93,14 @@ def wandb_config(config) -> dict:
 def wandb_log_images_enabled(config) -> bool:
     cfg = wandb_config(config)
     return bool(cfg.get("log_images", True))
+
+
+def maybe_update_reference_ema(model, config) -> None:
+    loss_cfg = config.get("loss", {})
+    if str(loss_cfg.get("contact_objective", "standard")) != "stopgrad_reference":
+        return
+    if hasattr(model, "update_reference_ema"):
+        model.update_reference_ema(float(loss_cfg.get("ema_decay", 0.995)))
 
 
 def _infer_wandb_run_id(run_dir: Path) -> str | None:
@@ -319,6 +328,7 @@ def train(config):
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            maybe_update_reference_ema(model, config)
 
             if step % log_every == 0 or step == 1:
                 row = {"step": step}
