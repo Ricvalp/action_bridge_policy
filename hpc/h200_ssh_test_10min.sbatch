@@ -7,7 +7,7 @@
 #SBATCH --mem=16G
 #SBATCH --time=00:10:00
 #SBATCH --partition=gpuq
-#SBATCH --gres=gpu:h200:1
+#SBATCH --gres=gpu:1
 #SBATCH --output=logs/slurm/%x-%j.out
 #SBATCH --error=logs/slurm/%x-%j.err
 

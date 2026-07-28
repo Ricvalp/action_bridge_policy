@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=bc_block3_beta_b
 #SBATCH --partition=gpuq
-#SBATCH --gres=gpu:h200:1
+#SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
