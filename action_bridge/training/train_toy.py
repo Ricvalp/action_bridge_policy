@@ -16,8 +16,10 @@ from action_bridge.training.common import (
     build_dataset,
     build_model,
     cycle,
+    load_config_from_checkpoint,
     make_run_dir,
     move_to_device,
+    restore_training_state,
     resolve_device,
     save_json,
     seed_everything,
@@ -48,13 +50,17 @@ FIGURE_FILES = [
 
 def save_checkpoint(path: Path, model, optimizer, config, step: int, best_metric: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    plain_config = to_plain_dict(config)
+    wandb_cfg = plain_config.get("logging", {}).get("wandb", {})
+    wandb_run_id = wandb_cfg.get("id") if isinstance(wandb_cfg, dict) else None
     torch.save(
         {
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
-            "config": to_plain_dict(config),
+            "config": plain_config,
             "step": step,
             "best_metric": best_metric,
+            "wandb_run_id": wandb_run_id,
         },
         path,
     )
@@ -87,6 +93,41 @@ def wandb_log_images_enabled(config) -> bool:
     return bool(cfg.get("log_images", True))
 
 
+def _infer_wandb_run_id(run_dir: Path) -> str | None:
+    wandb_dir = run_dir / "wandb"
+    latest = wandb_dir / "latest-run"
+    candidates = []
+    if latest.exists():
+        try:
+            candidates.append(latest.resolve())
+        except OSError:
+            candidates.append(latest)
+    if wandb_dir.exists():
+        candidates.extend(sorted(wandb_dir.glob("run-*"), key=lambda path: path.stat().st_mtime, reverse=True))
+    for candidate in candidates:
+        name = candidate.name
+        if name.startswith("run-") and "-" in name:
+            return name.rsplit("-", 1)[-1]
+    return None
+
+
+def attach_wandb_run_metadata(config, wandb_run) -> None:
+    if wandb_run is None:
+        return
+    logging_cfg = config.get("logging", None)
+    if not isinstance(logging_cfg, (ConfigDict, dict)):
+        logging_cfg = ConfigDict()
+        config["logging"] = logging_cfg
+    wandb_cfg = logging_cfg.get("wandb", None)
+    if isinstance(wandb_cfg, bool):
+        wandb_cfg = ConfigDict({"enabled": wandb_cfg})
+        logging_cfg["wandb"] = wandb_cfg
+    elif not isinstance(wandb_cfg, (ConfigDict, dict)):
+        wandb_cfg = ConfigDict()
+        logging_cfg["wandb"] = wandb_cfg
+    wandb_cfg["id"] = str(wandb_run.id)
+
+
 def maybe_init_wandb(config, run_dir: Path):
     cfg = wandb_config(config)
     if not bool(cfg.get("enabled", False)):
@@ -96,7 +137,15 @@ def maybe_init_wandb(config, run_dir: Path):
     except ImportError as exc:
         raise RuntimeError("wandb logging is enabled, but wandb is not installed. Run `uv sync` from the sandbox.") from exc
 
-    return wandb.init(
+    resume_same_run = bool(cfg.get("resume_same_run", True))
+    wandb_id = cfg.get("id")
+    if not wandb_id and config.get("resume_from") and resume_same_run:
+        wandb_id = _infer_wandb_run_id(run_dir)
+    resume_mode = None
+    if config.get("resume_from") and resume_same_run and wandb_id:
+        resume_mode = cfg.get("resume_mode", "allow")
+
+    init_kwargs = dict(
         project=cfg.get("project") or "action-bridge-policy",
         entity=cfg.get("entity"),
         name=cfg.get("name") or config.get("run_id"),
@@ -106,6 +155,10 @@ def maybe_init_wandb(config, run_dir: Path):
         dir=str(run_dir),
         config=flatten_dict(config),
     )
+    if resume_mode:
+        init_kwargs["id"] = wandb_id
+        init_kwargs["resume"] = resume_mode
+    return wandb.init(**init_kwargs)
 
 
 def log_wandb_scalars(wandb_run, metrics: dict, step: int, prefix: str) -> None:
@@ -212,12 +265,19 @@ def train(config):
     eval_every = int(config.get("logging", {}).get("eval_every_steps", max(25, log_every)))
     full_eval_every = int(config.get("logging", {}).get("full_eval_every_steps", 0))
     checkpoint_every = int(config.get("logging", {}).get("checkpoint_every_steps", 10000))
+    start_step = 1
     best_val = float("inf")
+    resume_from = config.get("resume_from", None)
+    if resume_from:
+        start_step, best_val = restore_training_state(Path(resume_from), model, optimizer, device)
+        print(f"Resumed training from {resume_from} at step {start_step - 1} with best_metric={best_val:.6g}")
     wandb_run = maybe_init_wandb(config, run_dir)
+    attach_wandb_run_metadata(config, wandb_run)
+    save_config(config, run_dir / "config.json")
     log_wandb_images = wandb_log_images_enabled(config)
 
     try:
-        for step in range(1, max_steps + 1):
+        for step in range(start_step, max_steps + 1):
             model.train()
             batch = move_to_device(next(batches), device)
             out = model_loss(model, batch, config.get("loss", {}), global_step=step)
@@ -239,10 +299,10 @@ def train(config):
                 val_row = {"step": step, "val_loss": val}
                 append_csv(run_dir / "metrics" / "val_metrics.csv", val_row)
                 log_wandb_scalars(wandb_run, val_row, step=step, prefix="val")
-                save_checkpoint(run_dir / "checkpoints" / "latest.pt", model, optimizer, config, step, best_val)
                 if val < best_val:
                     best_val = val
                     save_checkpoint(run_dir / "checkpoints" / "best.pt", model, optimizer, config, step, best_val)
+                save_checkpoint(run_dir / "checkpoints" / "latest.pt", model, optimizer, config, step, best_val)
 
             if full_eval_every > 0 and step % full_eval_every == 0 and step != max_steps:
                 run_periodic_eval(model, datasets, config, device, run_dir, step, wandb_run)
@@ -250,11 +310,12 @@ def train(config):
             if checkpoint_every > 0 and step % checkpoint_every == 0:
                 save_checkpoint(run_dir / "checkpoints" / f"step_{step:06d}.pt", model, optimizer, config, step, best_val)
 
-        save_checkpoint(run_dir / "checkpoints" / "latest.pt", model, optimizer, config, max_steps, best_val)
+        final_step = max_steps if start_step <= max_steps else start_step - 1
+        save_checkpoint(run_dir / "checkpoints" / "latest.pt", model, optimizer, config, final_step, best_val)
         metrics = evaluate_toy_model(model, test_set, config, device, output_dir=run_dir)
         save_json(run_dir / "metrics" / "test_metrics.json", metrics)
-        log_wandb_scalars(wandb_run, metrics, step=max_steps, prefix="test")
-        log_wandb_figures(wandb_run, run_dir / "figures", step=max_steps, prefix="test", log_images=log_wandb_images)
+        log_wandb_scalars(wandb_run, metrics, step=final_step, prefix="test")
+        log_wandb_figures(wandb_run, run_dir / "figures", step=final_step, prefix="test", log_images=log_wandb_images)
         print(f"Run directory: {run_dir}")
         print(metrics)
         return run_dir
@@ -265,10 +326,25 @@ def train(config):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config-name", type=str, required=True)
+    parser.add_argument("--config-name", type=str, default=None)
+    parser.add_argument("--resume-from", type=str, default=None)
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
-    config = apply_overrides(load_config(args.config_name), args.overrides)
+    resume_from = args.resume_from
+    if resume_from is None:
+        for item in args.overrides:
+            if item.startswith("resume_from="):
+                resume_from = item.split("=", 1)[1]
+                break
+    if resume_from:
+        config = load_config_from_checkpoint(resume_from)
+        config = apply_overrides(config, args.overrides)
+        config["resume_from"] = resume_from
+        config["resume"] = True
+    else:
+        if args.config_name is None:
+            parser.error("--config-name is required unless --resume-from or resume_from=... is provided.")
+        config = apply_overrides(load_config(args.config_name), args.overrides)
     train(config)
 
 

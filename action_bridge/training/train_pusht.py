@@ -23,8 +23,10 @@ from action_bridge.training.common import (
     build_dataset,
     build_model,
     cycle,
+    load_config_from_checkpoint,
     make_run_dir,
     move_to_device,
+    restore_training_state,
     resolve_device,
     save_json,
     seed_everything,
@@ -33,6 +35,7 @@ from action_bridge.training.common import (
 from action_bridge.training.losses import model_loss
 from action_bridge.training.train_toy import (
     FIGURE_FILES,
+    attach_wandb_run_metadata,
     log_wandb_figures,
     log_wandb_scalars,
     wandb_log_images_enabled,
@@ -134,6 +137,13 @@ class AsyncPushtSimEvalManager:
         self.keep_sim_eval_checkpoints = bool(logging_cfg.get("sim_eval_keep_checkpoints", True))
         self.log_wandb_images = wandb_log_images_enabled(config)
         self.best_sim_success = float("-inf")
+        best_path = self.run_dir / "metrics" / "best_sim_success.json"
+        if best_path.exists():
+            try:
+                with best_path.open("r", encoding="utf-8") as f:
+                    self.best_sim_success = float(json.load(f).get("sim_success_rate", float("-inf")))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                self.best_sim_success = float("-inf")
 
     def _cleanup_checkpoint(self, checkpoint_path: Optional[Path]) -> None:
         if self.keep_sim_eval_checkpoints or checkpoint_path is None:
@@ -365,14 +375,21 @@ def train(config):
     sim_eval_every = int(config.get("logging", {}).get("sim_eval_every_steps", 0))
     sim_eval_enabled = bool(config.get("logging", {}).get("sim_eval_enabled", False))
     sim_eval_async = bool(config.get("logging", {}).get("sim_eval_async", False))
+    start_step = 1
     best_val = float("inf")
+    resume_from = config.get("resume_from", None)
+    if resume_from:
+        start_step, best_val = restore_training_state(Path(resume_from), model, optimizer, device)
+        print(f"Resumed training from {resume_from} at step {start_step - 1} with best_metric={best_val:.6g}")
     wandb_run = maybe_init_wandb(config, run_dir)
+    attach_wandb_run_metadata(config, wandb_run)
+    save_config(config, run_dir / "config.json")
     define_pusht_wandb_metrics(wandb_run)
     log_wandb_images = wandb_log_images_enabled(config)
     async_sim_eval = AsyncPushtSimEvalManager(config, run_dir, wandb_run) if sim_eval_enabled and sim_eval_async else None
 
     try:
-        for step in range(1, max_steps + 1):
+        for step in range(start_step, max_steps + 1):
             if async_sim_eval is not None and (step == 1 or step % log_every == 0):
                 async_sim_eval.poll(wait=False)
             model.train()
@@ -396,10 +413,10 @@ def train(config):
                 val_row = {"step": step, "val_loss": val}
                 append_csv(run_dir / "metrics" / "val_metrics.csv", val_row)
                 log_wandb_scalars(wandb_run, val_row, step=step, prefix="val")
-                save_checkpoint(run_dir / "checkpoints" / "latest.pt", model, optimizer, config, step, best_val)
                 if val < best_val:
                     best_val = val
                     save_checkpoint(run_dir / "checkpoints" / "best.pt", model, optimizer, config, step, best_val)
+                save_checkpoint(run_dir / "checkpoints" / "latest.pt", model, optimizer, config, step, best_val)
 
             if full_eval_every > 0 and step % full_eval_every == 0 and step != max_steps:
                 run_periodic_pusht_eval(model, datasets, config, device, run_dir, step, wandb_run)
@@ -413,11 +430,12 @@ def train(config):
             if checkpoint_every > 0 and step % checkpoint_every == 0:
                 save_checkpoint(run_dir / "checkpoints" / f"step_{step:06d}.pt", model, optimizer, config, step, best_val)
 
-        save_checkpoint(run_dir / "checkpoints" / "latest.pt", model, optimizer, config, max_steps, best_val)
+        final_step = max_steps if start_step <= max_steps else start_step - 1
+        save_checkpoint(run_dir / "checkpoints" / "latest.pt", model, optimizer, config, final_step, best_val)
         metrics = evaluate_pusht_model(model, test_set, config, device, output_dir=run_dir)
         save_json(run_dir / "metrics" / "test_metrics.json", metrics)
-        log_wandb_scalars(wandb_run, metrics, step=max_steps, prefix="test")
-        log_wandb_figures(wandb_run, run_dir / "figures", step=max_steps, prefix="test", log_images=log_wandb_images)
+        log_wandb_scalars(wandb_run, metrics, step=final_step, prefix="test")
+        log_wandb_figures(wandb_run, run_dir / "figures", step=final_step, prefix="test", log_images=log_wandb_images)
         print(f"Run directory: {run_dir}")
         print(metrics)
         return run_dir
@@ -431,9 +449,22 @@ def train(config):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-name", type=str, default="pusht_lowdim_continuous")
+    parser.add_argument("--resume-from", type=str, default=None)
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
-    config = apply_overrides(load_config(args.config_name), args.overrides)
+    resume_from = args.resume_from
+    if resume_from is None:
+        for item in args.overrides:
+            if item.startswith("resume_from="):
+                resume_from = item.split("=", 1)[1]
+                break
+    if resume_from:
+        config = load_config_from_checkpoint(resume_from)
+        config = apply_overrides(config, args.overrides)
+        config["resume_from"] = resume_from
+        config["resume"] = True
+    else:
+        config = apply_overrides(load_config(args.config_name), args.overrides)
     train(config)
 
 

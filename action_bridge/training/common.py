@@ -9,10 +9,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable
 
+from ml_collections import ConfigDict
 import numpy as np
 import torch
 
-from action_bridge.config import to_plain_dict
+from action_bridge.config import to_config_dict, to_plain_dict
 from action_bridge.data.pusht_adapter import PushTLowDimDataset
 from action_bridge.data.toy_annular import AnnularObstacleDataset
 from action_bridge.data.toy_obstacle import DelayedBranchObstacleDataset
@@ -151,6 +152,48 @@ def save_json(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(to_plain_dict(data), f, indent=2, sort_keys=True)
+
+
+def _ensure_wandb_config(config: ConfigDict) -> ConfigDict:
+    logging_cfg = config.get("logging", None)
+    if not isinstance(logging_cfg, (ConfigDict, dict)):
+        logging_cfg = ConfigDict()
+        config["logging"] = logging_cfg
+    wandb_cfg = logging_cfg.get("wandb", None)
+    if isinstance(wandb_cfg, bool):
+        wandb_cfg = ConfigDict({"enabled": wandb_cfg})
+        logging_cfg["wandb"] = wandb_cfg
+    elif not isinstance(wandb_cfg, (ConfigDict, dict)):
+        wandb_cfg = ConfigDict()
+        logging_cfg["wandb"] = wandb_cfg
+    return wandb_cfg
+
+
+def load_config_from_checkpoint(checkpoint: Path | str) -> ConfigDict:
+    checkpoint = Path(checkpoint)
+    raw = torch.load(checkpoint, map_location="cpu")
+    if "config" not in raw:
+        raise KeyError(f"Checkpoint does not contain a training config: {checkpoint}")
+    config = to_config_dict(raw["config"])
+    config["resume_from"] = str(checkpoint)
+    config["resume"] = True
+    wandb_run_id = raw.get("wandb_run_id")
+    if wandb_run_id:
+        _ensure_wandb_config(config)["id"] = str(wandb_run_id)
+    return config
+
+
+def restore_training_state(checkpoint: Path | str, model, optimizer, device: torch.device) -> tuple[int, float]:
+    checkpoint = Path(checkpoint)
+    raw = torch.load(checkpoint, map_location=device)
+    if "model_state" not in raw:
+        raise KeyError(f"Checkpoint does not contain model_state: {checkpoint}")
+    model.load_state_dict(raw["model_state"])
+    if optimizer is not None and raw.get("optimizer_state") is not None:
+        optimizer.load_state_dict(raw["optimizer_state"])
+    step = int(raw.get("step", 0))
+    best_metric = float(raw.get("best_metric", float("inf")))
+    return step + 1, best_metric
 
 
 def tensor_metrics_to_float(metrics: Dict[str, Any]) -> Dict[str, float]:
