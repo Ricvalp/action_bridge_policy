@@ -234,6 +234,40 @@ def contact_unrolled_mse_conditioned(
     return mse / max(1, future_actions.shape[1])
 
 
+def contact_stopgrad_unrolled_mse_conditioned(
+    policy: ActionBridgePolicy,
+    h_emb: torch.Tensor,
+    batch: Dict[str, torch.Tensor],
+    z_emb: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Unroll the control against a detached EMA reference force.
+
+    The predicted phase state remains in the autograd graph, so later errors
+    train the control to recover from its own states. Only the EMA force is
+    stop-gradient; the online reference is trained by its passive-target loss.
+    """
+
+    future_actions = batch["future_actions"]
+    adapter = policy.coordinate_adapter
+    ref = policy.reference_process
+    ema_ref = policy.ema_reference()
+    q, p = adapter.init_qp_from_history(batch)
+    obs_state = batch["obs_hist"][:, -1]
+    mse = torch.zeros(future_actions.shape[0], device=future_actions.device, dtype=future_actions.dtype)
+    for k in range(future_actions.shape[1]):
+        with torch.no_grad():
+            f_ema, _ = ema_ref.force(q, p, h_emb, k, obs_state=obs_state)
+        u = policy.contact_control(q, p, h_emb, k, z_emb)
+        sigma = ref.sigma_like(q)
+        control_accel = sigma * u if ref.control_is_whitened else u
+        p_next = p + ref.dt * (f_ema.detach() + control_accel)
+        q_next = q + ref.dt * p_next
+        raw_pred = adapter.decode_step(q, q_next)
+        mse = mse + (future_actions[:, k] - raw_pred).pow(2).sum(dim=-1)
+        q, p = q_next, p_next
+    return mse / max(1, future_actions.shape[1])
+
+
 def contact_stopgrad_path_losses_conditioned(
     policy: ActionBridgePolicy,
     h_emb: torch.Tensor,
@@ -527,7 +561,7 @@ def contact_bridge_stopgrad_loss(
             z_emb = policy.latent.embed_ids(ids)
             per_z.append(contact_stopgrad_path_losses_conditioned(policy, h_emb, batch, z_emb, loss_config))
             if lambda_unroll > 0.0:
-                per_z_unroll.append(contact_unrolled_mse_conditioned(policy, h_emb, batch, z_emb))
+                per_z_unroll.append(contact_stopgrad_unrolled_mse_conditioned(policy, h_emb, batch, z_emb))
         weighted_keys = [
             ("nll", "nll"),
             ("path_kl", "path_kl"),
@@ -605,7 +639,7 @@ def contact_bridge_stopgrad_loss(
             z_emb = policy.latent.embed(z)
             metrics = _aggregate_contact_stopgrad(contact_stopgrad_path_losses_conditioned(policy, h_emb_z, batch_z, z_emb, loss_config))
             metrics["unroll_mse"] = (
-                contact_unrolled_mse_conditioned(policy, h_emb_z, batch_z, z_emb).mean()
+                contact_stopgrad_unrolled_mse_conditioned(policy, h_emb_z, batch_z, z_emb).mean()
                 if lambda_unroll > 0.0
                 else future_actions.new_zeros(())
             )
@@ -617,7 +651,9 @@ def contact_bridge_stopgrad_loss(
                 z_emb = policy.latent.embed(z)
                 totals.append(_aggregate_contact_stopgrad(contact_stopgrad_path_losses_conditioned(policy, h_emb, batch, z_emb, loss_config)))
                 if lambda_unroll > 0.0:
-                    unroll_total = unroll_total + contact_unrolled_mse_conditioned(policy, h_emb, batch, z_emb).mean()
+                    unroll_total = unroll_total + contact_stopgrad_unrolled_mse_conditioned(
+                        policy, h_emb, batch, z_emb
+                    ).mean()
             denom = float(n_samples)
             metrics = {}
             for key in totals[0]:
@@ -637,7 +673,7 @@ def contact_bridge_stopgrad_loss(
 
     metrics = _aggregate_contact_stopgrad(contact_stopgrad_path_losses_conditioned(policy, h_emb, batch, None, loss_config))
     metrics["unroll_mse"] = (
-        contact_unrolled_mse_conditioned(policy, h_emb, batch, None).mean()
+        contact_stopgrad_unrolled_mse_conditioned(policy, h_emb, batch, None).mean()
         if lambda_unroll > 0.0
         else future_actions.new_zeros(())
     )
