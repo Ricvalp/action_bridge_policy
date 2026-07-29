@@ -48,6 +48,7 @@ EXTRA_OVERRIDES=(
   "device=cuda"
   "data.dataset_path=${DATASET_PATH}"
   "data.backend=auto"
+  "inference.latent_commitment=chunk"
   "optim.max_steps=${MAX_STEPS}"
   "logging.wandb.enabled=true"
   "logging.wandb.project=${WANDB_PROJECT}"

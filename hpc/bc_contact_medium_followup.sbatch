@@ -30,6 +30,7 @@ COMMON_OVERRIDES=(
   "obs_dim=5"
   "data.dataset_path=${DATASET_PATH}"
   "data.backend=auto"
+  "inference.latent_commitment=chunk"
   "optim.batch_size=512"
   "optim.max_steps=300000"
   "logging.log_every_steps=100"

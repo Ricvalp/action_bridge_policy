@@ -47,6 +47,7 @@ uv run python -m action_bridge.training.train_pusht \
   obs_dim=5 \
   data.dataset_path="${DATASET_PATH}" \
   data.backend=auto \
+  inference.latent_commitment=chunk \
   model.hidden_dim=704 \
   model.h_emb_dim=704 \
   model.encoder_depth=3 \
