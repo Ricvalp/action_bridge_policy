@@ -44,6 +44,7 @@ FIGURE_FILES = [
     "pusht_sim_rewards.png",
     "pusht_sim_rollouts.png",
     "projected_demo_damped_continuation.png",
+    "projected_demo_passive_target.png",
     "receding_horizon_action_rollout.png",
     "wrong_side_go_around_lateral_summary.png",
     "wrong_side_go_around_latent_chunks.png",

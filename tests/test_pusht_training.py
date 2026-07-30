@@ -30,6 +30,8 @@ def test_pusht_npz_dataset_shapes(tmp_path):
     assert dataset.obs_dim == 6
     assert dataset.action_dim == 2
     assert item["obs_hist"].shape == (2, 6)
+    assert item["future_obs"].shape == (4, 6)
+    assert item["future_obs_raw"].shape == (4, 6)
     assert item["act_hist"].shape == (2, 2)
     assert item["future_actions"].shape == (4, 2)
 

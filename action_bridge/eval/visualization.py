@@ -186,7 +186,7 @@ def plot_generated_samples(
     plt.close(fig)
 
 
-def plot_projected_demo_damped_continuation(
+def plot_projected_demo_passive_target(
     batch: Dict[str, Any],
     path: Path,
     config: Dict[str, Any],
@@ -208,12 +208,23 @@ def plot_projected_demo_damped_continuation(
         dt=float(reference_cfg.get("dt", 1.0)),
         action_dim=action_dim,
     )
+    loss_cfg = config.get("loss", {})
+    target_type = str(loss_cfg.get("passive_target", "damped_continuation"))
     passive = passive_target_from_batch(
         adapter,
         batch,
-        target_type=str(config.get("loss", {}).get("passive_target", "damped_continuation")),
-        alpha_max=float(config.get("loss", {}).get("passive_alpha_max", 1.0)),
-        eps=float(config.get("loss", {}).get("passive_eps", 1e-8)),
+        target_type=target_type,
+        alpha_max=float(loss_cfg.get("passive_alpha_max", 1.0)),
+        ema_decay=float(loss_cfg.get("passive_ema_decay", 0.85)),
+        contact_lambda_parallel=float(loss_cfg.get("passive_contact_lambda_parallel", 0.8)),
+        contact_lambda_perp=float(loss_cfg.get("passive_contact_lambda_perp", 0.2)),
+        contact_distance=float(loss_cfg.get("passive_contact_distance", 18.0)),
+        contact_temperature=float(loss_cfg.get("passive_contact_temperature", 4.0)),
+        contact_boundary_samples_per_edge=int(
+            loss_cfg.get("passive_contact_boundary_samples_per_edge", 8)
+        ),
+        contact_goal_xy=tuple(loss_cfg.get("passive_contact_goal_xy", (256.0, 256.0))),
+        eps=float(loss_cfg.get("passive_eps", 1e-8)),
     )
 
     count = min(max_items, int(batch["future_actions"].shape[0]))
@@ -229,10 +240,20 @@ def plot_projected_demo_damped_continuation(
     obs_np = None
     if torch.is_tensor(obs_hist):
         obs_np = _maybe_denormalize_observations(obs_hist, config).detach().cpu().numpy()
-    alpha = passive["alpha"].detach().cpu().numpy()
+    coefficient = passive["projection_coefficient"].detach().cpu().numpy()
     residual = passive["residual_next_velocity"].detach().cpu()
     residual_norm = torch.linalg.norm(residual, dim=-1).mean(dim=-1).numpy()
     goal_pose = np.array([256.0, 256.0, math.pi / 4], dtype=np.float32)
+    coefficient_name = {
+        "damped_continuation": "alpha",
+        "ema_smoothed_velocity": "EMA decay",
+        "contact_direction": "contact score",
+    }.get(target_type, "coefficient")
+    target_title = {
+        "damped_continuation": "Damped-continuation",
+        "ema_smoothed_velocity": "EMA-smoothed velocity",
+        "contact_direction": "Contact-direction",
+    }.get(target_type, target_type)
 
     for flat_idx, ax in enumerate(axes.ravel()):
         if flat_idx >= count:
@@ -258,13 +279,27 @@ def plot_projected_demo_damped_continuation(
             ax.set_xlim(0, 512)
             ax.set_ylim(512, 0)
         ax.set_aspect("equal", adjustable="box")
-        ax.set_title(f"alpha {alpha[flat_idx].mean():.2f}, residual |p| {residual_norm[flat_idx]:.2f}")
+        ax.set_title(
+            f"{coefficient_name} {coefficient[flat_idx].mean():.2f}, "
+            f"residual |p| {residual_norm[flat_idx]:.2f}"
+        )
         if flat_idx == 0:
             ax.legend(fontsize=7, loc="upper right")
-    fig.suptitle("Damped-continuation passive target from demonstrations", y=0.995)
+    fig.suptitle(f"{target_title} passive target from demonstrations", y=0.995)
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     plt.close(fig)
+
+
+def plot_projected_demo_damped_continuation(
+    batch: Dict[str, Any],
+    path: Path,
+    config: Dict[str, Any],
+    max_items: int = 6,
+) -> None:
+    """Backward-compatible alias for the generic passive-target plot."""
+
+    plot_projected_demo_passive_target(batch, path, config, max_items=max_items)
 
 
 def plot_energy_histograms(values: Dict[str, torch.Tensor], path: Path) -> None:

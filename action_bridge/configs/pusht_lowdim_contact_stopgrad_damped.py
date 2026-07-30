@@ -8,6 +8,13 @@ def get_config():
     config.loss.contact_objective = "stopgrad_reference"
     config.loss.passive_target = "damped_continuation"
     config.loss.passive_alpha_max = 1.0
+    config.loss.passive_ema_decay = 0.85
+    config.loss.passive_contact_lambda_parallel = 0.8
+    config.loss.passive_contact_lambda_perp = 0.2
+    config.loss.passive_contact_distance = 18.0
+    config.loss.passive_contact_temperature = 4.0
+    config.loss.passive_contact_boundary_samples_per_edge = 8
+    config.loss.passive_contact_goal_xy = [256.0, 256.0]
     config.loss.passive_eps = 1e-8
     config.loss.lambda_ref = 0.5
     config.loss.lambda_ref_warmup_steps = 5000

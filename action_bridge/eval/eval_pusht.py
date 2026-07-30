@@ -17,7 +17,7 @@ from action_bridge.data.pusht_adapter import denormalize_actions_tensor, denorma
 from action_bridge.eval.metrics import action_smoothness, average_metric_dicts
 from action_bridge.eval.pusht_wrong_side import plot_wrong_side_go_around_diagnostic
 from action_bridge.eval.rollout import predict_actions
-from action_bridge.eval.visualization import plot_energy_histograms, plot_projected_demo_damped_continuation
+from action_bridge.eval.visualization import plot_energy_histograms, plot_projected_demo_passive_target
 from action_bridge.training.common import build_dataset, build_model, move_to_device, resolve_device, save_json
 
 
@@ -393,9 +393,9 @@ def evaluate_pusht_model(
             except Exception as exc:
                 summary["plot_action_chunk_2d_error"] = str(exc)
             try:
-                plot_projected_demo_damped_continuation(
+                plot_projected_demo_passive_target(
                     plot_batch,
-                    figures / "projected_demo_damped_continuation.png",
+                    figures / "projected_demo_passive_target.png",
                     config,
                 )
             except Exception as exc:

@@ -343,6 +343,7 @@ class PushTLowDimDataset(Dataset):
             obs_eps = obs_eps[: int(max_episodes)]
             action_eps = action_eps[: int(max_episodes)]
 
+        raw_obs_eps = [obs.float() for obs in obs_eps]
         initial_actions = [obs[0, : int(action_eps[0].shape[-1])].float() for obs in obs_eps]
 
         self.obs_history = int(obs_history)
@@ -362,6 +363,7 @@ class PushTLowDimDataset(Dataset):
             initial_actions = [(act.float() - tensors["action_mean"]) / tensors["action_std"] for act in initial_actions]
 
         self.observations = obs_eps
+        self.raw_observations = raw_obs_eps
         self.actions = action_eps
         self.initial_actions = initial_actions
         self.indices = _valid_indices(
@@ -395,6 +397,8 @@ class PushTLowDimDataset(Dataset):
         obs_start = t - self.obs_history + 1
         act_start = t - self.action_history
         obs_hist = _left_padded_slice(obs, obs_start, t + 1, obs[0])
+        future_obs = obs[t : t + self.chunk_horizon]
+        future_obs_raw = self.raw_observations[episode_id][t : t + self.chunk_horizon]
         initial_action = self.initial_actions[episode_id].to(dtype=actions.dtype)
         act_hist = _left_padded_slice(actions, act_start, t, initial_action)
         future_actions = actions[t : t + self.chunk_horizon]
@@ -405,6 +409,8 @@ class PushTLowDimDataset(Dataset):
         }
         return {
             "obs_hist": obs_hist.float(),
+            "future_obs": future_obs.float(),
+            "future_obs_raw": future_obs_raw.float(),
             "act_hist": act_hist.float(),
             "future_actions": future_actions.float(),
             "context": context,

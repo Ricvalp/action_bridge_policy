@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=bc_sg_ema_projection
+#SBATCH --partition=gpuq
+#SBATCH --gres=gpu:1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
+#SBATCH --time=30:00:00
+#SBATCH --output=hpc/logs/%x_%j.out
+#SBATCH --error=hpc/logs/%x_%j.err
+
+set -Eeuo pipefail
+
+PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:?Submit from the action_bridge_policy directory.}}"
+cd "${PROJECT_DIR}"
+test -d action_bridge || { echo "Expected action_bridge_policy; got ${PROJECT_DIR}" >&2; exit 2; }
+mkdir -p hpc/logs outputs/hpc_logs
+
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+export WANDB__SERVICE_WAIT="${WANDB__SERVICE_WAIT:-300}"
+export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
+export WANDB_HTTP_TIMEOUT="${WANDB_HTTP_TIMEOUT:-120}"
+export WANDB_CONSOLE="${WANDB_CONSOLE:-off}"
+
+SEED="${SEED:-0}"
+RUN_SUFFIX="${RUN_SUFFIX:-$(date +%Y%m%d_%H%M%S)}"
+DATASET_PATH="${PUSHT_DATASET_PATH:-data/pusht/pusht_cchi_v7_replay.zarr}"
+EMA_DECAY="${PASSIVE_EMA_DECAY:-0.85}"
+WANDB_PROJECT="${WANDB_PROJECT:-action-bridge-policy-bc-ablation}"
+WANDB_GROUP="${WANDB_GROUP:-contact_stopgrad_projection_diagnostics_seed${SEED}}"
+RUN_ID="bc_contact_stopgrad_ema_projection_z4_seed${SEED}_${RUN_SUFFIX}"
+
+uv run python -m action_bridge.training.train_pusht \
+  --config-name pusht_lowdim_contact_stopgrad_damped \
+  run_id="${RUN_ID}" \
+  seed="${SEED}" \
+  device=cuda \
+  obs_dim=5 \
+  data.dataset_path="${DATASET_PATH}" \
+  data.backend=auto \
+  inference.latent_commitment=chunk \
+  model.hidden_dim=704 \
+  model.h_emb_dim=704 \
+  model.encoder_depth=3 \
+  model.control_depth=4 \
+  model.time_emb_dim=64 \
+  model.z_embed_dim=128 \
+  model.z_dim=4 \
+  reference.hidden_dim=192 \
+  reference.time_emb_dim=64 \
+  loss.passive_target=ema_smoothed_velocity \
+  loss.passive_ema_decay="${EMA_DECAY}" \
+  loss.lambda_ref=0.5 \
+  loss.lambda_ref_warmup_steps=5000 \
+  loss.lambda_slow=0.01 \
+  loss.lambda_diss=0.0001 \
+  loss.ema_decay=0.995 \
+  loss.lambda_unroll=0.0 \
+  loss.lambda_unroll_warmup_steps=0 \
+  loss.beta_z_start=0.0 \
+  loss.beta_z_end=0.0003 \
+  loss.beta_z_warmup_steps=100000 \
+  loss.free_nats=0.0 \
+  loss.num_z_samples_train=4 \
+  loss.vectorize_z_samples_train=true \
+  optim.lr=0.0002 \
+  optim.batch_size=512 \
+  optim.max_steps=300000 \
+  optim.grad_clip=1.0 \
+  logging.log_every_steps=100 \
+  logging.eval_every_steps=1000 \
+  logging.checkpoint_every_steps=20000 \
+  logging.full_eval_every_steps=10000 \
+  logging.full_eval_split=val \
+  logging.full_eval_max_batches=4 \
+  logging.full_eval_closed_loop_episodes=64 \
+  logging.full_eval_num_samples=128 \
+  logging.sim_eval_enabled=true \
+  logging.sim_eval_async=true \
+  logging.sim_eval_device=cpu \
+  logging.sim_eval_num_workers=6 \
+  logging.sim_eval_worker_threads=1 \
+  logging.sim_eval_max_pending=2 \
+  logging.sim_eval_every_steps=5000 \
+  logging.sim_eval_episodes=100 \
+  logging.sim_eval_max_steps=500 \
+  logging.sim_eval_n_exec=8 \
+  logging.sim_eval_render_episodes=4 \
+  logging.sim_eval_save_gifs=true \
+  logging.sim_eval_collect_contact_diagnostics=true \
+  logging.sim_eval_keep_checkpoints=false \
+  logging.wandb.enabled=true \
+  logging.wandb.project="${WANDB_PROJECT}" \
+  logging.wandb.group="${WANDB_GROUP}" \
+  logging.wandb.log_images=false \
+  logging.wandb.tags="[\"stopgrad_reference\",\"projection_diagnostic\",\"ema_smoothed_velocity\",\"z4\"]" \
+  > "outputs/hpc_logs/${RUN_ID}.log" 2>&1

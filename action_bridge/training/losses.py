@@ -284,6 +284,15 @@ def contact_stopgrad_path_losses_conditioned(
         batch,
         target_type=str(loss_config.get("passive_target", "damped_continuation")),
         alpha_max=float(loss_config.get("passive_alpha_max", 1.0)),
+        ema_decay=float(loss_config.get("passive_ema_decay", 0.85)),
+        contact_lambda_parallel=float(loss_config.get("passive_contact_lambda_parallel", 0.8)),
+        contact_lambda_perp=float(loss_config.get("passive_contact_lambda_perp", 0.2)),
+        contact_distance=float(loss_config.get("passive_contact_distance", 18.0)),
+        contact_temperature=float(loss_config.get("passive_contact_temperature", 4.0)),
+        contact_boundary_samples_per_edge=int(
+            loss_config.get("passive_contact_boundary_samples_per_edge", 8)
+        ),
+        contact_goal_xy=tuple(loss_config.get("passive_contact_goal_xy", (256.0, 256.0))),
         eps=float(loss_config.get("passive_eps", 1e-8)),
     )
     q_seq = passive["q_seq"]
@@ -385,8 +394,12 @@ def contact_stopgrad_path_losses_conditioned(
         q_accel_energy = q_accel.pow(2).sum(dim=-1).mean()
     else:
         q_accel_energy = future_actions.new_zeros(())
-    alpha = passive["alpha"]
-    alpha_zero = (alpha <= float(loss_config.get("passive_eps", 1e-8))).to(future_actions.dtype)
+    projection_coefficient = passive["projection_coefficient"]
+    coefficient_zero = (
+        projection_coefficient <= float(loss_config.get("passive_eps", 1e-8))
+    ).to(future_actions.dtype)
+    contact_score = passive.get("contact_score")
+    contact_boundary_distance = passive.get("contact_boundary_distance")
     data_loss = loss_p + ref.lambda_q * loss_q
     return {
         "nll": data_loss,
@@ -409,10 +422,23 @@ def contact_stopgrad_path_losses_conditioned(
         "passive_target_mse": passive_target_mse / horizon,
         "passive_residual_mse": passive_residual_mse / horizon,
         "ema_reference_action_mse": ema_reference_mse / horizon,
-        "projection_alpha_mean": alpha.mean(),
-        "projection_alpha_min": alpha.min(),
-        "projection_alpha_max": alpha.max(),
-        "projection_alpha_zero_fraction": alpha_zero.mean(),
+        "projection_coefficient_mean": projection_coefficient.mean(),
+        "projection_coefficient_min": projection_coefficient.min(),
+        "projection_coefficient_max": projection_coefficient.max(),
+        "projection_coefficient_zero_fraction": coefficient_zero.mean(),
+        # Legacy aliases retained for damped-continuation dashboards.
+        "projection_alpha_mean": projection_coefficient.mean(),
+        "projection_alpha_min": projection_coefficient.min(),
+        "projection_alpha_max": projection_coefficient.max(),
+        "projection_alpha_zero_fraction": coefficient_zero.mean(),
+        "projection_contact_score_mean": (
+            contact_score.mean() if contact_score is not None else future_actions.new_zeros(())
+        ),
+        "projection_contact_boundary_distance_mean": (
+            contact_boundary_distance.mean()
+            if contact_boundary_distance is not None
+            else future_actions.new_zeros(())
+        ),
     }
 
 
@@ -450,6 +476,16 @@ def _contact_metric_template(policy: ActionBridgePolicy, value: torch.Tensor, me
         "projection_alpha_min": metrics.get("projection_alpha_min", zero),
         "projection_alpha_max": metrics.get("projection_alpha_max", zero),
         "projection_alpha_zero_fraction": metrics.get("projection_alpha_zero_fraction", zero),
+        "projection_coefficient_mean": metrics.get("projection_coefficient_mean", zero),
+        "projection_coefficient_min": metrics.get("projection_coefficient_min", zero),
+        "projection_coefficient_max": metrics.get("projection_coefficient_max", zero),
+        "projection_coefficient_zero_fraction": metrics.get(
+            "projection_coefficient_zero_fraction", zero
+        ),
+        "projection_contact_score_mean": metrics.get("projection_contact_score_mean", zero),
+        "projection_contact_boundary_distance_mean": metrics.get(
+            "projection_contact_boundary_distance_mean", zero
+        ),
     }
 
 
@@ -479,6 +515,14 @@ def _aggregate_contact_stopgrad(out: Dict[str, torch.Tensor]) -> Dict[str, torch
         "projection_alpha_min": out["projection_alpha_min"],
         "projection_alpha_max": out["projection_alpha_max"],
         "projection_alpha_zero_fraction": out["projection_alpha_zero_fraction"],
+        "projection_coefficient_mean": out["projection_coefficient_mean"],
+        "projection_coefficient_min": out["projection_coefficient_min"],
+        "projection_coefficient_max": out["projection_coefficient_max"],
+        "projection_coefficient_zero_fraction": out["projection_coefficient_zero_fraction"],
+        "projection_contact_score_mean": out["projection_contact_score_mean"],
+        "projection_contact_boundary_distance_mean": out[
+            "projection_contact_boundary_distance_mean"
+        ],
     }
 
 
@@ -601,6 +645,12 @@ def contact_bridge_stopgrad_loss(
                     "projection_alpha_min",
                     "projection_alpha_max",
                     "projection_alpha_zero_fraction",
+                    "projection_coefficient_mean",
+                    "projection_coefficient_min",
+                    "projection_coefficient_max",
+                    "projection_coefficient_zero_fraction",
+                    "projection_contact_score_mean",
+                    "projection_contact_boundary_distance_mean",
                 ]
             }
         )
