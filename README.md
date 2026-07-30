@@ -223,6 +223,18 @@ Implemented baselines include direct chunk BC, autoregressive BC without a refer
 
 Toy evaluation reports action MSE, goal error, path length, collision rate, minimum clearance, acceleration energy, jerk energy, path-KL energy, mode switch rate, hybrid rate, valid top/bottom rates for delayed data, cw/ccw rates for annular data, and an RBF-MMD over simple trajectory features. Closed-loop evaluation additionally reports success rate, clean success rate, receding-horizon chunk-boundary discontinuity, closed-loop collision/hybrid rates, and final goal error.
 
+## RLBench
+
+The RLBench data layer caches complete point-cloud demonstration episodes in
+HDF5 and builds standard state-conditioned imitation-learning windows at load
+time. Temporal histories, action horizons and strides, episode splits, point
+subsampling, and absolute versus `delta_xyz` actions can therefore change
+without recaching.
+
+See [RLBENCH_DATA.md](RLBENCH_DATA.md) for the raw-data contract, cache command,
+schema, and `RLBenchDataset` API. Point-cloud policy architectures and an
+RLBench training entrypoint are intentionally not connected yet.
+
 ## Push-T
 
 `action_bridge.data.pusht_adapter.PushTLowDimDataset` loads local low-dimensional offline Push-T data. Supported backends are:

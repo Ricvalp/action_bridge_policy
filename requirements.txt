@@ -1,4 +1,5 @@
 torch>=2.0
+h5py>=3.9
 numpy>=1.24
 ml-collections>=0.1.1
 matplotlib>=3.7

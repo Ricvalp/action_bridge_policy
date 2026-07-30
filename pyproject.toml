@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Research pilot for latent path-KL controlled action bridge policies."
 requires-python = ">=3.10"
 dependencies = [
+  "h5py>=3.9",
   "matplotlib>=3.7",
   "ml-collections>=0.1.1",
   "numpy>=1.24",

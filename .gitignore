@@ -13,3 +13,5 @@ logs/
 
 checkpoints/
 eval/
+rlbench/
+urdfs/
