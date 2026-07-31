@@ -6,6 +6,7 @@ import types
 import h5py
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 from action_bridge.data.rlbench_cache import (
     CACHE_SCHEMA_NAME,
@@ -16,6 +17,11 @@ from action_bridge.data.rlbench_cache_builder import convert_rlbench_dataset
 from action_bridge.data.rlbench_dataset import (
     RLBenchDataset,
     decode_action_chunk,
+)
+from action_bridge.eval.rlbench_visualization import (
+    episode_animation_figure,
+    training_batch_figure,
+    write_figure_html,
 )
 
 
@@ -199,3 +205,64 @@ def test_rlbench_dataset_can_be_serialized_for_dataloader_workers(tmp_path):
     restored = pickle_module.loads(pickle_module.dumps(dataset))
     restored_item = restored[0]
     assert restored_item["future_actions"].shape == (2, 8)
+
+
+def test_rlbench_visualizations_use_cached_episode_and_collated_batch(tmp_path):
+    cache_root = _build_fake_cache(tmp_path)
+    keys, _ = build_cache_keys(cache_root)
+    store = RLBenchCacheStore(keys, keep_open=True)
+    episode_figure = episode_animation_figure(
+        store,
+        0,
+        0,
+        frame_stride=2,
+        max_frames=3,
+        chunk_horizon=2,
+        point_count=4,
+    )
+    episode_path = write_figure_html(
+        episode_figure,
+        tmp_path / "episode.html",
+        embed_plotly=True,
+    )
+    assert len(episode_figure.frames) >= 3
+    assert episode_path.is_file()
+    assert "Plotly.newPlot" in episode_path.read_text(encoding="utf-8")
+    store.close()
+
+    dataset = RLBenchDataset(
+        str(cache_root),
+        split="all",
+        obs_history=2,
+        action_history=2,
+        chunk_horizon=2,
+        action_representation="absolute",
+        point_count=4,
+        include_rgb=True,
+        include_mask_id=True,
+    )
+    batch = next(iter(DataLoader(dataset, batch_size=2, shuffle=False)))
+    metadata = []
+    for window in dataset.indices[:2]:
+        key = dataset.keys[window.variation_index]
+        metadata.append(
+            {
+                "task": key.task,
+                "variation": key.variation,
+                "episode_id": window.episode_id,
+                "time_index": window.time_index,
+            }
+        )
+    batch_figure = training_batch_figure(
+        batch,
+        metadata,
+        action_representation="absolute",
+    )
+    batch_path = write_figure_html(
+        batch_figure,
+        tmp_path / "batch.html",
+        embed_plotly=True,
+    )
+    assert len(batch_figure.data) == 14
+    assert batch_path.is_file()
+    dataset.close()

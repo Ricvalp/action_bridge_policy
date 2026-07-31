@@ -170,3 +170,35 @@ lazily per process, so the dataset is safe with multiprocessing data loaders.
 For `action_representation="delta_xyz"`, only XYZ is differenced. Quaternion
 and gripper-open channels remain absolute. Use `decode_action_chunk()` to
 recover absolute targets.
+
+## Visualize Episodes And Training Batches
+
+Generate interactive 3D HTML views directly from the cache:
+
+```bash
+uv run --extra cpu python -m action_bridge.scripts.visualize_rlbench_data \
+  --cache-root data/rlbench_cache \
+  --tasks open_fridge stack_cups basketball_in_hoop \
+  --episodes-per-task 1 \
+  --obs-history 2 \
+  --action-history 2 \
+  --chunk-horizon 16 \
+  --action-representation absolute \
+  --batch-size 6 \
+  --num-batches 2
+```
+
+The command writes a timestamped directory under
+`outputs/rlbench_visualizations/` with:
+
+- animated episode views showing the RGB point cloud, full expert trajectory,
+  current gripper pose, orientation axes, and the next target action chunk;
+- batch views built from actual collated `DataLoader` output, including tensor
+  shapes and one 3D scene per sample;
+- `index.html` linking every generated view;
+- `visualization_config.json` recording the loader and display settings.
+
+Use `--action-representation delta_xyz` to inspect loader-time delta targets;
+the orange chunk is decoded back into world coordinates for display. HTML
+files use Plotly from a CDN by default. Add `--embed-plotly` for fully
+self-contained files.

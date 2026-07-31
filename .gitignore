@@ -11,7 +11,7 @@ outputs/
 *.DS_Store
 logs/
 
-checkpoints/
-eval/
-rlbench/
-urdfs/
+/checkpoints/
+/eval/
+/rlbench/
+/urdfs/

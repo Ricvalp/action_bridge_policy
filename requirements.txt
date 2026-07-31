@@ -1,6 +1,7 @@
 torch>=2.0
 h5py>=3.9
 numpy>=1.24
+plotly>=6.0
 ml-collections>=0.1.1
 matplotlib>=3.7
 tqdm>=4.66
