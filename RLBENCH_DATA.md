@@ -1,11 +1,11 @@
 # RLBench Data Layer
 
-This module provides RLBench caching and PyTorch data loading for standard
-state-conditioned imitation learning. It is independent of the ICIL project:
+This module provides RLBench caching plus NumPy and PyTorch data loading for
+standard state-conditioned imitation learning. It is independent of the ICIL project:
 `action_bridge_policy` neither imports from nor modifies `icil-jax-rlbench`.
 
-No point-cloud policy is connected yet. The data layer deliberately stops at
-producing model-ready histories and action chunks.
+The NumPy loader feeds the JAX point-cloud policies under `action_bridge/jax/`.
+The cache itself remains framework and training-objective agnostic.
 
 ## Design
 
@@ -170,6 +170,78 @@ lazily per process, so the dataset is safe with multiprocessing data loaders.
 For `action_representation="delta_xyz"`, only XYZ is differenced. Quaternion
 and gripper-open channels remain absolute. Use `decode_action_chunk()` to
 recover absolute targets.
+
+The framework-neutral loader has matching window semantics and returns NumPy
+arrays with flat metadata keys:
+
+```python
+import numpy as np
+
+from action_bridge.data.rlbench_numpy_dataset import NumpyRLBenchDataset
+
+dataset = NumpyRLBenchDataset(
+    "data/rlbench_cache",
+    split="train",
+    obs_history=2,
+    action_history=2,
+    chunk_horizon=16,
+    action_representation="absolute",
+    point_count=1024,
+)
+batch = dataset.sample_batch(32, np.random.default_rng(0), strategy="task_uniform")
+```
+
+## Train The JAX Policy
+
+Install one JAX environment:
+
+```bash
+# macOS or CPU node
+uv sync --extra jax-cpu
+
+# Linux H200 with a CUDA 13-capable NVIDIA driver
+uv sync --extra jax-cu13
+```
+
+Train the XYZ contact bridge:
+
+```bash
+uv run --extra jax-cu13 python -m action_bridge.jax.training.train_rlbench \
+  --config-name rlbench_jax_contact_bridge \
+  run_id=rlbench_contact_bridge_seed0 \
+  seed=0 \
+  logging.wandb.enabled=true \
+  logging.wandb.project=action-bridge-policy-rlbench
+```
+
+Train the parameter-matched frontend with direct chunk BC:
+
+```bash
+uv run --extra jax-cu13 python -m action_bridge.jax.training.train_rlbench \
+  --config-name rlbench_jax_direct_chunk_bc \
+  run_id=rlbench_direct_chunk_bc_seed0
+```
+
+Training saves `latest.pt`, periodic checkpoints, `best_val.pt`, scalar metrics,
+and local interactive 3D chunk diagnostics. It can fully resume model,
+optimizer, RNG, step, best validation loss, and optionally the same W&B run:
+
+```bash
+uv run --extra jax-cu13 python -m action_bridge.jax.training.train_rlbench \
+  --config-name rlbench_jax_contact_bridge \
+  checkpoint.resume_path=outputs/rlbench_contact_bridge_seed0/checkpoints/latest.pt \
+  optim.max_steps=500000
+```
+
+Evaluate cached validation windows from a checkpoint:
+
+```bash
+uv run --extra jax-cpu python -m action_bridge.jax.eval.eval_rlbench \
+  --checkpoint outputs/rlbench_contact_bridge_seed0/checkpoints/best_val.pt \
+  --split val \
+  --num-batches 32 \
+  --batch-size 64
+```
 
 ## Visualize Episodes And Training Batches
 

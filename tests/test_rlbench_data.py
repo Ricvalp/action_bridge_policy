@@ -18,6 +18,7 @@ from action_bridge.data.rlbench_dataset import (
     RLBenchDataset,
     decode_action_chunk,
 )
+from action_bridge.data.rlbench_numpy_dataset import NumpyRLBenchDataset
 from action_bridge.eval.rlbench_visualization import (
     episode_animation_figure,
     training_batch_figure,
@@ -205,6 +206,52 @@ def test_rlbench_dataset_can_be_serialized_for_dataloader_workers(tmp_path):
     restored = pickle_module.loads(pickle_module.dumps(dataset))
     restored_item = restored[0]
     assert restored_item["future_actions"].shape == (2, 8)
+
+
+def test_numpy_dataset_matches_pytorch_windows(tmp_path):
+    cache_root = _build_fake_cache(tmp_path)
+    kwargs = dict(
+        cache_root=str(cache_root),
+        split="all",
+        obs_history=2,
+        action_history=2,
+        chunk_horizon=2,
+        action_offset=1,
+        action_representation="absolute",
+        include_rgb=True,
+        include_mask_id=True,
+        point_count=3,
+        point_sampling_seed=17,
+    )
+    torch_dataset = RLBenchDataset(**kwargs)
+    numpy_dataset = NumpyRLBenchDataset(**kwargs)
+    assert [
+        (item.variation_index, item.episode_id, item.time_index)
+        for item in torch_dataset.indices
+    ] == [
+        (item.variation_index, item.episode_id, item.time_index)
+        for item in numpy_dataset.indices
+    ]
+    for index in (0, len(torch_dataset) // 2, len(torch_dataset) - 1):
+        torch_item = torch_dataset[index]
+        numpy_item = numpy_dataset[index]
+        for key in (
+            "obs_hist",
+            "point_cloud_hist",
+            "point_valid_hist",
+            "rgb_hist",
+            "mask_id_hist",
+            "act_hist",
+            "future_actions",
+            "obs_history_mask",
+            "action_history_mask",
+            "future_action_mask",
+        ):
+            assert np.allclose(torch_item[key].numpy(), numpy_item[key])
+        assert int(torch_item["context"]["task_id"]) == int(numpy_item["task_id"])
+        assert int(torch_item["context"]["time_index"]) == int(numpy_item["time_index"])
+    torch_dataset.close()
+    numpy_dataset.close()
 
 
 def test_rlbench_visualizations_use_cached_episode_and_collated_batch(tmp_path):

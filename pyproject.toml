@@ -20,6 +20,16 @@ cu118 = ["torch>=2.0"]
 cu126 = ["torch>=2.0"]
 cu128 = ["torch>=2.0"]
 cu130 = ["torch>=2.0"]
+jax-cpu = [
+  "flax>=0.10.0",
+  "jax>=0.4.35",
+  "optax>=0.2.4",
+]
+jax-cu13 = [
+  "flax>=0.10.0; python_version >= '3.11'",
+  "jax[cuda13]>=0.7.0; python_version >= '3.11'",
+  "optax>=0.2.4; python_version >= '3.11'",
+]
 pusht-sim = [
   "gym-pusht>=0.1.5",
   "pymunk<7",
@@ -34,6 +44,10 @@ conflicts = [
     { extra = "cu126" },
     { extra = "cu128" },
     { extra = "cu130" },
+  ],
+  [
+    { extra = "jax-cpu" },
+    { extra = "jax-cu13" },
   ],
 ]
 

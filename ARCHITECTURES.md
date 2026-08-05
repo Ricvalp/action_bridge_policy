@@ -259,6 +259,145 @@ Approximate parameter count with Push-T state observations (`obs_dim=5`):
 - Are the learned attractor `m`, stiffness `K`, and damping `gamma` doing useful work, or is the control residual overriding the reference?
 - Is the contact reference best expressed in absolute pusher target space, or should future variants use a more task-aware/object-centered coordinate?
 
+## 2. JAX RLBench XYZ Contact Action Bridge
+
+Query-only, state-conditioned RLBench policy. This is an independent JAX/Flax
+implementation under `action_bridge/jax/`; it does not import from the ICIL
+repository and contains no support demonstrations or meta-learning machinery.
+
+### Inputs And Outputs
+
+The cache supplies:
+
+- RGB point-cloud history: `[B, T_obs, N, 3]` XYZ and optional RGB;
+- low-dimensional gripper state history: `[B, T_obs, 8]`;
+- executed absolute action history: `[B, T_act, 8]`;
+- expert future chunk: `[B, H, 8]` during training only.
+
+An RLBench action is the absolute target
+`[x, y, z, qx, qy, qz, qw, gripper_open]`. The initial implementation uses
+Euclidean contact dynamics only for normalized XYZ. Quaternion and gripper
+channels use separate learned heads.
+
+### Query Frontend
+
+Implementation: `action_bridge/jax/models/rlbench_encoder.py`.
+
+Each point-cloud frame is tokenized by either:
+
+- `SupernodeFrameTokenizer`: deterministic center selection, soft spatial
+  assignment, weighted point-feature pooling, and self-attention; or
+- `PerceiverFrameTokenizer`: point/state tokens compressed by learned latents.
+
+The tokenizer is adapted from the tested JAX RLBench frontend, but only the
+query path is retained. Frame-position embeddings are added to visual tokens.
+Absolute action-history vectors are projected into tokens with their own
+position embeddings. Optional learned task and task-variation tokens are then
+concatenated. A Perceiver compressor produces a bounded context-token set.
+
+The decoder starts from `H` learned action-query vectors. Every layer applies
+self-attention among chunk steps and cross-attention from those queries to the
+context tokens. The output is a per-step context `c_k`. Thus chunk position is
+represented by the learned action query itself; a bare time embedding is not
+used as the cross-attention query.
+
+### Continuous Chunk Latent
+
+The bridge uses one latent for the complete chunk:
+
+$$
+p_\theta(z\mid h)=\mathcal{N}(\mu_p(h),\operatorname{diag}\sigma_p^2(h)),
+$$
+
+$$
+q_\phi(z\mid h,a_{1:H})=
+\mathcal{N}(\mu_q(h,a_{1:H}),\operatorname{diag}\sigma_q^2(h,a_{1:H})).
+$$
+
+Training samples from the posterior; deployment samples from the prior. The
+default latent dimension is four and the same sampled `z` conditions every
+step in the chunk.
+
+### XYZ Contact Reference And Control
+
+Raw XYZ is normalized with configured workspace center and scale. Initial
+position comes from the most recent executed absolute action. Initial momentum
+is the difference between the two most recent valid actions, divided by `dt`.
+
+For each action query `c_k`, the reference head predicts:
+
+- normalized attractor `m_k in [-1, 1]^3`;
+- positive diagonal stiffness `K_k in [k_min, k_max]^3`;
+- positive diagonal damping `gamma_k in [gamma_min, gamma_max]`.
+
+The passive reference force is
+
+$$
+f_R(q_k,p_k,c_k)=-K_k(q_k-m_k)-\gamma_k p_k.
+$$
+
+The residual-control MLP sees `(c_k, q_k, p_k, z)` and predicts whitened
+control `u_k in R^3`. The semi-implicit update is
+
+$$
+p_{k+1}=p_k+dt\,[f_R(q_k,p_k,c_k)+\sigma u_k],
+$$
+
+$$
+q_{k+1}=q_k+dt\,p_{k+1}.
+$$
+
+The reference is history/state conditioned through `c_k`; the control also
+receives the current rollout state and chunk latent directly.
+
+### Quaternion And Gripper Heads
+
+A shared auxiliary MLP receives `(c_k, q_{k+1}, p_{k+1}, z)` and emits four
+quaternion values plus a gripper logit. The quaternion is normalized and its
+sign is canonicalized relative to the current observed gripper quaternion.
+The gripper logit is trained with binary cross-entropy and converted with a
+sigmoid for execution.
+
+### Training Objective
+
+The contact model reports both teacher-forced one-step predictions and a free
+chunk rollout. The configurable objective combines:
+
+- normalized XYZ one-step error;
+- momentum/velocity error;
+- free-unroll XYZ error;
+- sign-invariant quaternion loss `1 - <q_hat, q>^2`;
+- gripper binary cross-entropy;
+- whitened path-control energy `0.5 ||u_k||^2`;
+- continuous-latent KL with warmup and free nats.
+
+Validation logs posterior reconstruction and prior-conditioned deployment
+metrics separately. Diagnostics plot the RGB point cloud, expert chunk, free
+rollout, teacher-forced prediction, and learned attractor path in 3D.
+
+### Direct Chunk Baseline
+
+`DirectChunkBCPolicy` uses the identical history encoder and learned
+action-query decoder. A feed-forward head directly predicts all eight action
+channels for each query. It therefore controls for the expensive point-cloud
+frontend while removing the latent, contact reference, and path-control loss.
+
+With the default 256-wide frontend, four decoder layers, 512-wide dynamics
+heads, 105 task IDs, and 393 task-variation IDs, the current implementations
+contain approximately 13.1M parameters for the contact bridge and 11.6M for
+direct chunk BC.
+
+### Entry Points
+
+- Contact bridge config: `rlbench_jax_contact_bridge`
+- Direct baseline config: `rlbench_jax_direct_chunk_bc`
+- Training: `python -m action_bridge.jax.training.train_rlbench`
+- Cached-window evaluation: `python -m action_bridge.jax.eval.eval_rlbench`
+
+JAX dependencies are optional: use `uv sync --extra jax-cpu` on macOS/CPU or
+`uv sync --extra jax-cu13` on a CUDA 13 H200 node. Online RLBench/PyRep
+closed-loop evaluation is not connected to this JAX policy yet.
+
 ## 2. Non-Contact Latent Action Bridge
 
 Earlier toy and Push-T bridge variant using an autoregressive reference over raw actions rather than contact-Langevin state.
