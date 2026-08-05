@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=2-00:00:00
+#SBATCH --time=10:00:00
 #SBATCH --output=hpc/logs/%x_%j.out
 #SBATCH --error=hpc/logs/%x_%j.err
 
@@ -28,7 +28,7 @@ export WANDB_CONSOLE="${WANDB_CONSOLE:-off}"
 SEED="${SEED:-0}"
 RUN_SUFFIX="${RUN_SUFFIX:-$(date +%Y%m%d_%H%M%S)}"
 CACHE_ROOT="${RLBENCH_CACHE_ROOT:-data/rlbench_cache}"
-BATCH_SIZE="${BATCH_SIZE:-256}"
+BATCH_SIZE="${BATCH_SIZE:-512}"
 MAX_STEPS="${MAX_STEPS:-300000}"
 WANDB_PROJECT="${WANDB_PROJECT:-action-bridge-policy-rlbench}"
 WANDB_GROUP="${WANDB_GROUP:-open_drawer_v0_contact_30m}"
