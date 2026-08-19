@@ -97,6 +97,10 @@ def get_config():
     config.optim.weight_decay = 0.000001
     config.optim.grad_clip = 1.0
 
+    config.distributed = ConfigDict()
+    # Zero uses every accelerator visible to this process. Batch size remains global.
+    config.distributed.num_devices = 0
+
     config.logging = ConfigDict()
     config.logging.log_every_steps = 100
     config.logging.val_every_steps = 2000
@@ -116,5 +120,5 @@ def get_config():
     config.checkpoint = ConfigDict()
     config.checkpoint.resume_path = None
     config.checkpoint.resume_wandb = True
+    config.checkpoint.save_best_val = True
     return config
-

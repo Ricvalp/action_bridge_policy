@@ -8,6 +8,7 @@ from pathlib import Path
 import time
 from typing import Any, Dict
 
+from flax import jax_utils
 from flax.training import train_state
 import jax
 import jax.numpy as jnp
@@ -76,11 +77,87 @@ def _to_device(batch: Dict[str, np.ndarray]) -> Dict[str, jax.Array]:
     return jax.tree_util.tree_map(lambda value: jax.device_put(np.asarray(value)), batch)
 
 
-def _create_steps(model, policy_config, loss_config, policy_type: str):
+def _training_devices(config) -> tuple[jax.Device, ...]:
+    available = tuple(jax.local_devices())
+    distributed = config.get("distributed", {})
+    requested = int(distributed.get("num_devices", 0))
+    if requested < 0:
+        raise ValueError("distributed.num_devices must be non-negative.")
+    count = len(available) if requested == 0 else requested
+    if count < 1:
+        raise RuntimeError("JAX did not expose any local devices.")
+    if count > len(available):
+        raise ValueError(
+            f"distributed.num_devices={count} exceeds the {len(available)} "
+            "devices visible to this process."
+        )
+    batch_size = int(config.optim.batch_size)
+    if batch_size % count:
+        raise ValueError(
+            f"optim.batch_size={batch_size} must be divisible by "
+            f"distributed.num_devices={count}."
+        )
+    return available[:count]
+
+
+def _shard_batch(
+    batch: Dict[str, np.ndarray], devices: tuple[jax.Device, ...]
+) -> Dict[str, np.ndarray]:
+    count = len(devices)
+
+    def shard(value):
+        array = np.asarray(value)
+        if array.ndim < 1 or array.shape[0] % count:
+            raise ValueError(
+                f"Cannot shard batch leaf with shape {array.shape} over {count} devices."
+            )
+        per_device = array.shape[0] // count
+        return array.reshape((count, per_device) + array.shape[1:])
+
+    return jax.tree_util.tree_map(shard, batch)
+
+
+def _merge_device_batch(tree: Any) -> Any:
+    def merge(value):
+        array = np.asarray(jax.device_get(value))
+        if array.ndim < 2:
+            return array
+        return array.reshape((-1,) + array.shape[2:])
+
+    return jax.tree_util.tree_map(merge, tree)
+
+
+def _metric_value(value: Any) -> float:
+    return float(np.mean(np.asarray(jax.device_get(value))))
+
+
+def _state_step(state: TrainState, replicated: bool) -> int:
+    step = jax_utils.unreplicate(state).step if replicated else state.step
+    return int(np.asarray(jax.device_get(step)))
+
+
+def _checkpoint_state(state: TrainState, replicated: bool) -> TrainState:
+    return jax_utils.unreplicate(state) if replicated else state
+
+
+def _create_steps(
+    model,
+    policy_config,
+    loss_config,
+    policy_type: str,
+    *,
+    devices: tuple[jax.Device, ...],
+):
     is_bridge = str(policy_type) == "action_bridge"
+    parallel = len(devices) > 1
+    axis_name = "devices"
 
     def train_step(state: TrainState, batch: Dict[str, jax.Array]):
         next_rng, latent_rng, dropout_rng = jax.random.split(state.rng, 3)
+        if parallel:
+            device_index = jax.lax.axis_index(axis_name)
+            latent_rng = jax.random.fold_in(latent_rng, device_index)
+            dropout_rng = jax.random.fold_in(dropout_rng, device_index)
 
         def loss_fn(params):
             if is_bridge:
@@ -109,6 +186,9 @@ def _create_steps(model, policy_config, loss_config, policy_type: str):
             return metrics["loss"], metrics
 
         (_, metrics), gradients = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        if parallel:
+            gradients = jax.lax.pmean(gradients, axis_name=axis_name)
+            metrics = jax.lax.pmean(metrics, axis_name=axis_name)
         metrics = {**metrics, "grad_norm": optax.global_norm(gradients)}
         state = state.apply_gradients(grads=gradients).replace(rng=next_rng)
         return state, metrics
@@ -145,18 +225,33 @@ def _create_steps(model, policy_config, loss_config, policy_type: str):
             )
             metrics = {f"posterior_{key}": value for key, value in posterior.items()}
             metrics.update({f"prior_{key}": value for key, value in prior.items()})
+            if parallel:
+                metrics = jax.lax.pmean(metrics, axis_name=axis_name)
             return metrics, prior_output
         output = model.apply({"params": params}, batch, train=False)
-        return direct_bc_loss(
+        metrics = direct_bc_loss(
             output, batch, loss_config, policy_config.bridge
-        ), output
+        )
+        if parallel:
+            metrics = jax.lax.pmean(metrics, axis_name=axis_name)
+        return metrics, output
 
+    if parallel:
+        return (
+            jax.pmap(train_step, axis_name=axis_name, devices=devices),
+            jax.pmap(
+                validation_step,
+                axis_name=axis_name,
+                in_axes=(0, 0, None),
+                devices=devices,
+            ),
+        )
     return jax.jit(train_step), jax.jit(validation_step)
 
 
 def _mean_metrics(metrics):
     return {
-        key: float(np.mean([np.asarray(jax.device_get(item[key])) for item in metrics]))
+        key: float(np.mean([_metric_value(item[key]) for item in metrics]))
         for key in metrics[0]
     }
 
@@ -189,16 +284,28 @@ def _log(payload: Dict[str, float], step: int, wandb_run) -> None:
         wandb_run.log(payload, step=int(step))
 
 
-def _validate(validation_step, params, source, batches: int, step: int):
+def _validate(
+    validation_step,
+    params,
+    source,
+    batches: int,
+    step: int,
+    devices: tuple[jax.Device, ...],
+):
+    parallel = len(devices) > 1
     all_metrics = []
     last_batch = None
     last_output = None
     for _ in range(int(batches)):
-        last_batch = _to_device(source())
+        host_batch = source()
+        last_batch = _shard_batch(host_batch, devices) if parallel else _to_device(host_batch)
         metrics, last_output = validation_step(
             params, last_batch, jnp.asarray(step, dtype=jnp.int32)
         )
         all_metrics.append(metrics)
+    if parallel:
+        last_batch = _merge_device_batch(last_batch)
+        last_output = _merge_device_batch(last_output)
     return _mean_metrics(all_metrics), last_batch, last_output
 
 
@@ -215,6 +322,8 @@ def train(config) -> Path:
 
     train_dataset = _build_dataset(config, "train")
     validation_dataset = _build_dataset(config, "val")
+    devices = _training_devices(config)
+    parallel = len(devices) > 1
     model, policy_config = _build_model(config, train_dataset)
     loss_config = loss_config_from_config(config)
     initialization_source = BatchSource(
@@ -271,13 +380,21 @@ def train(config) -> Path:
     wandb_run = _init_wandb(config, resume_payload)
     if wandb_run is not None:
         wandb_run.config.update(
-            {"model_parameter_count": _parameter_count(state.params)}, allow_val_change=True
+            {
+                "model_parameter_count": _parameter_count(state.params),
+                "runtime_device_count": len(devices),
+                "runtime_per_device_batch_size": int(config.optim.batch_size) // len(devices),
+            },
+            allow_val_change=True,
         )
     print(
         json.dumps(
             {
                 "run_dir": str(run_dir),
-                "jax_devices": [str(device) for device in jax.devices()],
+                "jax_visible_devices": [str(device) for device in jax.local_devices()],
+                "training_devices": [str(device) for device in devices],
+                "global_batch_size": int(config.optim.batch_size),
+                "per_device_batch_size": int(config.optim.batch_size) // len(devices),
                 "parameters": _parameter_count(state.params),
                 "train_windows": len(train_dataset),
                 "val_windows": len(validation_dataset),
@@ -313,13 +430,20 @@ def train(config) -> Path:
         seed=int(config.seed) + 99173,
     )
     train_step, validation_step = _create_steps(
-        model, policy_config, loss_config, str(config.policy_type)
+        model,
+        policy_config,
+        loss_config,
+        str(config.policy_type),
+        devices=devices,
     )
-    start_step = int(jax.device_get(state.step))
+    if parallel:
+        state = jax_utils.replicate(state, devices=devices)
+    start_step = _state_step(state, parallel)
     start_time = time.monotonic()
     try:
         for target_step in range(start_step + 1, int(config.optim.max_steps) + 1):
-            batch = _to_device(prefetcher.get())
+            host_batch = prefetcher.get()
+            batch = _shard_batch(host_batch, devices) if parallel else _to_device(host_batch)
             state, metrics = train_step(state, batch)
             if target_step == start_step + 1:
                 jax.block_until_ready(state.params)
@@ -327,10 +451,13 @@ def train(config) -> Path:
             if target_step % int(config.logging.log_every_steps) == 0 or target_step == 1:
                 elapsed = max(time.monotonic() - start_time, 1e-6)
                 train_metrics = {
-                    f"train/{key}": float(np.asarray(jax.device_get(value)))
+                    f"train/{key}": _metric_value(value)
                     for key, value in metrics.items()
                 }
                 train_metrics["train/steps_per_second"] = (target_step - start_step) / elapsed
+                train_metrics["train/examples_per_second"] = (
+                    (target_step - start_step) * int(config.optim.batch_size) / elapsed
+                )
                 train_metrics["data/prefetch_queue_size"] = float(prefetcher.qsize())
                 _log(train_metrics, target_step, wandb_run)
 
@@ -342,6 +469,7 @@ def train(config) -> Path:
                     validation_source,
                     int(config.logging.val_batches),
                     target_step,
+                    devices,
                 )
                 val_metrics = {f"val/{key}": value for key, value in val_metrics.items()}
                 _log(val_metrics, target_step, wandb_run)
@@ -352,13 +480,14 @@ def train(config) -> Path:
                 )
                 if val_metrics[val_loss_key] < best_val_loss:
                     best_val_loss = val_metrics[val_loss_key]
-                    save_checkpoint(
-                        checkpoint_dir / "best_val.pt",
-                        state=state,
-                        config=config,
-                        best_val_loss=best_val_loss,
-                        wandb_run_id=None if wandb_run is None else wandb_run.id,
-                    )
+                    if bool(config.checkpoint.get("save_best_val", True)):
+                        save_checkpoint(
+                            checkpoint_dir / "best_val.pt",
+                            state=_checkpoint_state(state, parallel),
+                            config=config,
+                            best_val_loss=best_val_loss,
+                            wandb_run_id=None if wandb_run is None else wandb_run.id,
+                        )
 
                 if target_step % int(config.logging.artifact_every_steps) == 0:
                     host_batch = jax.device_get(artifact_batch)
@@ -377,23 +506,24 @@ def train(config) -> Path:
                         wandb_run.log({"val/predicted_chunks": figure}, step=target_step)
 
             if target_step % int(config.logging.checkpoint_every_steps) == 0:
+                checkpoint_state = _checkpoint_state(state, parallel)
                 save_checkpoint(
                     checkpoint_dir / f"step_{target_step:07d}.pt",
-                    state=state,
+                    state=checkpoint_state,
                     config=config,
                     best_val_loss=best_val_loss,
                     wandb_run_id=None if wandb_run is None else wandb_run.id,
                 )
                 save_checkpoint(
                     checkpoint_dir / "latest.pt",
-                    state=state,
+                    state=checkpoint_state,
                     config=config,
                     best_val_loss=best_val_loss,
                     wandb_run_id=None if wandb_run is None else wandb_run.id,
                 )
         save_checkpoint(
             checkpoint_dir / "latest.pt",
-            state=state,
+            state=_checkpoint_state(state, parallel),
             config=config,
             best_val_loss=best_val_loss,
             wandb_run_id=None if wandb_run is None else wandb_run.id,
