@@ -4,7 +4,14 @@ This sandbox implements a toy-first research pilot for action chunks as stochast
 
 ## Install
 
-From this directory:
+This branch supports Python 3.11 and 3.12. RLBench-neutral Action Bridge code
+and RLBench training currently share that project-level requirement because
+`phi-rlbench` itself is restricted to `>=3.11,<3.13`.
+
+The current dependency source is an editable development checkout at
+`workspace/phi-rlbench`. That directory is ignored by this repository and is
+not present in a fresh clone, so the checked-in source setting is suitable only
+for local co-development. With that directory present, run from this directory:
 
 ```bash
 uv sync --extra cpu --extra test
@@ -25,6 +32,21 @@ uv sync --extra cu130 --extra test --locked
 
 Only one of `cpu`, `cu118`, `cu126`, `cu128`, or `cu130` should be enabled in a given environment. Use `uv lock` locally after dependency changes, then use `uv sync --locked` on experiment machines so they do not rewrite `uv.lock`.
 
+Do not deploy the editable `workspace/phi-rlbench` source to an HPC clone. Once
+`phi-rlbench` has its own private or appropriately licensed remote, replace the
+editable source with an immutable full Git commit, regenerate `uv.lock`, and
+commit both files. For example, after substituting the real organization and
+40-character revision:
+
+```toml
+[tool.uv.sources]
+phi-rlbench = { git = "ssh://git@github.com/<PHI-ORG>/phi-rlbench.git", rev = "<FULL-COMMIT>" }
+```
+
+Shared jobs should then use `uv sync --locked` and record the Action Bridge
+commit, the `phi-rlbench` commit, and the lockfile digest. A moving branch or an
+uncommitted local path is not a reproducible HPC dependency.
+
 If uv is unavailable, create a virtualenv and install dependencies manually. For PyTorch, use the install command appropriate for the target machine from the PyTorch selector.
 
 ```bash
@@ -32,6 +54,9 @@ python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+The `requirements.txt` fallback does not reproduce the editable `phi-rlbench`
+source or the locked RLBench environment; use `uv` for RLBench work.
 
 ## Toy Data
 
@@ -225,15 +250,36 @@ Toy evaluation reports action MSE, goal error, path length, collision rate, mini
 
 ## RLBench
 
-The RLBench data layer caches complete point-cloud demonstration episodes in
-HDF5 and builds standard state-conditioned imitation-learning windows at load
-time. Temporal histories, action horizons and strides, episode splits, point
-subsampling, and absolute versus `delta_xyz` actions can therefore change
-without recaching.
+RLBench support is now split across two repositories with one-way ownership:
 
-See [RLBENCH_DATA.md](RLBENCH_DATA.md) for the raw-data contract, cache command,
-schema, and `RLBenchDataset` API. Point-cloud policy architectures and an
-RLBench training entrypoint are intentionally not connected yet.
+- `phi-rlbench` owns the immutable HDF5 schema, whole-root cache builder,
+  read-only cache access, NumPy/PyTorch windows, preprocessing, simulator
+  runtime, and framework-neutral evaluation loop;
+- this repository owns the JAX policies, losses, training loop, checkpoint
+  format/loading, offline checkpoint evaluation, and the policy-specific
+  adapter used by online evaluation.
+
+The JAX trainer is connected to the `phi-rlbench` NumPy loader. Existing HDF5
+v1 caches remain readable without rewriting, and temporal histories, horizons,
+splits, point subsampling, and action representation remain loader-time
+choices. The deprecated `action_bridge.data.rlbench_*` imports are temporary
+compatibility shims; new code should import data APIs directly from
+`phi_rlbench`.
+
+`phi-rlbench` can build a new cache from an existing raw demonstration tree,
+but persistent RLBench demonstration collection is not implemented yet. Cache
+construction is an immutable whole-new-root operation: it never appends to or
+overwrites an existing cache destination.
+
+The policy-owned online command now exists at
+`python -m action_bridge.jax.eval.rlbench_online`. It has passed pure metadata,
+adapter, and cached-input tests, but no learned GUI or headless CoppeliaSim
+episode has been run successfully on this workstation. It must not yet be
+treated as native-simulator acceptance.
+
+See [RLBENCH_DATA.md](RLBENCH_DATA.md) for the raw-data contract, cache and
+loader commands, offline JAX training, dependency pinning, and the provisional
+online-evaluation procedure.
 
 ## Push-T
 
