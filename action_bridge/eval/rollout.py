@@ -28,7 +28,7 @@ def generate_chunk(
         z, z_emb = policy.sample_prior_z(
             h_emb,
             mode=mode,
-            deterministic_continuous=False,
+            deterministic_continuous=deterministic,
             z_prev=z,
             sticky=sticky,
             kappa=kappa,

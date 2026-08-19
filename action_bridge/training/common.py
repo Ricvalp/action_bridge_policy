@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable
 from ml_collections import ConfigDict
 import numpy as np
 import torch
+from torch.utils.data import default_collate
 
 from action_bridge.config import to_config_dict, to_plain_dict
 from action_bridge.data.pusht_adapter import PushTLowDimDataset
@@ -43,6 +44,23 @@ def move_to_device(value: Any, device: torch.device) -> Any:
     if isinstance(value, list):
         return [move_to_device(v, device) for v in value]
     return value
+
+
+def writable_numpy_collate(batch):
+    """Copy immutable backend arrays before PyTorch tensor collation."""
+
+    def copy_arrays(value):
+        if isinstance(value, np.ndarray):
+            return np.array(value, copy=True)
+        if isinstance(value, dict):
+            return {key: copy_arrays(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(copy_arrays(item) for item in value)
+        if isinstance(value, list):
+            return [copy_arrays(item) for item in value]
+        return value
+
+    return default_collate([copy_arrays(item) for item in batch])
 
 
 def slice_batch(batch: Dict[str, Any], item_slice) -> Dict[str, Any]:
@@ -90,6 +108,44 @@ def build_dataset(config: Dict, split: str):
             normalization_stats=data_cfg.get("normalization_stats"),
             normalization_eps=float(data_cfg.get("normalization_eps", 1e-6)),
             pad_episode_starts=bool(data_cfg.get("pad_episode_starts", False)),
+        )
+    if benchmark == "mujoco_planar_reach":
+        from phi_mujoco.windows import (
+            PlanarReachWindowDataset,
+            SplitConfig,
+            WindowConfig,
+        )
+
+        collection_root = data_cfg.get("collection_root")
+        if not collection_root:
+            raise ValueError(
+                "MuJoCo demonstrations are not configured. Set data.collection_root "
+                "to a completed phi-mujoco collection bundle."
+            )
+        if data_cfg.get("max_episodes") is not None:
+            raise ValueError(
+                "data.max_episodes is not supported for immutable MuJoCo split identity; "
+                "collect a smaller explicit bundle instead."
+            )
+        if not bool(data_cfg.get("pad_episode_starts", True)):
+            raise ValueError("MuJoCo v1 windows require pad_episode_starts=true")
+        return PlanarReachWindowDataset(
+            collection_root,
+            split=split,
+            window_config=WindowConfig(
+                observation_history=int(config.get("obs_history", 2)),
+                action_history=int(config.get("action_history", 2)),
+                prediction_horizon=int(config.get("chunk_horizon", 16)),
+            ),
+            split_config=SplitConfig(
+                train_fraction=float(data_cfg.get("train_fraction", 0.8)),
+                val_fraction=float(data_cfg.get("val_fraction", 0.1)),
+                seed=int(data_cfg.get("split_seed", 0)),
+            ),
+            successful_only=bool(data_cfg.get("successful_only", True)),
+            normalize=bool(data_cfg.get("normalize", True)),
+            normalization=to_plain_dict(data_cfg.get("normalization")),
+            normalization_eps=float(data_cfg.get("normalization_eps", 1e-6)),
         )
     raise ValueError(f"Unsupported benchmark {benchmark!r} for train_toy.")
 

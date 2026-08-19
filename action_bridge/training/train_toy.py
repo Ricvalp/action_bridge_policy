@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -52,21 +53,24 @@ FIGURE_FILES = [
 
 
 def save_checkpoint(path: Path, model, optimizer, config, step: int, best_metric: float) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     plain_config = to_plain_dict(config)
     wandb_cfg = plain_config.get("logging", {}).get("wandb", {})
     wandb_run_id = wandb_cfg.get("id") if isinstance(wandb_cfg, dict) else None
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "config": plain_config,
-            "step": step,
-            "best_metric": best_metric,
-            "wandb_run_id": wandb_run_id,
-        },
-        path,
-    )
+    payload = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "config": plain_config,
+        "step": step,
+        "best_metric": best_metric,
+        "wandb_run_id": wandb_run_id,
+    }
+    online_evaluation = plain_config.get("online_evaluation")
+    if online_evaluation is not None:
+        if not isinstance(online_evaluation, Mapping):
+            raise TypeError("config.online_evaluation must be a mapping when present.")
+        payload["online_evaluation"] = dict(online_evaluation)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
 
 
 @torch.no_grad()

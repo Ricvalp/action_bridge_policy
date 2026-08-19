@@ -8,10 +8,11 @@ This branch supports Python 3.11 and 3.12. RLBench-neutral Action Bridge code
 and RLBench training currently share that project-level requirement because
 `phi-rlbench` itself is restricted to `>=3.11,<3.13`.
 
-The current dependency source is an editable development checkout at
-`workspace/phi-rlbench`. That directory is ignored by this repository and is
-not present in a fresh clone, so the checked-in source setting is suitable only
-for local co-development. With that directory present, run from this directory:
+The current simulator dependency sources are editable development checkouts at
+`workspace/phi-rlbench` and `workspace/phi-mujoco`. Those directories are
+ignored by this repository and are not present in a fresh clone, so the
+checked-in source settings are suitable only for local co-development. With
+both directories present, run from this directory:
 
 ```bash
 uv sync --extra cpu --extra test
@@ -32,19 +33,20 @@ uv sync --extra cu130 --extra test --locked
 
 Only one of `cpu`, `cu118`, `cu126`, `cu128`, or `cu130` should be enabled in a given environment. Use `uv lock` locally after dependency changes, then use `uv sync --locked` on experiment machines so they do not rewrite `uv.lock`.
 
-Do not deploy the editable `workspace/phi-rlbench` source to an HPC clone. Once
-`phi-rlbench` has its own private or appropriately licensed remote, replace the
-editable source with an immutable full Git commit, regenerate `uv.lock`, and
-commit both files. For example, after substituting the real organization and
-40-character revision:
+Do not deploy either editable workspace source as an unversioned copy on an HPC
+clone. Once each backend has its own private or appropriately licensed remote,
+replace its editable source with an immutable full Git commit, regenerate
+`uv.lock`, and commit both files. For example, after substituting the real
+organization and 40-character revision:
 
 ```toml
 [tool.uv.sources]
 phi-rlbench = { git = "ssh://git@github.com/<PHI-ORG>/phi-rlbench.git", rev = "<FULL-COMMIT>" }
+phi-mujoco = { git = "ssh://git@github.com/<PHI-ORG>/phi-mujoco.git", rev = "<FULL-COMMIT>" }
 ```
 
 Shared jobs should then use `uv sync --locked` and record the Action Bridge
-commit, the `phi-rlbench` commit, and the lockfile digest. A moving branch or an
+commit, both backend commits, and the lockfile digest. A moving branch or an
 uncommitted local path is not a reproducible HPC dependency.
 
 If uv is unavailable, create a virtualenv and install dependencies manually. For PyTorch, use the install command appropriate for the target machine from the PyTorch selector.
@@ -55,8 +57,8 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-The `requirements.txt` fallback does not reproduce the editable `phi-rlbench`
-source or the locked RLBench environment; use `uv` for RLBench work.
+The `requirements.txt` fallback does not reproduce either editable simulator
+source or their locked environments; use `uv` for simulator work.
 
 ## Toy Data
 
@@ -247,6 +249,24 @@ Implemented baselines include direct chunk BC, autoregressive BC without a refer
 ## Metrics
 
 Toy evaluation reports action MSE, goal error, path length, collision rate, minimum clearance, acceleration energy, jerk energy, path-KL energy, mode switch rate, hybrid rate, valid top/bottom rates for delayed data, cw/ccw rates for annular data, and an RBF-MMD over simple trajectory features. Closed-loop evaluation additionally reports success rate, clean success rate, receding-horizon chunk-boundary discontinuity, closed-loop collision/hybrid rates, and final goal error.
+
+## MuJoCo
+
+The `phi-mujoco` integration provides immutable scripted demonstration
+collections, deterministic low-dimensional windows, a dedicated Torch trainer,
+checkpoint metadata, and native closed-loop evaluation. The default planar
+reach horizon is four actions and online evaluation replans after every action.
+
+Available experiment configs are:
+
+- `mujoco_planar_reach_direct_chunk_bc`;
+- `mujoco_planar_reach_no_latent` for the bridge/reference controller without
+  a latent bottleneck;
+- `mujoco_planar_reach_continuous` for the continuous-latent experiment.
+
+See [MUJOCO.md](MUJOCO.md) for exact collection, validation, training, trusted
+checkpoint evaluation, and HPC commands. The current analytic-PD task is a
+pipeline benchmark; it is not yet a multimodal demonstration benchmark.
 
 ## RLBench
 
