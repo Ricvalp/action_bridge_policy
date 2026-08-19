@@ -8,11 +8,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import plotly.graph_objects as go
+from phi_rlbench.data.actions import decode_action_chunk
+from phi_rlbench.data.cache import RLBenchCacheStore
 from plotly.subplots import make_subplots
-
-from action_bridge.data.rlbench_cache import RLBenchCacheStore
-from action_bridge.data.rlbench_dataset import decode_action_chunk
-
 
 _AXIS_COLORS = ("#ef4444", "#22c55e", "#3b82f6")
 
@@ -561,4 +559,3 @@ def write_figure_html(
         auto_play=False,
     )
     return path
-

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from action_bridge.data.rlbench_cache_builder import (
+from phi_rlbench.data.builder import (
     DEFAULT_LOW_DIM_FIELDS,
     DEFAULT_WORKSPACE_BOUNDS,
     convert_rlbench_dataset,

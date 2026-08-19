@@ -3,28 +3,26 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
 import json
-from pathlib import Path
 import time
+from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List, Sequence
 
 import numpy as np
-from torch.utils.data import DataLoader, Subset
-
-from action_bridge.data.rlbench_cache import (
+from phi_rlbench.data.cache import (
     RLBenchCacheStore,
-    build_cache_keys,
     build_variation_keys,
     discover_tasks,
 )
-from action_bridge.data.rlbench_dataset import RLBenchDataset
+from phi_rlbench.data.torch_dataset import RLBenchDataset
+from torch.utils.data import DataLoader, Subset
+
 from action_bridge.eval.rlbench_visualization import (
     episode_animation_figure,
     training_batch_figure,
     write_figure_html,
 )
-
 
 _PREFERRED_TASKS = (
     "open_fridge",

@@ -8,9 +8,9 @@ from importlib import import_module
 __all__ = [
     "AnnularObstacleDataset",
     "DelayedBranchObstacleDataset",
+    "NumpyRLBenchDataset",
     "RLBenchCacheStore",
     "RLBenchDataset",
-    "NumpyRLBenchDataset",
 ]
 
 
@@ -20,10 +20,10 @@ _EXPORTS = {
         "action_bridge.data.toy_obstacle",
         "DelayedBranchObstacleDataset",
     ),
-    "RLBenchCacheStore": ("action_bridge.data.rlbench_cache", "RLBenchCacheStore"),
-    "RLBenchDataset": ("action_bridge.data.rlbench_dataset", "RLBenchDataset"),
+    "RLBenchCacheStore": ("phi_rlbench.data.cache", "RLBenchCacheStore"),
+    "RLBenchDataset": ("phi_rlbench.data.torch_dataset", "RLBenchDataset"),
     "NumpyRLBenchDataset": (
-        "action_bridge.data.rlbench_numpy_dataset",
+        "phi_rlbench.data.numpy_dataset",
         "NumpyRLBenchDataset",
     ),
 }

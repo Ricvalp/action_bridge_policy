@@ -9,8 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict
 
 import numpy as np
-
-from action_bridge.data.rlbench_numpy_dataset import NumpyRLBenchDataset
+from phi_rlbench.data.numpy_dataset import NumpyRLBenchDataset
 
 
 def dataset_kwargs(config, split: str) -> Dict[str, Any]:
@@ -41,6 +40,7 @@ def dataset_kwargs(config, split: str) -> Dict[str, Any]:
         "max_episodes_per_variation": data.max_episodes_per_variation,
         "keep_h5_open": True,
         "preload_to_memory": bool(data.preload_to_memory),
+        "validation_mode": str(data.get("cache_validation_mode", "legacy")),
     }
 
 

@@ -1,24 +1,22 @@
-from pathlib import Path
 import json
 import pickle
 import types
+from pathlib import Path
 
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-
-from action_bridge.data.rlbench_cache import (
-    CACHE_SCHEMA_NAME,
+from phi_rlbench.data.actions import decode_action_chunk
+from phi_rlbench.data.builder import convert_rlbench_dataset
+from phi_rlbench.data.cache import (
     RLBenchCacheStore,
     build_cache_keys,
 )
-from action_bridge.data.rlbench_cache_builder import convert_rlbench_dataset
-from action_bridge.data.rlbench_dataset import (
-    RLBenchDataset,
-    decode_action_chunk,
-)
-from action_bridge.data.rlbench_numpy_dataset import NumpyRLBenchDataset
+from phi_rlbench.data.numpy_dataset import NumpyRLBenchDataset
+from phi_rlbench.data.schema import CACHE_SCHEMA_NAME
+from phi_rlbench.data.torch_dataset import RLBenchDataset
+from torch.utils.data import DataLoader
+
 from action_bridge.eval.rlbench_visualization import (
     episode_animation_figure,
     training_batch_figure,
