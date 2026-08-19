@@ -31,7 +31,11 @@ BATCH_SIZE="${BATCH_SIZE:-512}"
 MAX_STEPS="${MAX_STEPS:-200000}"
 WANDB_PROJECT="${WANDB_PROJECT:-action-bridge-policy-rlbench}"
 WANDB_GROUP="${WANDB_GROUP:-full_allvars_large_comparison}"
-RUN_ID="rlbench_full_contact_scene_only_370m_seed${SEED}_${RUN_SUFFIX}"
+UNROLL_WEIGHT="${UNROLL_WEIGHT:-0.1}"
+UNROLL_TAG="${UNROLL_TAG:-unroll_0p1}"
+RUN_VARIANT="${RUN_VARIANT:-}"
+RUN_VARIANT_SUFFIX="${RUN_VARIANT:+_${RUN_VARIANT}}"
+RUN_ID="rlbench_full_contact_scene_only_370m${RUN_VARIANT_SUFFIX}_seed${SEED}_${RUN_SUFFIX}"
 
 echo "Run: ${RUN_ID}"
 echo "Dataset: all cached tasks and variations under ${CACHE_ROOT}"
@@ -66,6 +70,7 @@ uv run --extra jax-cu13 python -m action_bridge.jax.training.train_rlbench \
   bridge.auxiliary_depth=3 \
   bridge.z_dim=16 \
   bridge.z_embed_dim=256 \
+  loss.unroll_weight="${UNROLL_WEIGHT}" \
   distributed.num_devices=2 \
   optim.batch_size="${BATCH_SIZE}" \
   optim.max_steps="${MAX_STEPS}" \
@@ -80,5 +85,5 @@ uv run --extra jax-cu13 python -m action_bridge.jax.training.train_rlbench \
   logging.wandb.project="${WANDB_PROJECT}" \
   logging.wandb.group="${WANDB_GROUP}" \
   logging.wandb.log_plotly=false \
-  logging.wandb.tags='["rlbench","full_dataset","all_variations","contact_bridge","supernode","scene_only","370m","h200","2gpu"]' \
+  logging.wandb.tags="[\"rlbench\",\"full_dataset\",\"all_variations\",\"contact_bridge\",\"supernode\",\"scene_only\",\"370m\",\"h200\",\"2gpu\",\"${UNROLL_TAG}\"]" \
   checkpoint.save_best_val=false
