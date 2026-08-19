@@ -47,8 +47,8 @@ uv run --extra jax-cu13 python -m action_bridge.jax.training.train_rlbench \
   data.variation_ids='[]' \
   data.sampling_strategy=task_uniform \
   data.point_count=1024 \
-  data.preload_to_memory=false \
-  data.prefetch_workers=4 \
+  data.preload_to_memory=true \
+  data.prefetch_workers=2 \
   data.prefetch_batches=4 \
   encoder.type=supernode \
   encoder.d_model=1024 \
