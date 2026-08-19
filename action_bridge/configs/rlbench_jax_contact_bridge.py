@@ -33,6 +33,9 @@ def get_config():
     config.data.point_sampling = "random"
     config.data.sampling_strategy = "task_uniform"
     config.data.max_episodes_per_variation = None
+    # Preserve the original Action Bridge reader's tolerance while migrating
+    # existing v1 caches. New cache acceptance can opt into "strict".
+    config.data.cache_validation_mode = "legacy"
     config.data.preload_to_memory = False
     config.data.prefetch_workers = 4
     config.data.prefetch_batches = 4
@@ -121,4 +124,5 @@ def get_config():
     config.checkpoint.resume_path = None
     config.checkpoint.resume_wandb = True
     config.checkpoint.save_best_val = True
+    config.checkpoint.online_deterministic_latent_default = True
     return config

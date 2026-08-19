@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import time
+from pathlib import Path
 from typing import Any, Dict
 
-from flax import jax_utils
-from flax.training import train_state
 import jax
 import jax.numpy as jnp
-from ml_collections import ConfigDict
 import numpy as np
 import optax
+from flax import jax_utils
+from flax.training import train_state
+from ml_collections import ConfigDict
+from phi_rlbench.data.numpy_dataset import NumpyRLBenchDataset
 
 from action_bridge.config import (
     apply_overrides,
@@ -23,7 +24,6 @@ from action_bridge.config import (
     save_config,
     to_plain_dict,
 )
-from action_bridge.data.rlbench_numpy_dataset import NumpyRLBenchDataset
 from action_bridge.jax.eval.visualization import (
     prediction_chunk_figure,
     write_prediction_chunk_html,
@@ -43,6 +43,9 @@ from action_bridge.jax.training.data import (
     dataset_kwargs,
 )
 from action_bridge.jax.training.losses import bridge_loss, direct_bc_loss
+from action_bridge.jax.training.rlbench_online_metadata import (
+    configure_rlbench_online_metadata,
+)
 
 
 class TrainState(train_state.TrainState):
@@ -318,10 +321,20 @@ def train(config) -> Path:
     checkpoint_dir = run_dir / "checkpoints"
     figure_dir = run_dir / "figures"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    save_config(config, run_dir / "config.json")
 
     train_dataset = _build_dataset(config, "train")
     validation_dataset = _build_dataset(config, "val")
+    resume_path = config.checkpoint.resume_path
+    resume_payload = load_checkpoint(resume_path) if resume_path else None
+    configure_rlbench_online_metadata(
+        config,
+        train_dataset,
+        validation_dataset,
+        resume_payload=resume_payload,
+    )
+    # Persist the resolved dataset vocabularies and cache identity, not only
+    # the pre-instantiation user configuration.
+    save_config(config, run_dir / "config.json")
     devices = _training_devices(config)
     parallel = len(devices) > 1
     model, policy_config = _build_model(config, train_dataset)
@@ -363,11 +376,8 @@ def train(config) -> Path:
         rng=rng,
     )
 
-    resume_payload = None
     best_val_loss = float("inf")
-    resume_path = config.checkpoint.resume_path
-    if resume_path:
-        resume_payload = load_checkpoint(resume_path)
+    if resume_payload is not None:
         state = state.replace(
             step=jnp.asarray(resume_payload["step"], dtype=jnp.int32),
             params=resume_payload["params"],
