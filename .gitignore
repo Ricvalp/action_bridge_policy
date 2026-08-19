@@ -16,3 +16,7 @@ logs/
 /rlbench/
 /urdfs/
 /wandb/
+
+/workspace/
+PHI_RLBENCH_IMPLEMENTATION_CODEX_PROMPT.md
+PHI_ROBOTICS_SIM_ECOSYSTEM_CODEX_PROMPT.md
