@@ -14,11 +14,20 @@ batched Warp expert collection in phi-isaaclab
 The implemented contract is `franka_cube_lift` variation 0:
 
 - upstream task `Isaac-Lift-Cube-Franka-IK-Abs-v0`;
-- observation profile `phi.isaaclab.franka_cube_lift.state.v1`, width 35;
+- observation profile `phi.isaaclab.franka_cube_lift.state.v2`, width 35;
 - action profile
-  `phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v1`, width 8;
+  `phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v2`, width 8;
+- raw acquisition schema 2 and processed cache schema 2;
+- demonstration expert
+  `phi.isaaclab.franka_cube_lift.reactive_pick_lift.v1`;
 - observation history 2, action history 2, prediction horizon 4;
 - 50 Hz control and one executed action per plan.
+
+Profile v2 normalizes each XYZW quaternion, then makes its first
+largest-absolute-value component non-negative; exact ties use the lowest XYZW
+index. This replaces the historical non-negative-w rule. Version-1 caches and
+checkpoints are incompatible with this workflow and must not be relabelled or
+silently upgraded.
 
 ## Ownership and environments
 
@@ -94,7 +103,7 @@ across eight collection-seed streams and keeps all live tensors vectorized on
 the GPU:
 
 ```bash
-export RAW_ID=cube-lift-seed0-2048-v1
+export RAW_ID=franka-cube-lift-reactive-v1-2048-seed0-v1
 export RAW_ROOT="$ISAAC_DATA_ROOT/raw/$RAW_ID"
 test ! -e "$RAW_ROOT"
 
@@ -114,17 +123,23 @@ test ! -e "$RAW_ROOT"
 )
 ```
 
-The collector records only successful expert episodes. One true simulator RNG
-stream belongs to each shard; vector lanes are not mislabeled as independent
-seeds. Batched completion may produce slightly more successes than requested,
-and `summary.json` records the actual count. A failed or interrupted collection
-is not resumed by this release—inspect it for diagnosis and choose a new ID.
+The collector records only successful episodes from the timer-free reactive
+expert. Each decision uses current O35 and, after the first command, prior
+policy-visible A8; the first waypoint is anchored at the observed TCP. Its
+exact behavior descriptor and thresholds are bound into configuration and
+provenance. One true simulator RNG stream belongs to each shard; vector lanes
+are not mislabeled as independent seeds. Batched completion may produce
+slightly more successes than requested, and `summary.json` records the actual
+count. A strict `manifest.json` is atomically published last; its presence and
+successful validation identify a complete collection. A failed or interrupted
+collection is not resumed by this release—inspect it for diagnosis and choose a
+new ID.
 
-On a new host, first repeat the audited infrastructure scale with a fresh raw
-ID and `--episodes 12 --num-shards 3 --num-envs 4 --base-seed 1000`. The
-recorded acceptance produced four successes per seed. Do not use that tiny
-collection to draw a learning conclusion; create another ID for the 2,048-demo
-experiment above.
+On a new host, first use a fresh ID with `--episodes 12`, `--num-shards 3`,
+`--num-envs 4`, and a new `--base-seed`, then convert and validate that
+schema-2 smoke. Twelve episodes are a systems check, not a useful corpus.
+Earlier 12-episode and 2,048-episode acquisitions used superseded expert,
+reset, or profile semantics and are diagnostic artifacts only.
 
 ## 3. Convert and validate the immutable cache
 
@@ -133,7 +148,7 @@ those completed shards explicitly and convert them with the offline backend
 environment:
 
 ```bash
-export PROCESSED_ID=cube-lift-seed0-2048-v1
+export PROCESSED_ID=franka-cube-lift-reactive-v1-2048-seed0-v1
 export COLLECTION="$ISAAC_DATA_ROOT/processed/$PROCESSED_ID"
 test ! -e "$COLLECTION"
 
@@ -148,6 +163,7 @@ test "${#raw_args[@]}" -ge 6
   scripts/with_offline_env.sh -- uv run --frozen phi-isaaclab convert-raw \
     "${raw_args[@]}" \
     --raw-provenance "$RAW_ROOT/provenance.json" \
+    --raw-manifest "$RAW_ROOT/manifest.json" \
     --output-directory "$COLLECTION"
   scripts/with_offline_env.sh -- \
     uv run --frozen phi-isaaclab validate-cache "$COLLECTION"
@@ -157,10 +173,16 @@ test "${#raw_args[@]}" -ge 6
 Retain the printed manifest SHA-256. Both raw and processed destinations are
 create-once. Conversion writes a complete sibling, validates transition
 alignment and content hashes, then publishes it atomically; it never appends
-to or overwrites a cache. `--raw-provenance` binds the exact collection
-provenance bytes to the processed identity. Portable cache metadata identifies
-the selected shards by stable ordinal, SHA-256, and episode count; it does not
-retain their workstation paths or filenames.
+to or overwrites a cache. `--raw-manifest` must bind the exact complete shard
+set and the supplied `--raw-provenance`; missing, extra, repeated-path,
+byte-identical, or content-mismatched shards are rejected. Portable cache
+metadata identifies each source by stable ordinal, SHA-256, size, collection
+seed, and episode count; it does not retain workstation paths or filenames.
+
+The resulting manifest must identify `phi.isaaclab.episode_hdf5` schema 2 and
+the v2 observation/action profiles. Conversion rejects raw provenance that
+does not bind the current reactive expert descriptor, including any changed
+threshold.
 
 ## 4. Install the Action Bridge training environment
 
@@ -182,7 +204,7 @@ split/normalization construction, batching, model/loss/optimizer code,
 checkpoint metadata, checkpoint writing, and bounded offline evaluation:
 
 ```bash
-export RUN_ID=isaaclab_cube_lift_direct_smoke_seed0_v1
+export RUN_ID=isaaclab_cube_lift_reactive_v1_direct_smoke_seed0_v1
 test ! -e "$ISAAC_RUNS_ROOT/$RUN_ID"
 
 uv run --frozen --extra cu128 \
@@ -286,10 +308,11 @@ cache identity into evaluation provenance. It never scans or rewrites the
 collection.
 
 The adapter keeps histories and latent state per lane on the GPU. It clamps
-XYZ to the checkpoint-declared workspace, normalizes/canonicalizes XYZW
-quaternions, thresholds gripper output to exactly `-1` or `+1`, and then hands
-the action to the backend's strict validator. Policy and simulator devices must
-match; silent CUDA-to-CPU fallback is rejected.
+XYZ to the checkpoint-declared workspace, normalizes XYZW quaternions and
+applies the profile-v2 largest-absolute-component sign rule, thresholds gripper
+output to exactly `-1` or `+1`, and then hands the action to the backend's
+strict validator. Policy and simulator devices must match; silent CUDA-to-CPU
+fallback is rejected.
 
 ## 8. Record video
 
@@ -358,8 +381,8 @@ source. Before a shared run:
 1. select a repository licence and publish the independent backend history;
 2. pin the Action Bridge dependency to one full backend commit, not a branch or
    editable path, then regenerate and commit `uv.lock`;
-3. transfer the processed collection separately, preserve its bytes, and run
-   `phi-isaaclab validate-cache` on the destination;
+3. transfer a current schema-2 processed collection separately, preserve its
+   bytes, and run `phi-isaaclab validate-cache` on the destination;
 4. build `.native/` on the destination rather than copying it;
 5. have the operator review/accept NVIDIA's terms before scheduling native
    work, and rerun doctor on that host;
@@ -374,32 +397,29 @@ itself establish RTX rendering or video support.
 
 ## Current acceptance truth
 
-Simulator-independent tests cover synthetic processed data, conversion,
-windows, one-step training, checkpoint reconstruction, device-native adapter
-behavior, and evaluation artifact logic. On 2026-08-20, the pinned native stack
-passed a one-environment CUDA physics doctor and a fixed-seed 32-environment
-expert gate with 32/32 successful first episodes, finite `[32,35]`
-observations, finite `[32,8]` actions, strict invalid-action rejection, and
-successful cleanup.
+Simulator-independent tests cover schema-2 conversion/windows, checkpoint
+metadata, profile-v2 projection, device-native adapter behavior, and artifact
+logic. On 2026-08-20, the pinned native stack passed physics and cleanup gates.
+A separate RGB doctor also remains accepted for that audited host: it returned
+one `[720,1280,3]` frame and cleaned up successfully.
+A corrected reset probe then recorded two episodes in each of four lanes: all
+8/8 O0 records exactly matched fresh live post-reset observations, and the
+maximum O0-to-O1 TCP movement was 0.000222280 m.
 
-The real end-to-end smoke also passed its infrastructure criteria: collection
-recorded four successful episodes for each seed 1000–1002; portable conversion
-produced a 12-episode, 1,937-transition cache with manifest SHA-256
-`b0912998674d5f2c383cecb2bf168e88872aa91761473f0cab7923312dfc2fba`;
-and one-step no-latent training produced checkpoint SHA-256
-`98182936e53bd3b57a2c94930d8173be4e52ae537c6605d9ef50077ab0e79c32`,
-with that cache identity embedded in checkpoint metadata. A fresh native
-seed-2100 evaluation completed its one 250-step episode, recorded no
-exceptions, and cleaned up successfully. The intentionally one-step model
-timed out at 0% success, so this is not a policy-performance result.
+The current reactive expert subsequently passed 256/256 first episodes across
+four independent seeds 20000–20003 with 64 lanes per seed. Episode lengths were
+128–176; every lane visited all four phases and toggled the gripper exactly
+once. First and successive commands respected the declared 0.02 m/0.20 rad
+caps within the 5e-5 native tolerance, and cleanup passed. The expert semantic
+identity SHA-256 is
+`59ecf807f4efbcf847bf79a059e2cbcc6cff34a575def2fa85cc081d766e43ee`;
+the gate summary SHA-256 is
+`0d46cf57f5353b9e4e4cbc00060e23e1208733c3136c2476a0eac008175b4376`.
 
-Exact result scope and artifact paths are recorded in
-`workspace/phi-isaaclab/docs/milestones.md`. A separate render doctor passed
-task reset, expert/step, cleanup, and one RGB frame shaped `[720,1280,3]`.
-The fresh learned rollout wrote a 418,206-byte H.264 MP4 with 251 frames at
-1280×720 and 50 fps; its SHA-256 is
-`1ed4e56953165c2e0b4b811aed4f34e0ad401b55da276a33addb838bdd1047f1`.
-Its create-once run directory is
-`workspace/experiments/isaaclab/native-evaluations/action-bridge-portable-cache-video-seed2100-1ep-20260820T114709Z/`.
-Substantive training, a production-scale collection, and held-out
-learned-policy success remain pending.
+Earlier collection/cache/training/evaluation and H.264 video runs proved the
+infrastructure but used stale-reset, timed-expert, or profile-v1 semantics.
+They and their derived checkpoints are quarantined diagnostics, not current
+training evidence. A fresh schema-2 multi-shard corpus and conversion,
+substantive training, current learned-policy video, and held-out success
+evaluation remain pending. Exact paths and audit details are in
+`workspace/phi-isaaclab/docs/milestones.md`.

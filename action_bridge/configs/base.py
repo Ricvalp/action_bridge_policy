@@ -471,9 +471,9 @@ def isaaclab_franka_cube_lift_config(latent_type: str) -> ConfigDict:
     config.data.normalization = None
     config.data.normalization_eps = 1e-6
     config.data.pad_episode_starts = True
-    config.data.observation_profile = "phi.isaaclab.franka_cube_lift.state.v1"
+    config.data.observation_profile = "phi.isaaclab.franka_cube_lift.state.v2"
     config.data.action_profile = (
-        "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v1"
+        "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v2"
     )
 
     config.model = _toy_model(latent_type)

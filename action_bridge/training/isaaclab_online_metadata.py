@@ -35,7 +35,14 @@ def _dataset_value(dataset: object, name: str) -> object:
 
 
 def _same_dataset_contract(train_dataset: object, other: object, *, split: str) -> None:
-    for name in ("obs_dim", "action_dim", "normalization_stats", "collection_identity"):
+    for name in (
+        "obs_dim",
+        "action_dim",
+        "observation_profile",
+        "action_profile",
+        "normalization_stats",
+        "collection_identity",
+    ):
         train_value = to_plain_dict(_dataset_value(train_dataset, name))
         other_value = to_plain_dict(_dataset_value(other, name))
         if train_value != other_value:
@@ -56,6 +63,14 @@ def configure_isaaclab_online_metadata(
         raise ValueError("Isaac Lab dataset observation width disagrees with its named profile")
     if int(_dataset_value(train_dataset, "action_dim")) != ACTION_DIM:
         raise ValueError("Isaac Lab dataset action width disagrees with its named profile")
+    if _dataset_value(train_dataset, "observation_profile") != OBSERVATION_PROFILE:
+        raise ValueError("Isaac Lab dataset observation_profile is incompatible")
+    if _dataset_value(train_dataset, "action_profile") != ACTION_PROFILE:
+        raise ValueError("Isaac Lab dataset action_profile is incompatible")
+    if config.data.observation_profile != OBSERVATION_PROFILE:
+        raise ValueError("Isaac Lab config data.observation_profile is incompatible")
+    if config.data.action_profile != ACTION_PROFILE:
+        raise ValueError("Isaac Lab config data.action_profile is incompatible")
 
     observation_history = int(config.obs_history)
     action_history = int(config.action_history)
@@ -69,7 +84,7 @@ def configure_isaaclab_online_metadata(
     actions_per_plan = int(config.eval.actions_per_plan)
     if actions_per_plan != 1:
         raise ValueError(
-            "Isaac Lab v1 requires eval.actions_per_plan=1 so vectorized live "
+            "Isaac Lab requires eval.actions_per_plan=1 so vectorized live "
             "observation history remains aligned with training"
         )
     latent_commitment = str(config.inference.latent_commitment)
@@ -77,7 +92,7 @@ def configure_isaaclab_online_metadata(
         raise ValueError("inference.latent_commitment must be 'chunk' or 'episode' for Isaac Lab")
     deterministic_latent = config.inference.deterministic
     if deterministic_latent is not True:
-        raise ValueError("Isaac Lab v1 requires inference.deterministic=true")
+        raise ValueError("Isaac Lab requires inference.deterministic=true")
 
     stats = _mapping(
         _dataset_value(train_dataset, "normalization_stats"),

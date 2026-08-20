@@ -19,11 +19,11 @@ from action_bridge.training.isaaclab_online_metadata import (
 def _metadata_dict(**overrides: object) -> dict[str, object]:
     value: dict[str, object] = {
         "schema_name": "action_bridge.isaaclab_online",
-        "schema_version": 1,
+        "schema_version": 2,
         "task_name": "franka_cube_lift",
         "variation_id": 0,
-        "observation_profile": "phi.isaaclab.franka_cube_lift.state.v1",
-        "action_profile": "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v1",
+        "observation_profile": "phi.isaaclab.franka_cube_lift.state.v2",
+        "action_profile": "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v2",
         "observation_dim": 35,
         "action_dim": 8,
         "observation_history": 2,
@@ -41,7 +41,7 @@ def _metadata_dict(**overrides: object) -> dict[str, object]:
         },
         "collection_identity": {
             "schema_name": "phi.isaaclab.episode_hdf5",
-            "schema_version": 1,
+            "schema_version": 2,
             "manifest_sha256": "a" * 64,
         },
         "action_projection": {
@@ -49,7 +49,7 @@ def _metadata_dict(**overrides: object) -> dict[str, object]:
             "position_upper_m": [0.8, 0.5, 0.8],
             "position_projection": "clamp",
             "quaternion_order": "xyzw",
-            "quaternion_projection": "normalize_nonnegative_w",
+            "quaternion_projection": "normalize_positive_first_largest_absolute_xyzw_component",
             "quaternion_epsilon": 1e-8,
             "gripper_threshold": 0.0,
             "gripper_open_action": 1.0,
@@ -77,6 +77,8 @@ def _checkpoint_config(metadata: dict[str, object]) -> dict[str, object]:
             "latent_commitment": metadata["latent_commitment"],
         },
         "data": {
+            "observation_profile": metadata["observation_profile"],
+            "action_profile": metadata["action_profile"],
             "normalize": True,
             "normalization_stats": deepcopy(metadata["normalization"]),
             "collection_identity": deepcopy(metadata["collection_identity"]),
@@ -87,6 +89,8 @@ def _checkpoint_config(metadata: dict[str, object]) -> dict[str, object]:
 class _Dataset:
     obs_dim = 35
     action_dim = 8
+    observation_profile = "phi.isaaclab.franka_cube_lift.state.v2"
+    action_profile = "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v2"
     normalization_stats: ClassVar[dict[str, object]] = deepcopy(
         _metadata_dict()["normalization"]
     )
@@ -104,10 +108,10 @@ def test_isaaclab_configs_bind_the_exact_lowdim_contract() -> None:
         assert (config.obs_dim, config.action_dim) == (35, 8)
         assert (config.obs_history, config.action_history, config.chunk_horizon) == (2, 2, 4)
         assert config.eval.actions_per_plan == 1
-        assert config.data.observation_profile == "phi.isaaclab.franka_cube_lift.state.v1"
+        assert config.data.observation_profile == "phi.isaaclab.franka_cube_lift.state.v2"
         assert (
             config.data.action_profile
-            == "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v1"
+            == "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v2"
         )
     assert continuous.model.latent_type == "continuous"
     assert no_latent.model.latent_type == "none"
@@ -119,6 +123,17 @@ def test_metadata_round_trip_and_checkpoint_validation() -> None:
     metadata = OnlineEvaluationMetadata.from_mapping(value)
     assert metadata.to_json_dict() == value
     validate_checkpoint_config(_checkpoint_config(value), metadata)
+
+
+@pytest.mark.parametrize("profile_key", ["observation_profile", "action_profile"])
+def test_checkpoint_config_rejects_profile_drift(profile_key: str) -> None:
+    value = _metadata_dict()
+    metadata = OnlineEvaluationMetadata.from_mapping(value)
+    config = _checkpoint_config(value)
+    config["data"][profile_key] = "phi.isaaclab.incompatible.v999"
+
+    with pytest.raises(OnlineMetadataError, match=f"data.{profile_key}"):
+        validate_checkpoint_config(config, metadata)
 
 
 @pytest.mark.parametrize(
@@ -167,6 +182,26 @@ def test_training_metadata_rejects_split_drift_and_multi_action_execution() -> N
     config = load_config("isaaclab_franka_cube_lift_continuous")
     config.eval.actions_per_plan = 2
     with pytest.raises(ValueError, match="actions_per_plan=1"):
+        configure_isaaclab_online_metadata(
+            config, _Dataset(), _Dataset(), _Dataset()
+        )
+
+
+@pytest.mark.parametrize("profile_key", ["observation_profile", "action_profile"])
+def test_training_metadata_rejects_dataset_and_config_profile_drift(
+    profile_key: str,
+) -> None:
+    config = load_config("isaaclab_franka_cube_lift_direct_chunk_bc")
+    validation = _Dataset()
+    setattr(validation, profile_key, "phi.isaaclab.incompatible.v999")
+    with pytest.raises(ValueError, match=f"validation dataset {profile_key}"):
+        configure_isaaclab_online_metadata(
+            config, _Dataset(), validation, _Dataset()
+        )
+
+    config = load_config("isaaclab_franka_cube_lift_direct_chunk_bc")
+    setattr(config.data, profile_key, "phi.isaaclab.incompatible.v999")
+    with pytest.raises(ValueError, match=f"config data.{profile_key}"):
         configure_isaaclab_online_metadata(
             config, _Dataset(), _Dataset(), _Dataset()
         )

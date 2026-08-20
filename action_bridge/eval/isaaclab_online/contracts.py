@@ -1,28 +1,31 @@
-"""Simulator-free constants for the first PHI Isaac Lab policy contract."""
+"""Simulator-free constants for the current PHI Isaac Lab policy contract."""
 
 from __future__ import annotations
 
+from phi_isaaclab.constants import (
+    ACTION_DIMENSION as ACTION_DIM,
+    ACTION_PROFILE,
+    CONTROL_TIMESTEP_SECONDS as CONTROL_TIMESTEP_S,
+    OBSERVATION_DIMENSION as OBSERVATION_DIM,
+    OBSERVATION_PROFILE,
+    PROCESSED_DATASET_SCHEMA as COLLECTION_SCHEMA_NAME,
+    PROCESSED_DATASET_SCHEMA_VERSION as COLLECTION_SCHEMA_VERSION,
+    TASK_NAME as TASK_ID,
+    TASK_VARIATION_ID as VARIATION_ID,
+    TCP_POSE_SLICE,
+    WORKSPACE_POSITION_LOWER as POSITION_LOWER_M,
+    WORKSPACE_POSITION_UPPER as POSITION_UPPER_M,
+)
+
 BENCHMARK_NAME = "isaaclab_franka_cube_lift"
-TASK_ID = "franka_cube_lift"
-VARIATION_ID = 0
-OBSERVATION_PROFILE = "phi.isaaclab.franka_cube_lift.state.v1"
-ACTION_PROFILE = "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v1"
-OBSERVATION_DIM = 35
-ACTION_DIM = 8
-CONTROL_TIMESTEP_S = 0.02
 
-COLLECTION_SCHEMA_NAME = "phi.isaaclab.episode_hdf5"
-COLLECTION_SCHEMA_VERSION = 1
 ONLINE_SCHEMA_NAME = "action_bridge.isaaclab_online"
-ONLINE_SCHEMA_VERSION = 1
+ONLINE_SCHEMA_VERSION = 2
 
-POSITION_LOWER_M = (0.20, -0.50, 0.02)
-POSITION_UPPER_M = (0.80, 0.50, 0.80)
 POSITION_PROJECTION = "clamp"
 QUATERNION_ORDER = "xyzw"
-QUATERNION_PROJECTION = "normalize_nonnegative_w"
+QUATERNION_PROJECTION = "normalize_positive_first_largest_absolute_xyzw_component"
 QUATERNION_EPSILON = 1e-8
-TCP_POSE_SLICE = (18, 25)
 GRIPPER_THRESHOLD = 0.0
 GRIPPER_OPEN_ACTION = 1.0
 GRIPPER_CLOSE_ACTION = -1.0

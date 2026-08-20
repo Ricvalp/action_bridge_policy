@@ -15,9 +15,11 @@ from pathlib import Path
 from typing import Any, Never
 
 from action_bridge.eval.isaaclab_online.contracts import (
+    ACTION_PROFILE,
     COLLECTION_SCHEMA_NAME,
     COLLECTION_SCHEMA_VERSION,
     CONTROL_TIMESTEP_S,
+    OBSERVATION_PROFILE,
     TASK_ID,
     VARIATION_ID,
 )
@@ -200,7 +202,15 @@ def _cache_manifest_identity(
         raise ValueError("collection manifest has the wrong schema_version")
     if value.get("task_name") != TASK_ID or value.get("variation_id") != VARIATION_ID:
         raise ValueError(
-            "collection manifest task identity disagrees with Isaac Lab v1"
+            "collection manifest task identity disagrees with the Isaac Lab contract"
+        )
+    if value.get("observation_profile") != OBSERVATION_PROFILE:
+        raise ValueError(
+            "collection manifest observation_profile disagrees with the Isaac Lab contract"
+        )
+    if value.get("action_profile") != ACTION_PROFILE:
+        raise ValueError(
+            "collection manifest action_profile disagrees with the Isaac Lab contract"
         )
     episodes = value.get("episode_count")
     if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes < 0:

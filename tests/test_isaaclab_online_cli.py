@@ -11,9 +11,11 @@ from action_bridge.eval.isaaclab_online import eval_isaaclab_online
 
 _MANIFEST_VALUE = {
     "schema_name": "phi.isaaclab.episode_hdf5",
-    "schema_version": 1,
+    "schema_version": 2,
     "task_name": "franka_cube_lift",
     "variation_id": 0,
+    "observation_profile": "phi.isaaclab.franka_cube_lift.state.v2",
+    "action_profile": "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v2",
     "episode_count": 3,
 }
 _MANIFEST_PAYLOAD = (
@@ -26,10 +28,10 @@ class _Metadata:
     def to_json_dict(self):
         return {
             "schema_name": "action_bridge.isaaclab_online",
-            "schema_version": 1,
+            "schema_version": 2,
             "collection_identity": {
                 "schema_name": "phi.isaaclab.episode_hdf5",
-                "schema_version": 1,
+                "schema_version": 2,
                 "manifest_sha256": _MANIFEST_SHA256,
             },
         }
@@ -126,6 +128,30 @@ def test_collection_manifest_mismatch_never_launches_native_runtime(
     error = json.loads(capsys.readouterr().err)
     assert error["stage"] == "checkpoint_load"
     assert "manifest SHA-256 disagrees" in error["message"]
+
+
+@pytest.mark.parametrize(
+    ("profile_key", "replacement"),
+    [
+        ("observation_profile", "phi.isaaclab.franka_cube_lift.state.v1"),
+        ("action_profile", "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v1"),
+    ],
+)
+def test_collection_manifest_profile_drift_is_rejected_before_native_launch(
+    tmp_path, monkeypatch, profile_key, replacement
+) -> None:
+    manifest = dict(_MANIFEST_VALUE)
+    manifest[profile_key] = replacement
+    payload = (
+        json.dumps(manifest, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    ).encode()
+    path = tmp_path / "drifted-manifest.json"
+    path.write_bytes(payload)
+
+    with pytest.raises(ValueError, match=profile_key):
+        eval_isaaclab_online._cache_manifest_identity(
+            path, expected_sha256=hashlib.sha256(payload).hexdigest()
+        )
 
 
 def test_preflight_identifier_is_forwarded_to_native_runner(
@@ -373,7 +399,7 @@ def test_native_runner_persists_policy_identity_and_owns_cleanup(
     config = captured["config"]
     assert config.checkpoint_identifier == identifier
     assert config.policy_provenance["checkpoint_identifier"] == identifier
-    assert config.policy_provenance["online_evaluation"]["schema_version"] == 1
+    assert config.policy_provenance["online_evaluation"]["schema_version"] == 2
     assert config.runtime_provenance["isaac_lab_git_head"] == "f" * 40
     assert config.cache_manifest_identity["sha256"] == _MANIFEST_SHA256
     assert config.preprocessing_identity["algorithm"] == "sha256"

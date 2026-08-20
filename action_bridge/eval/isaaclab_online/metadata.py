@@ -379,7 +379,7 @@ class OnlineEvaluationMetadata:
         if self.latent_commitment not in SUPPORTED_LATENT_COMMITMENTS:
             _fail(f"latent_commitment must be one of {sorted(SUPPORTED_LATENT_COMMITMENTS)}.")
         if self.deterministic_latent is not True:
-            _fail("Isaac Lab v1 requires deterministic_latent=true.")
+            _fail("Isaac Lab requires deterministic_latent=true.")
         if not math.isclose(float(self.control_timestep_s), CONTROL_TIMESTEP_S, abs_tol=1e-12):
             _fail(f"control_timestep_s must equal {CONTROL_TIMESTEP_S!r}.")
 
@@ -545,6 +545,10 @@ def validate_checkpoint_config(
         _fail("checkpoint inference.deterministic disagrees with online metadata.")
 
     data = _mapping(_config_value(config, "data", name="data"), name="config.data")
+    if data.get("observation_profile") != metadata.observation_profile:
+        _fail("checkpoint data.observation_profile disagrees with online metadata.")
+    if data.get("action_profile") != metadata.action_profile:
+        _fail("checkpoint data.action_profile disagrees with online metadata.")
     if data.get("normalize") is not True:
         _fail("Isaac Lab online checkpoints require data.normalize=true.")
     if StandardNormalization.from_mapping(

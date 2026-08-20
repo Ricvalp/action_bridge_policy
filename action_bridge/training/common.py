@@ -169,7 +169,7 @@ def build_dataset(config: Dict, split: str):
                 "identity; collect a smaller explicit bundle instead."
             )
         if not bool(data_cfg.get("pad_episode_starts", True)):
-            raise ValueError("Isaac Lab v1 windows require pad_episode_starts=true")
+            raise ValueError("Isaac Lab windows require pad_episode_starts=true")
         return FrankaCubeLiftWindowDataset(
             collection_root,
             split=split,

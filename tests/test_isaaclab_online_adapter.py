@@ -18,11 +18,11 @@ def _metadata() -> OnlineEvaluationMetadata:
     return OnlineEvaluationMetadata.from_mapping(
         {
             "schema_name": "action_bridge.isaaclab_online",
-            "schema_version": 1,
+            "schema_version": 2,
             "task_name": "franka_cube_lift",
             "variation_id": 0,
-            "observation_profile": "phi.isaaclab.franka_cube_lift.state.v1",
-            "action_profile": "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v1",
+            "observation_profile": "phi.isaaclab.franka_cube_lift.state.v2",
+            "action_profile": "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v2",
             "observation_dim": 35,
             "action_dim": 8,
             "observation_history": 2,
@@ -40,7 +40,7 @@ def _metadata() -> OnlineEvaluationMetadata:
             },
             "collection_identity": {
                 "schema_name": "phi.isaaclab.episode_hdf5",
-                "schema_version": 1,
+                "schema_version": 2,
                 "manifest_sha256": "a" * 64,
             },
             "action_projection": {
@@ -48,7 +48,7 @@ def _metadata() -> OnlineEvaluationMetadata:
                 "position_upper_m": [0.8, 0.5, 0.8],
                 "position_projection": "clamp",
                 "quaternion_order": "xyzw",
-                "quaternion_projection": "normalize_nonnegative_w",
+                "quaternion_projection": "normalize_positive_first_largest_absolute_xyzw_component",
                 "quaternion_epsilon": 1e-8,
                 "gripper_threshold": 0.0,
                 "gripper_open_action": 1.0,
@@ -197,7 +197,7 @@ def test_adapter_rejects_near_zero_quaternion() -> None:
     backend = _Backend(source)
     adapter = _adapter(backend)
     adapter.reset()
-    with pytest.raises(ValueError, match="near-zero quaternion"):
+    with pytest.raises(ValueError, match="zero-norm quaternion"):
         adapter.predict(
             _Input(
                 _reset_observations(),
@@ -205,3 +205,17 @@ def test_adapter_rejects_near_zero_quaternion() -> None:
                 torch.zeros(2, dtype=torch.int64),
             )
         )
+
+
+def test_adapter_uses_phi_v2_tie_safe_quaternion_projection() -> None:
+    adapter = _adapter(_Backend(torch.empty((0, 4, 8), dtype=torch.float32)))
+    source = torch.tensor(
+        [[0.4, 0.0, 0.5, -1.0, 1.0, 1.0, 1.0, 0.2]], dtype=torch.float32
+    )
+
+    projected = adapter._project_actions(source)
+
+    torch.testing.assert_close(
+        projected,
+        torch.tensor([[0.4, 0.0, 0.5, 0.5, -0.5, -0.5, -0.5, 1.0]]),
+    )

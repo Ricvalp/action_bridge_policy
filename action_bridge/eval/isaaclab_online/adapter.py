@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Protocol
 
 import torch
+from phi_isaaclab.sim.actions import project_policy_action
 
 from action_bridge.eval.isaaclab_online.contracts import TCP_POSE_SLICE
 from action_bridge.eval.isaaclab_online.metadata import OnlineEvaluationMetadata
@@ -37,7 +38,7 @@ class ActionBridgeIsaacLabPolicyAdapter:
     """Maintain exact per-environment histories around a batched Torch policy.
 
     The adapter consumes and returns tensors on the simulator device.  It does
-    not convert through NumPy or loop over environments.  Isaac Lab v1 executes
+    not convert through NumPy or loop over environments.  The current contract executes
     one action from each predicted chunk before providing the next observation.
     """
 
@@ -155,7 +156,7 @@ class ActionBridgeIsaacLabPolicyAdapter:
                 f"observation must have shape [B,{self.metadata.observation_dim}]"
             )
         if observation.dtype != torch.float32:
-            raise TypeError("Isaac Lab v1 observations must use torch.float32")
+            raise TypeError("Isaac Lab observations must use torch.float32")
         if not torch.isfinite(observation).all():
             raise ValueError("observation contains non-finite values")
         for value, name in ((episode_ids, "episode_ids"), (steps, "step_indices")):
@@ -230,7 +231,7 @@ class ActionBridgeIsaacLabPolicyAdapter:
         continuing = ~reset_mask
         if bool((steps[continuing] != self._last_steps[continuing] + 1).any()):
             raise ValueError(
-                "Isaac Lab v1 requires consecutive step_indices because actions_per_plan=1"
+                "Isaac Lab requires consecutive step_indices because actions_per_plan=1"
             )
 
         if bool(continuing.any()):
@@ -272,23 +273,12 @@ class ActionBridgeIsaacLabPolicyAdapter:
         lower = actions.new_tensor(projection.position_lower_m)
         upper = actions.new_tensor(projection.position_upper_m)
         position = torch.maximum(torch.minimum(actions[..., :3], upper), lower)
-        quaternion = actions[..., 3:7]
-        quaternion_norm = torch.linalg.vector_norm(quaternion, dim=-1, keepdim=True)
-        if bool((quaternion_norm < projection.quaternion_epsilon).any()):
-            raise ValueError("policy produced a near-zero quaternion that cannot be normalized")
-        quaternion = quaternion / quaternion_norm
-        sign = torch.where(
-            quaternion[..., 3:4] < 0.0,
-            quaternion.new_tensor(-1.0),
-            quaternion.new_tensor(1.0),
+        # PHI owns quaternion/gripper canonicalization.  Metadata validation
+        # fixes its thresholds to the same v2 semantic contract, so delegating
+        # here prevents the offline and online boundaries from drifting.
+        return project_policy_action(
+            torch.cat([position, actions[..., 3:]], dim=-1)
         )
-        quaternion = quaternion * sign
-        gripper = torch.where(
-            actions[..., 7:8] >= projection.gripper_threshold,
-            actions.new_tensor(projection.gripper_open_action),
-            actions.new_tensor(projection.gripper_close_action),
-        )
-        return torch.cat([position, quaternion, gripper], dim=-1).contiguous()
 
     def predict(self, inputs: BatchedPolicyInputLike) -> torch.Tensor:
         """Return one strict physical action for every active vector environment."""
