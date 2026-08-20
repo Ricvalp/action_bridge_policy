@@ -147,6 +147,47 @@ def build_dataset(config: Dict, split: str):
             normalization=to_plain_dict(data_cfg.get("normalization")),
             normalization_eps=float(data_cfg.get("normalization_eps", 1e-6)),
         )
+    if benchmark == "isaaclab_franka_cube_lift":
+        # This package contains only the simulator-free HDF5/window layer.
+        # Native Isaac Lab modules are deliberately never imported by offline
+        # Action Bridge training.
+        from phi_isaaclab.windows import (
+            FrankaCubeLiftWindowDataset,
+            SplitConfig,
+            WindowConfig,
+        )
+
+        collection_root = data_cfg.get("collection_root")
+        if not collection_root:
+            raise ValueError(
+                "Isaac Lab demonstrations are not configured. Set "
+                "data.collection_root to a completed phi-isaaclab collection bundle."
+            )
+        if data_cfg.get("max_episodes") is not None:
+            raise ValueError(
+                "data.max_episodes is not supported for immutable Isaac Lab split "
+                "identity; collect a smaller explicit bundle instead."
+            )
+        if not bool(data_cfg.get("pad_episode_starts", True)):
+            raise ValueError("Isaac Lab v1 windows require pad_episode_starts=true")
+        return FrankaCubeLiftWindowDataset(
+            collection_root,
+            split=split,
+            window_config=WindowConfig(
+                observation_history=int(config.get("obs_history", 2)),
+                action_history=int(config.get("action_history", 2)),
+                prediction_horizon=int(config.get("chunk_horizon", 4)),
+            ),
+            split_config=SplitConfig(
+                train_fraction=float(data_cfg.get("train_fraction", 0.8)),
+                val_fraction=float(data_cfg.get("val_fraction", 0.1)),
+                seed=int(data_cfg.get("split_seed", 0)),
+            ),
+            successful_only=bool(data_cfg.get("successful_only", True)),
+            normalize=bool(data_cfg.get("normalize", True)),
+            normalization=to_plain_dict(data_cfg.get("normalization")),
+            normalization_eps=float(data_cfg.get("normalization_eps", 1e-6)),
+        )
     raise ValueError(f"Unsupported benchmark {benchmark!r} for train_toy.")
 
 

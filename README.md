@@ -2,6 +2,10 @@
 
 This sandbox implements a toy-first research pilot for action chunks as stochastic action-path laws. The main policy is a reference action process plus a learned control residual, with an optional latent variable held fixed over the chunk for path-level mode commitment. It is SB-inspired, but it is not an exact Schrodinger Bridge solver and does not use Sinkhorn, IPF, score matching, or diffusion noising.
 
+This checkout has no repository `LICENSE`; the project/institute must select
+one and complete dependency/source notices before sharing it outside the
+authorized collaboration group.
+
 ## Install
 
 This branch supports Python 3.11 and 3.12. RLBench-neutral Action Bridge code
@@ -9,13 +13,14 @@ and RLBench training currently share that project-level requirement because
 `phi-rlbench` itself is restricted to `>=3.11,<3.13`.
 
 The current simulator dependency sources are editable development checkouts at
-`workspace/phi-rlbench` and `workspace/phi-mujoco`. Those directories are
+`workspace/phi-rlbench`, `workspace/phi-mujoco`, and
+`workspace/phi-isaaclab`. Those directories are
 ignored by this repository and are not present in a fresh clone, so the
 checked-in source settings are suitable only for local co-development. With
-both directories present, run from this directory:
+all three backend directories present, run from this directory:
 
 ```bash
-uv sync --extra cpu --extra test
+uv sync --locked --extra cpu --extra test
 ```
 
 Choose the PyTorch backend explicitly for each machine:
@@ -33,7 +38,7 @@ uv sync --extra cu130 --extra test --locked
 
 Only one of `cpu`, `cu118`, `cu126`, `cu128`, or `cu130` should be enabled in a given environment. Use `uv lock` locally after dependency changes, then use `uv sync --locked` on experiment machines so they do not rewrite `uv.lock`.
 
-Do not deploy either editable workspace source as an unversioned copy on an HPC
+Do not deploy any editable workspace source as an unversioned copy on an HPC
 clone. Once each backend has its own private or appropriately licensed remote,
 replace its editable source with an immutable full Git commit, regenerate
 `uv.lock`, and commit both files. For example, after substituting the real
@@ -43,10 +48,11 @@ organization and 40-character revision:
 [tool.uv.sources]
 phi-rlbench = { git = "ssh://git@github.com/<PHI-ORG>/phi-rlbench.git", rev = "<FULL-COMMIT>" }
 phi-mujoco = { git = "ssh://git@github.com/<PHI-ORG>/phi-mujoco.git", rev = "<FULL-COMMIT>" }
+phi-isaaclab = { git = "ssh://git@github.com/<PHI-ORG>/phi-isaaclab.git", rev = "<FULL-COMMIT>" }
 ```
 
 Shared jobs should then use `uv sync --locked` and record the Action Bridge
-commit, both backend commits, and the lockfile digest. A moving branch or an
+commit, every selected backend commit, and the lockfile digest. A moving branch or an
 uncommitted local path is not a reproducible HPC dependency.
 
 If uv is unavailable, create a virtualenv and install dependencies manually. For PyTorch, use the install command appropriate for the target machine from the PyTorch selector.
@@ -57,7 +63,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-The `requirements.txt` fallback does not reproduce either editable simulator
+The `requirements.txt` fallback does not reproduce the editable simulator
 source or their locked environments; use `uv` for simulator work.
 
 ## Toy Data
@@ -267,6 +273,24 @@ Available experiment configs are:
 See [MUJOCO.md](MUJOCO.md) for exact collection, validation, training, trusted
 checkpoint evaluation, and HPC commands. The current analytic-PD task is a
 pipeline benchmark; it is not yet a multimodal demonstration benchmark.
+
+## Isaac Lab
+
+The `phi-isaaclab` integration targets the upstream absolute-IK Franka cube
+lift task with 35-dimensional state observations and 8-dimensional absolute
+TCP-pose plus signed-gripper actions. The core dependency is simulator-free;
+offline validation, window loading, and Action Bridge training do not import
+Isaac Sim. Native collection and evaluation use a separate, pinned Python
+3.12 environment and retain batched Torch tensors on the simulator device.
+
+Available configs are:
+
+- `isaaclab_franka_cube_lift_direct_chunk_bc`;
+- `isaaclab_franka_cube_lift_no_latent`;
+- `isaaclab_franka_cube_lift_continuous`.
+
+See [ISAACLAB.md](ISAACLAB.md) for the collection-to-training workflow,
+checkpoint contract, native evaluation command, and current acceptance status.
 
 ## RLBench
 

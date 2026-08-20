@@ -440,3 +440,86 @@ def mujoco_planar_reach_config(latent_type: str) -> ConfigDict:
     config.eval.clip_actions = False
     config.eval.record_video = False
     return config
+
+
+def isaaclab_franka_cube_lift_config(latent_type: str) -> ConfigDict:
+    """Return the first native-Isaac-Lab imitation-learning config.
+
+    This is a low-dimensional, absolute end-effector-pose baseline for the
+    Franka cube-lift task.  Isaac Lab remains an online-runtime dependency;
+    offline training only consumes a validated ``phi-isaaclab`` collection.
+    The defaults establish an integration baseline and are not tuned results.
+    """
+
+    config = _toy_common("isaaclab_franka_cube_lift")
+    config.device = "cuda"
+    config.chunk_horizon = 4
+    config.obs_history = 2
+    config.action_history = 2
+    config.obs_dim = 35
+    config.action_dim = 8
+    config.output_dir = "workspace/experiments/isaaclab"
+
+    config.data = ConfigDict()
+    config.data.collection_root = None
+    config.data.train_fraction = 0.8
+    config.data.val_fraction = 0.1
+    config.data.split_seed = 0
+    config.data.successful_only = True
+    config.data.normalize = True
+    config.data.normalization_stats = None
+    config.data.normalization = None
+    config.data.normalization_eps = 1e-6
+    config.data.pad_episode_starts = True
+    config.data.observation_profile = "phi.isaaclab.franka_cube_lift.state.v1"
+    config.data.action_profile = (
+        "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v1"
+    )
+
+    config.model = _toy_model(latent_type)
+    config.model.hidden_dim = 256
+    config.model.h_emb_dim = 256
+    config.model.z_embed_dim = 32
+    config.model.control_scale = 2.0
+    if latent_type == "continuous":
+        config.model.z_dim = 4
+
+    config.reference = _toy_reference()
+    config.reference.type = "continuation"
+    config.reference.coordinate_mode = "raw_action"
+    config.reference.dt = 1.0
+    config.reference.alpha = 0.8
+    config.reference.sigma = 0.5
+    config.reference.learn_alpha = True
+    config.reference.learn_sigma = False
+
+    config.loss = _toy_loss(latent_type)
+    config.loss.beta_R = 0.005
+    config.loss.lambda_unroll = 1.0
+    config.loss.lambda_unroll_warmup_steps = 1_000
+
+    config.optim = _toy_optim()
+    config.optim.lr = 2e-4
+    config.optim.batch_size = 256
+    config.optim.max_steps = 50_000
+
+    config.inference = _toy_inference()
+    config.inference.deterministic = True
+    config.inference.latent_commitment = "chunk"
+    config.inference.n_exec = 1
+
+    config.logging = _logging_config()
+    config.logging.full_eval_every_steps = 0
+    config.logging.sim_eval_enabled = False
+    config.logging.sim_eval_async = False
+
+    config.eval = ConfigDict()
+    config.eval.batch_size = 256
+    config.eval.offline_max_batches = 0
+    config.eval.online_episodes = 100
+    config.eval.online_seed = 1_000_000
+    config.eval.online_max_steps = 300
+    config.eval.online_num_envs = 64
+    config.eval.actions_per_plan = 1
+    config.eval.record_video = False
+    return config

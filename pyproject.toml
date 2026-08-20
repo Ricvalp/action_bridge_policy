@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
 [project]
 name = "action-bridge-policy"
 version = "0.1.0"
@@ -8,6 +12,7 @@ dependencies = [
   "matplotlib>=3.7",
   "ml-collections>=0.1.1",
   "numpy>=1.24",
+  "phi-isaaclab>=0.1.0,<0.2",
   "phi-mujoco>=0.1.0,<0.2",
   "phi-rlbench>=0.1.0,<0.2",
   "plotly>=6.0",
@@ -53,7 +58,18 @@ conflicts = [
   ],
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["action_bridge"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "action_bridge",
+  "README.md",
+  "pyproject.toml",
+]
+
 [tool.uv.sources]
+phi-isaaclab = { path = "workspace/phi-isaaclab", editable = true }
 phi-mujoco = { path = "workspace/phi-mujoco", editable = true }
 phi-rlbench = { path = "workspace/phi-rlbench", editable = true }
 torch = [
