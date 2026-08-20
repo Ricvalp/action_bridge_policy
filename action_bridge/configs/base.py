@@ -471,6 +471,9 @@ def isaaclab_franka_cube_lift_config(latent_type: str) -> ConfigDict:
     config.data.normalization = None
     config.data.normalization_eps = 1e-6
     config.data.pad_episode_starts = True
+    # Opt-in task-aware sampling for the single open-to-close command in each
+    # demonstration.  A value of one preserves ordinary uniform shuffling.
+    config.data.first_close_sampling_weight = 1.0
     config.data.observation_profile = "phi.isaaclab.franka_cube_lift.state.v2"
     config.data.action_profile = (
         "phi.isaaclab.franka_cube_lift.ee_pose_abs_gripper.v2"

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
+from typing import Any
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from action_bridge.config import apply_overrides, load_config, save_config
 from action_bridge.eval.eval_isaaclab import evaluate_isaaclab_offline
@@ -44,6 +46,65 @@ def _offline_max_batches(config) -> int:
     if value < 0:
         raise ValueError("eval.offline_max_batches must be non-negative")
     return value
+
+
+def _first_close_sampling_weights(dataset: Any, weight: float) -> torch.Tensor | None:
+    """Return deterministic per-window weights for rare open-to-close commands.
+
+    The corrected Franka expert emits exactly one critical gripper transition per
+    episode.  Uniform window sampling makes those starts less than one percent of
+    the training stream, even though missing that single command prevents the
+    entire lift.  Keep uniform sampling as the default and make the task-aware
+    weighting explicit in the resolved experiment config.
+    """
+
+    if isinstance(weight, bool) or not math.isfinite(float(weight)) or weight < 1.0:
+        raise ValueError("data.first_close_sampling_weight must be finite and >= 1")
+    if weight == 1.0:
+        return None
+    if not hasattr(dataset, "indices") or not hasattr(dataset, "episodes"):
+        raise TypeError("first-close sampling requires an Isaac Lab window dataset")
+
+    episodes = {int(episode.episode_index): episode for episode in dataset.episodes}
+    weights = torch.ones(len(dataset), dtype=torch.float64)
+    transition_count = 0
+    for dataset_index, key in enumerate(dataset.indices):
+        episode_index = int(key.episode_index)
+        time_index = int(key.time_index)
+        try:
+            actions = episodes[episode_index].arrays.actions
+        except KeyError as exc:
+            raise ValueError(
+                f"window references unknown episode {episode_index}"
+            ) from exc
+        current_gripper = float(actions[time_index, -1])
+        previous_gripper = (
+            1.0 if time_index == 0 else float(actions[time_index - 1, -1])
+        )
+        if previous_gripper >= 0.0 and current_gripper < 0.0:
+            weights[dataset_index] = float(weight)
+            transition_count += 1
+    if transition_count == 0:
+        raise ValueError(
+            "first-close sampling was requested, but the training split contains "
+            "no open-to-close transition"
+        )
+    return weights
+
+
+def _training_sampler(dataset: Any, config: Any) -> WeightedRandomSampler | None:
+    weight = float(config.data.get("first_close_sampling_weight", 1.0))
+    weights = _first_close_sampling_weights(dataset, weight)
+    if weights is None:
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(int(config.get("seed", 0)))
+    return WeightedRandomSampler(
+        weights,
+        num_samples=len(dataset),
+        replacement=True,
+        generator=generator,
+    )
 
 
 def _periodic_offline_eval(model, dataset, config, device, run_dir: Path, step: int, wandb_run):
@@ -90,10 +151,12 @@ def train(config):
     batch_size = int(config.optim.batch_size)
     if batch_size < 1:
         raise ValueError("optim.batch_size must be positive")
+    train_sampler = _training_sampler(train_set, config)
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         drop_last=False,
         collate_fn=writable_numpy_collate,
     )
