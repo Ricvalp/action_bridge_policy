@@ -28,10 +28,10 @@ SEED="${SEED:-0}"
 RUN_SUFFIX="${RUN_SUFFIX:-$(date +%Y%m%d_%H%M%S)}"
 CACHE_ROOT="${RLBENCH_CACHE_ROOT:-data/rlbench_cache}"
 BATCH_SIZE="${BATCH_SIZE:-512}"
-MAX_STEPS="${MAX_STEPS:-300000}"
+MAX_STEPS="${MAX_STEPS:-500000}"
 WANDB_PROJECT="${WANDB_PROJECT:-action-bridge-policy-rlbench}"
 WANDB_GROUP="${WANDB_GROUP:-20tasks_allvars_medium}"
-RUN_ID="rlbench_20tasks_allvars_contact_64m_seed${SEED}_${RUN_SUFFIX}"
+RUN_ID="rlbench_20tasks_allvars_contact_64m_no_unroll_seed${SEED}_${RUN_SUFFIX}"
 TASKS='["basketball_in_hoop","close_jar","empty_dishwasher","insert_onto_square_peg","light_bulb_in","meat_off_grill","open_drawer","pick_and_lift","place_cups","place_shape_in_shape_sorter","push_button","push_buttons","put_groceries_in_cupboard","put_item_in_drawer","put_money_in_safe","reach_and_drag","slide_block_to_target","stack_blocks","stack_cups","turn_tap"]'
 
 echo "Run: ${RUN_ID}"
@@ -67,6 +67,7 @@ uv run --extra jax-cu13 python -m action_bridge.jax.training.train_rlbench \
   bridge.auxiliary_depth=3 \
   bridge.z_dim=8 \
   bridge.z_embed_dim=128 \
+  loss.unroll_weight=0.0 \
   distributed.num_devices=1 \
   optim.batch_size="${BATCH_SIZE}" \
   optim.max_steps="${MAX_STEPS}" \
@@ -81,5 +82,5 @@ uv run --extra jax-cu13 python -m action_bridge.jax.training.train_rlbench \
   logging.wandb.project="${WANDB_PROJECT}" \
   logging.wandb.group="${WANDB_GROUP}" \
   logging.wandb.log_plotly=false \
-  logging.wandb.tags='["rlbench","20tasks","all_variations","contact_bridge","supernode","task_conditioned","64m","h200","1gpu"]' \
+  logging.wandb.tags='["rlbench","20tasks","all_variations","contact_bridge","supernode","task_conditioned","64m","h200","1gpu","no_unroll"]' \
   checkpoint.save_best_val=false
