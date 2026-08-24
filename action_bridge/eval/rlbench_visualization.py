@@ -8,8 +8,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import plotly.graph_objects as go
-from phi_rlbench.data.actions import decode_action_chunk
-from phi_rlbench.data.cache import RLBenchCacheStore
+from phi_rlbench.data import RLBenchCacheStore, decode_action_chunk
 from plotly.subplots import make_subplots
 
 _AXIS_COLORS = ("#ef4444", "#22c55e", "#3b82f6")

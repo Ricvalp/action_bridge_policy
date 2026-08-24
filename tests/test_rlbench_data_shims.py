@@ -7,11 +7,13 @@ import sys
 import warnings
 
 import pytest
-from phi_rlbench.data.actions import decode_action_chunk
-from phi_rlbench.data.builder import convert_rlbench_dataset
-from phi_rlbench.data.cache import RLBenchCacheStore
-from phi_rlbench.data.numpy_dataset import NumpyRLBenchDataset
-from phi_rlbench.data.torch_dataset import RLBenchDataset
+from phi_rlbench.data import (
+    NumpyRLBenchDataset,
+    RLBenchCacheStore,
+    RLBenchDataset,
+    convert_rlbench_dataset,
+    decode_action_chunk,
+)
 
 
 @pytest.mark.parametrize(

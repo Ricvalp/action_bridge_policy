@@ -18,8 +18,8 @@ from typing import NoReturn
 
 from phi_mujoco.dataset import SCHEMA_NAME as COLLECTION_SCHEMA_NAME
 from phi_mujoco.dataset import SCHEMA_VERSION as COLLECTION_SCHEMA_VERSION
-from phi_mujoco.evaluation.protocol import ACTION_DIM, OBSERVATION_DIM
-from phi_mujoco.tasks.planar_reach import (
+from phi_mujoco.evaluation import ACTION_DIM, OBSERVATION_DIM
+from phi_mujoco.tasks import (
     ACTION_PROFILE,
     DEFAULT_ACTION_REPEAT,
     MODEL_TIMESTEP_S,

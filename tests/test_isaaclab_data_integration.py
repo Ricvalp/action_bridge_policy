@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-from phi_isaaclab.dataset import EpisodeData, write_processed_bundle
+from phi_isaaclab.offline import EpisodeData, write_processed_bundle
 from torch.utils.data import DataLoader
 
 from action_bridge.config import load_config

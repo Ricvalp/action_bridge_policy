@@ -151,7 +151,7 @@ def build_dataset(config: Dict, split: str):
         # This package contains only the simulator-free HDF5/window layer.
         # Native Isaac Lab modules are deliberately never imported by offline
         # Action Bridge training.
-        from phi_isaaclab.windows import (
+        from phi_isaaclab.offline import (
             FrankaCubeLiftWindowDataset,
             SplitConfig,
             WindowConfig,

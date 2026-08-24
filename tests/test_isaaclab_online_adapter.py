@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 import torch
-from phi_isaaclab.windows import reset_hold_open_action
+from phi_isaaclab.offline import reset_hold_open_action
 
 from action_bridge.eval.isaaclab_online.adapter import (
     ActionBridgeIsaacLabPolicyAdapter,

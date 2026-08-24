@@ -10,7 +10,7 @@ from numbers import Integral
 from pathlib import Path
 from types import MappingProxyType
 
-from phi_rlbench.data.schema import ACTION_COMPONENTS, STATE_COMPONENTS
+from phi_rlbench.data import ACTION_COMPONENTS, STATE_COMPONENTS
 
 
 class OnlineMetadataError(ValueError):

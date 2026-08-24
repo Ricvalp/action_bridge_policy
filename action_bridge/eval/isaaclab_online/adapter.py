@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Protocol
 
 import torch
-from phi_isaaclab.sim.actions import project_policy_action
+from phi_isaaclab.native import project_policy_action
 
 from action_bridge.eval.isaaclab_online.contracts import TCP_POSE_SLICE
 from action_bridge.eval.isaaclab_online.metadata import OnlineEvaluationMetadata

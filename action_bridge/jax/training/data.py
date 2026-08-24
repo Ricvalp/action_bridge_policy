@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict
 
 import numpy as np
-from phi_rlbench.data.numpy_dataset import NumpyRLBenchDataset
+from phi_rlbench.data import NumpyRLBenchDataset
 
 
 def dataset_kwargs(config, split: str) -> Dict[str, Any]:

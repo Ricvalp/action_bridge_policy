@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from phi_isaaclab.constants import (
+from phi_isaaclab.offline import (
     ACTION_DIMENSION as ACTION_DIM,
     ACTION_PROFILE,
     CONTROL_TIMESTEP_SECONDS as CONTROL_TIMESTEP_S,

@@ -15,7 +15,7 @@ import optax
 from flax import jax_utils
 from flax.training import train_state
 from ml_collections import ConfigDict
-from phi_rlbench.data.numpy_dataset import NumpyRLBenchDataset
+from phi_rlbench.data import NumpyRLBenchDataset
 
 from action_bridge.config import (
     apply_overrides,

@@ -4,29 +4,24 @@ from __future__ import annotations
 
 import warnings
 
-from phi_rlbench.data.actions import (
+from phi_rlbench.data import (
+    EpisodeKey,
+    RLBenchCacheStore,
+    RLBenchDataset,
+    RLBenchWindowKey,
     SUPPORTED_ACTION_REPRESENTATIONS,
+    VariationKey,
+    build_cache_keys,
     decode_action_chunk,
     encode_action_chunk,
     encode_action_history,
     normalize_action_representation,
-)
-from phi_rlbench.data.cache import (
-    EpisodeKey,
-    RLBenchCacheStore,
-    VariationKey,
-    build_cache_keys,
-)
-from phi_rlbench.data.indexing import split_episode_ids
-from phi_rlbench.data.torch_dataset import (
-    RLBenchDataset,
-    RLBenchWindowKey,
+    split_episode_ids,
 )
 
 warnings.warn(
     "action_bridge.data.rlbench_dataset is deprecated; import the Torch adapter "
-    "from phi_rlbench.data.torch_dataset and action helpers from "
-    "phi_rlbench.data.actions. This compatibility module will be removed in "
+    "and action helpers from phi_rlbench.data. This compatibility module will be removed in "
     "action-bridge-policy 0.2.0.",
     FutureWarning,
     stacklevel=2,

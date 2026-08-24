@@ -271,8 +271,9 @@ def _run_native(
 ) -> dict[str, object]:
     """Launch Isaac only after CPU checkpoint validation has completed."""
 
-    from phi_isaaclab.evaluation import BatchedEvaluationRunner, EvaluationConfig
-    from phi_isaaclab.sim.runtime import (
+    from phi_isaaclab.native import (
+        BatchedEvaluationRunner,
+        EvaluationConfig,
         NativeRuntimeConfig,
         launch_native_app,
     )
@@ -320,7 +321,7 @@ def _run_native(
 
     try:
         # Isaac Lab modules may only be imported after AppLauncher starts.
-        from phi_isaaclab.sim.task import (
+        from phi_isaaclab.native import (
             build_lift_task_config,
             create_lift_environment,
         )
@@ -459,7 +460,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def native_main(argv: Sequence[str] | None = None) -> int:
     """Run the executable boundary with Isaac's teardown workaround enabled."""
 
-    from phi_isaaclab.sim.runtime import (
+    from phi_isaaclab.native import (
         finalize_native_cli_process,
         native_cli_process_exit_required,
     )

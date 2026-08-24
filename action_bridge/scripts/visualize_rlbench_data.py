@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Dict, List, Sequence
 
 import numpy as np
-from phi_rlbench.data.cache import (
+from phi_rlbench.data import (
+    RLBenchDataset,
     RLBenchCacheStore,
     build_variation_keys,
     discover_tasks,
 )
-from phi_rlbench.data.torch_dataset import RLBenchDataset
 from torch.utils.data import DataLoader, Subset
 
 from action_bridge.eval.rlbench_visualization import (

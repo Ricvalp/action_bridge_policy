@@ -7,7 +7,7 @@ from collections.abc import Mapping
 
 import numpy as np
 import pytest
-from phi_rlbench.data.schema import ACTION_COMPONENTS, STATE_COMPONENTS
+from phi_rlbench.data import ACTION_COMPONENTS, STATE_COMPONENTS
 from phi_rlbench.evaluation import PolicyInput
 
 from action_bridge.jax.eval.rlbench_online import (

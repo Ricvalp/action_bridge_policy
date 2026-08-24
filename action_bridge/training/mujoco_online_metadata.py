@@ -7,7 +7,7 @@ from typing import Any
 
 from phi_mujoco.dataset import SCHEMA_NAME as COLLECTION_SCHEMA_NAME
 from phi_mujoco.dataset import SCHEMA_VERSION as COLLECTION_SCHEMA_VERSION
-from phi_mujoco.tasks.planar_reach import (
+from phi_mujoco.tasks import (
     ACTION_PROFILE,
     DEFAULT_ACTION_REPEAT,
     MODEL_TIMESTEP_S,

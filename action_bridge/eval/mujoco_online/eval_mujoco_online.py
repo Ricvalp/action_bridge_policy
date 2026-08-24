@@ -111,7 +111,7 @@ def _run_native(
         selected_gl_backend,
     )
     from phi_mujoco.sim import PlanarReachConfig, PlanarReachRuntime
-    from phi_mujoco.tasks.planar_reach import DEFAULT_MAX_EPISODE_STEPS
+    from phi_mujoco.tasks import DEFAULT_MAX_EPISODE_STEPS
 
     if args.max_steps > DEFAULT_MAX_EPISODE_STEPS:
         raise ValueError(

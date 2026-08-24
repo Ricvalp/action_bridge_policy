@@ -6,15 +6,15 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
-from phi_rlbench.data.actions import decode_action_chunk
-from phi_rlbench.data.builder import convert_rlbench_dataset
-from phi_rlbench.data.cache import (
+from phi_rlbench.data import (
+    CACHE_SCHEMA_NAME,
+    NumpyRLBenchDataset,
     RLBenchCacheStore,
+    RLBenchDataset,
     build_cache_keys,
+    convert_rlbench_dataset,
+    decode_action_chunk,
 )
-from phi_rlbench.data.numpy_dataset import NumpyRLBenchDataset
-from phi_rlbench.data.schema import CACHE_SCHEMA_NAME
-from phi_rlbench.data.torch_dataset import RLBenchDataset
 from torch.utils.data import DataLoader
 
 from action_bridge.eval.rlbench_visualization import (

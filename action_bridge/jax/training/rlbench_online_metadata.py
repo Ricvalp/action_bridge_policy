@@ -8,7 +8,7 @@ from collections.abc import Mapping, MutableMapping
 from numbers import Integral
 from typing import Any
 
-from phi_rlbench.data.schema import ACTION_COMPONENTS, STATE_COMPONENTS
+from phi_rlbench.data import ACTION_COMPONENTS, STATE_COMPONENTS
 from phi_rlbench.provenance import cache_manifest_identity
 
 from action_bridge.jax.eval.rlbench_online.metadata import (

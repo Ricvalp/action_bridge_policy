@@ -195,7 +195,7 @@ def test_preflight_identifier_is_forwarded_to_native_runner(
 def test_native_entrypoint_flushes_then_uses_forced_exit_after_runtime(
     tmp_path, monkeypatch, capsys
 ) -> None:
-    from phi_isaaclab.sim import runtime
+    import phi_isaaclab.native as native
 
     identifier = "sha256:" + "d" * 64
     forced_statuses: list[int] = []
@@ -226,8 +226,8 @@ def test_native_entrypoint_flushes_then_uses_forced_exit_after_runtime(
         forced_statuses.append(status)
         raise _ForcedExit
 
-    monkeypatch.setattr(runtime, "native_cli_process_exit_required", lambda: True)
-    monkeypatch.setattr(runtime, "finalize_native_cli_process", force_exit)
+    monkeypatch.setattr(native, "native_cli_process_exit_required", lambda: True)
+    monkeypatch.setattr(native, "finalize_native_cli_process", force_exit)
     with pytest.raises(_ForcedExit):
         eval_isaaclab_online.native_main(
             [*_arguments(tmp_path), "--episodes", "1", "--json"]
@@ -240,7 +240,7 @@ def test_native_entrypoint_flushes_then_uses_forced_exit_after_runtime(
 def test_native_entrypoint_forces_nonzero_exit_after_native_failure(
     tmp_path, monkeypatch, capsys
 ) -> None:
-    from phi_isaaclab.sim import runtime
+    import phi_isaaclab.native as native
 
     identifier = "sha256:" + "e" * 64
     forced_statuses: list[int] = []
@@ -267,8 +267,8 @@ def test_native_entrypoint_forces_nonzero_exit_after_native_failure(
         forced_statuses.append(status)
         raise _ForcedExit
 
-    monkeypatch.setattr(runtime, "native_cli_process_exit_required", lambda: True)
-    monkeypatch.setattr(runtime, "finalize_native_cli_process", force_exit)
+    monkeypatch.setattr(native, "native_cli_process_exit_required", lambda: True)
+    monkeypatch.setattr(native, "finalize_native_cli_process", force_exit)
     with pytest.raises(_ForcedExit):
         eval_isaaclab_online.native_main(_arguments(tmp_path))
 
@@ -310,8 +310,7 @@ def test_native_runner_persists_policy_identity_and_owns_cleanup(
     tmp_path, monkeypatch
 ) -> None:
     import torch
-    from phi_isaaclab import evaluation
-    from phi_isaaclab.sim import runtime, task
+    import phi_isaaclab.native as native
 
     identifier = "sha256:" + "b" * 64
     closed = {"environment": 0, "application": 0}
@@ -360,12 +359,12 @@ def test_native_runner_persists_policy_identity_and_owns_cleanup(
             captured["cleanup"]()
             return Result()
 
-    monkeypatch.setattr(runtime, "launch_native_app", lambda _config: App())
-    monkeypatch.setattr(task, "build_lift_task_config", lambda **_kwargs: object())
+    monkeypatch.setattr(native, "launch_native_app", lambda _config: App())
+    monkeypatch.setattr(native, "build_lift_task_config", lambda **_kwargs: object())
     monkeypatch.setattr(
-        task, "create_lift_environment", lambda *_args, **_kwargs: Environment()
+        native, "create_lift_environment", lambda *_args, **_kwargs: Environment()
     )
-    monkeypatch.setattr(evaluation, "BatchedEvaluationRunner", Runner)
+    monkeypatch.setattr(native, "BatchedEvaluationRunner", Runner)
     monkeypatch.setattr(
         eval_isaaclab_online,
         "load_torch_policy_adapter",
@@ -409,7 +408,7 @@ def test_native_runner_persists_policy_identity_and_owns_cleanup(
 
 
 def test_native_setup_failure_still_closes_application(tmp_path, monkeypatch) -> None:
-    from phi_isaaclab.sim import runtime, task
+    import phi_isaaclab.native as native
 
     closed = 0
 
@@ -425,10 +424,10 @@ def test_native_setup_failure_still_closes_application(tmp_path, monkeypatch) ->
             nonlocal closed
             closed += 1
 
-    monkeypatch.setattr(runtime, "launch_native_app", lambda _config: App())
-    monkeypatch.setattr(task, "build_lift_task_config", lambda **_kwargs: object())
+    monkeypatch.setattr(native, "launch_native_app", lambda _config: App())
+    monkeypatch.setattr(native, "build_lift_task_config", lambda **_kwargs: object())
     monkeypatch.setattr(
-        task,
+        native,
         "create_lift_environment",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("create failed")),
     )

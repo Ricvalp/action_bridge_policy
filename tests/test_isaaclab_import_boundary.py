@@ -11,7 +11,7 @@ from action_bridge.config import load_config
 from action_bridge.training import common, train_isaaclab
 from action_bridge.eval import eval_isaaclab
 from action_bridge.eval import isaaclab_online
-from phi_isaaclab import windows
+from phi_isaaclab import offline
 load_config('isaaclab_franka_cube_lift_no_latent')
 forbidden = [
     name for name in sys.modules
