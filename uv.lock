@@ -2441,6 +2441,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "diffusers", marker = "extra == 'tiny-diffusion'", specifier = "==0.39.0" },
     { name = "h5py", specifier = ">=3.12,<4" },
     { name = "imageio", marker = "extra == 'viz'", specifier = ">=2.37,<3" },
     { name = "imageio-ffmpeg", marker = "extra == 'viz'", specifier = ">=0.6,<1" },
@@ -2450,7 +2451,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<10" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9,<1" },
 ]
-provides-extras = ["viz", "dev"]
+provides-extras = ["viz", "tiny-diffusion", "dev"]
 
 [[package]]
 name = "phi-mujoco"
@@ -2504,7 +2505,6 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9,<1" },
     { name = "scipy", marker = "extra == 'sim'", specifier = ">=1.11,<2" },
     { name = "torch", marker = "extra == 'torch'", specifier = ">=2" },
-    { name = "tqdm", marker = "extra == 'dev'", specifier = ">=4.66,<5" },
 ]
 provides-extras = ["sim", "torch", "viz", "dev"]
 
