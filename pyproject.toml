@@ -14,7 +14,7 @@ dependencies = [
   "numpy>=1.24",
   "phi-isaaclab>=0.1.0,<0.2",
   "phi-mujoco>=0.1.0,<0.2",
-  "phi-rlbench>=0.1.0,<0.2",
+  "phi-coppeliasim>=0.1.0,<0.2",
   "plotly>=6.0",
   "tqdm>=4.66",
   "wandb>=0.16",
@@ -71,7 +71,7 @@ include = [
 [tool.uv.sources]
 phi-isaaclab = { path = "workspace/phi-isaaclab", editable = true }
 phi-mujoco = { path = "workspace/phi-mujoco", editable = true }
-phi-rlbench = { path = "workspace/phi-rlbench", editable = true }
+phi-coppeliasim = { path = "workspace/phi-coppeliasim", editable = true }
 torch = [
   { index = "pytorch-cpu", extra = "cpu" },
   { index = "pytorch-cu118", extra = "cu118" },

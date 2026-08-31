@@ -111,9 +111,9 @@ dependencies = [
     { name = "ml-collections" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
+    { name = "phi-coppeliasim" },
     { name = "phi-isaaclab" },
     { name = "phi-mujoco" },
-    { name = "phi-rlbench" },
     { name = "plotly" },
     { name = "tqdm" },
     { name = "wandb" },
@@ -171,9 +171,9 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
     { name = "optax", marker = "python_full_version >= '3.11' and extra == 'jax-cu13'", specifier = ">=0.2.4" },
     { name = "optax", marker = "extra == 'jax-cpu'", specifier = ">=0.2.4" },
+    { name = "phi-coppeliasim", editable = "workspace/phi-coppeliasim" },
     { name = "phi-isaaclab", editable = "workspace/phi-isaaclab" },
     { name = "phi-mujoco", editable = "workspace/phi-mujoco" },
-    { name = "phi-rlbench", editable = "workspace/phi-rlbench" },
     { name = "plotly", specifier = ">=6.0" },
     { name = "pymunk", marker = "extra == 'pusht-sim'", specifier = "<7" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },
@@ -1317,6 +1317,24 @@ wheels = [
 ]
 
 [[package]]
+name = "metaworld"
+version = "3.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "gymnasium" },
+    { name = "imageio" },
+    { name = "mujoco" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1b/30/d490e07948ca67f6989dc27e31493a0c6b9ad8092a807ec80e40c2c3974d/metaworld-3.1.1.tar.gz", hash = "sha256:0d6eac433adf77e838a1dceec1792219c6e4a25d18a1e7c87ddea994d2b5730c", size = 36452357, upload-time = "2026-06-28T17:11:10.774Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/81/50/3acdb0af5609278e58c388cbc05352da4d046f3df487f5bcca5260eefa44/metaworld-3.1.1-py3-none-any.whl", hash = "sha256:99e25d9baf97f2f1a19ca89c0d2ca9c6a2b396d9a9be81729de64eedc683f0d3", size = 36660415, upload-time = "2026-06-28T17:11:07.088Z" },
+]
+
+[[package]]
 name = "ml-collections"
 version = "1.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1392,7 +1410,7 @@ wheels = [
 
 [[package]]
 name = "mujoco"
-version = "3.11.0"
+version = "3.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "absl-py" },
@@ -1402,16 +1420,18 @@ dependencies = [
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
     { name = "pyopengl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3b/2d/290f3f4062eec1c0d5246de0a75f1b18b59a1961081f49ddc97333fc8263/mujoco-3.11.0.tar.gz", hash = "sha256:390856102af9547dfd87cb2791eb105a3d2e00a37323fe9a12ed17e512aff1a6", size = 1139880, upload-time = "2026-07-28T01:23:32.252Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8a/c6/76716fd205ccd0afbaef8b355555ace70347bd02c921d14e05e68eab3dbb/mujoco-3.3.0.tar.gz", hash = "sha256:0fb12ab715bc2b6d2394a6330b8c3a1dd95b0f3ba812bfe4f6c91e0a1ca3ad0f", size = 801447, upload-time = "2025-02-27T19:16:18.748Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/82/cb/eaa909bfdb093d82b80518182db89936fd0cc5486aeac31e71d9940e4800/mujoco-3.11.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:87a70b79d461b3afe03d1cd3dfb44b9ba1955a80b011a87c9536a6ef9c7936c8", size = 17474359, upload-time = "2026-07-28T01:22:32.578Z" },
-    { url = "https://files.pythonhosted.org/packages/68/d6/74fcb2a95b21de5217f19d9eb87db923d337e204da4dedaffeacababd28a/mujoco-3.11.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d09bcec0d9338fd79095314c4bd3a3072d7063e94a27d47f78e6159ca9a2baa9", size = 17655486, upload-time = "2026-07-28T01:22:35.33Z" },
-    { url = "https://files.pythonhosted.org/packages/43/3d/3c933a7a8e7f00e12260ad175195b8bbc36fd3aa62068f00db36351a2147/mujoco-3.11.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:16f94f05745225aaafb68016cbd2a1617f4af6b4bfca6c97d22c7b14e598d1f1", size = 18751041, upload-time = "2026-07-28T01:22:38.149Z" },
-    { url = "https://files.pythonhosted.org/packages/a7/eb/e09d6ac38f3e7af2fec0b3501515973f8a400d9c3d1e22e727a21762f598/mujoco-3.11.0-cp311-cp311-win_amd64.whl", hash = "sha256:5a286601c6a73a21f576ac6405e842a3221eb7db53013084a5c2e341a35112ee", size = 15687351, upload-time = "2026-07-28T01:22:40.864Z" },
-    { url = "https://files.pythonhosted.org/packages/87/b3/b2b449b5978bcb13277c9e50d764e6d8cd9534f58f071fb1647724123e2c/mujoco-3.11.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:3609c198de090c8218b9cc62ca6133f0feede8edd103b743b8002f3f735fcd9b", size = 17511145, upload-time = "2026-07-28T01:22:43.668Z" },
-    { url = "https://files.pythonhosted.org/packages/1a/65/d8130bb8a673f9cdc8a8fb2ef02f9b6931708567de57f17395106e83b4e3/mujoco-3.11.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:517bff03623c3329a563f575afd7d731b0be5c4f92a54dcec934b99120b4a9ec", size = 17704436, upload-time = "2026-07-28T01:22:47.05Z" },
-    { url = "https://files.pythonhosted.org/packages/41/d6/7b79f5d8fbd019658a3b5feb6ffd09c1e727eaf93f518685d3cc105a28f5/mujoco-3.11.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f40214fefc8c2fe0002a3c8abadf30de7a3330634f3c45cc29b407b40a0173fc", size = 18868030, upload-time = "2026-07-28T01:22:50.494Z" },
-    { url = "https://files.pythonhosted.org/packages/19/46/f994cd7d973c4db4f6b5af19ba6eb62703b9aafc8f894c5bc5ceadd31b0d/mujoco-3.11.0-cp312-cp312-win_amd64.whl", hash = "sha256:98c08a5eec9411ecd6f763f1e635fbc8f31e3ea3701584d6b7edcc24d8d6c575", size = 15791637, upload-time = "2026-07-28T01:22:53.922Z" },
+    { url = "https://files.pythonhosted.org/packages/11/aa/a0b20e86e9944fdbdbea004974df1426f4bc532c9711112012e89a56a389/mujoco-3.3.0-cp311-cp311-macosx_10_16_x86_64.whl", hash = "sha256:d61157a53356c790ef73d4ec918288c2dd7d0da26eaa1de8f56cffbdcd1ca275", size = 6498398, upload-time = "2025-02-27T19:14:59.241Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/12/5a158a125114e35409e60dedeb694bf80d7e3a02c99edc8734ed352baff2/mujoco-3.3.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:60025a554e444a85d3183714115f48ea4582c5c654f120c5f7652e22260b0069", size = 6524031, upload-time = "2025-02-27T19:15:04.301Z" },
+    { url = "https://files.pythonhosted.org/packages/81/85/f7dbcc704710e304cd1220fcdb505e5f0d142c741850efaf33950ab5bc51/mujoco-3.3.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:ff984aaec2006effe12fbb8bc29fbc0abb82b4332891307d99e637791067e912", size = 6276343, upload-time = "2025-02-27T19:15:08.446Z" },
+    { url = "https://files.pythonhosted.org/packages/05/9e/a0cd11d0501421d547d74ad0de092912c2e4952b9663f7807e32a9cbcf1b/mujoco-3.3.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1403630afb922ab2cb7aa7310b5cb596a5568ee4250f96e663c9f365353cab00", size = 6565173, upload-time = "2025-02-27T19:15:14.112Z" },
+    { url = "https://files.pythonhosted.org/packages/03/56/f5d8e2ac2df979044cb18c8862de7be9c2247921f8f7b06d45d3daf99c15/mujoco-3.3.0-cp311-cp311-win_amd64.whl", hash = "sha256:436d863747fea327393a46f04d7aeaea6acf27b961b54dbdde32a823e90355eb", size = 4860052, upload-time = "2025-02-27T19:15:18.631Z" },
+    { url = "https://files.pythonhosted.org/packages/11/6f/218bf9c8480340d640d4f8e09c0295bfd02cc08610bd6798fad12ebc9cc0/mujoco-3.3.0-cp312-cp312-macosx_10_16_x86_64.whl", hash = "sha256:32a7671069799e69f51bf515f6f97d8b2c852a0de065129033347e616fe4e9ed", size = 6588848, upload-time = "2025-02-27T19:15:22.124Z" },
+    { url = "https://files.pythonhosted.org/packages/42/3b/f17690dee3f3f3771e9953ffe634d0a1649af44c609c8b201325b9a7fbe6/mujoco-3.3.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:2f435f34ea8c41711e68c635ada89c7347e9d53a330c2ff748723a96495d8710", size = 6493393, upload-time = "2025-02-27T19:15:26.398Z" },
+    { url = "https://files.pythonhosted.org/packages/db/d5/89feffffdc085a6e3a31eea46a86efdd5a4d3421dacfba742f75e3df3319/mujoco-3.3.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:f526587b05879842e7380feda0a207455e78cdc05c8672c77d292383c145ab7e", size = 6283111, upload-time = "2025-02-27T19:15:30.509Z" },
+    { url = "https://files.pythonhosted.org/packages/cc/7b/dfedcfd4a8db4d861747e34e47d96dbcbb994db47b6bd626ed3f25935b81/mujoco-3.3.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:607df8af9e01831d624fc5ffcb6376899fb47c1e999a0e38b8388622da712f64", size = 6639670, upload-time = "2025-02-27T19:15:33.889Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/e2/7865204cbe00a2c319bf39a918c975a2cfb931ff2715348a815bdb7b453e/mujoco-3.3.0-cp312-cp312-win_amd64.whl", hash = "sha256:6e8811d854a5f4b3340ba11220781427659d5a87ced2d60688e476db8f3f6188", size = 4905647, upload-time = "2025-02-27T19:15:37.421Z" },
 ]
 
 [[package]]
@@ -2430,8 +2450,38 @@ wheels = [
 ]
 
 [[package]]
-name = "phi-isaaclab"
+name = "phi-coppeliasim"
 version = "0.1.0"
+source = { editable = "workspace/phi-coppeliasim" }
+dependencies = [
+    { name = "h5py" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "gymnasium", marker = "extra == 'sim'", specifier = "==1.0.0a2" },
+    { name = "h5py", specifier = ">=3.10,<4" },
+    { name = "imageio", marker = "extra == 'viz'", specifier = ">=2.37,<3" },
+    { name = "imageio-ffmpeg", marker = "extra == 'viz'", specifier = ">=0.6,<1" },
+    { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.22,<5" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11,<2" },
+    { name = "natsort", marker = "extra == 'sim'", specifier = ">=8.4,<9" },
+    { name = "numpy", specifier = ">=1.26,<3" },
+    { name = "pillow", marker = "extra == 'sim'", specifier = ">=10,<13" },
+    { name = "pyquaternion", marker = "extra == 'sim'", specifier = ">=0.9.9,<1" },
+    { name = "pyrep", marker = "extra == 'sim'", git = "https://github.com/stepjam/PyRep.git?rev=8f420be8064b1970aae18a9cfbc978dfb15747ef" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<10" },
+    { name = "rlbench", marker = "extra == 'sim'", git = "https://github.com/stepjam/RLBench.git?rev=02720bba4c73fe02eb75df946b8791b806028a9d" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9,<1" },
+    { name = "scipy", marker = "extra == 'sim'", specifier = ">=1.11,<2" },
+]
+provides-extras = ["sim", "viz", "dev"]
+
+[[package]]
+name = "phi-isaaclab"
+version = "0.2.0"
 source = { editable = "workspace/phi-isaaclab" }
 dependencies = [
     { name = "h5py" },
@@ -2455,58 +2505,34 @@ provides-extras = ["viz", "tiny-diffusion", "dev"]
 
 [[package]]
 name = "phi-mujoco"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "workspace/phi-mujoco" }
 dependencies = [
+    { name = "gymnasium" },
+    { name = "h5py" },
+    { name = "metaworld" },
     { name = "mujoco" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
+    { name = "packaging" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "gymnasium", marker = "extra == 'gym'", specifier = "==1.3.0" },
+    { name = "gymnasium", specifier = "==1.3.0" },
+    { name = "h5py", specifier = ">=3.12,<4" },
     { name = "imageio", marker = "extra == 'viz'", specifier = ">=2.37,<3" },
     { name = "imageio-ffmpeg", marker = "extra == 'viz'", specifier = ">=0.6,<1" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.22,<5" },
-    { name = "mujoco", specifier = "==3.11.0" },
+    { name = "metaworld", specifier = "==3.1.1" },
+    { name = "mujoco", specifier = "==3.3.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11,<2" },
     { name = "numpy", specifier = ">=1.26,<3" },
+    { name = "packaging", specifier = ">=24,<27" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<10" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9,<1" },
 ]
-provides-extras = ["gym", "viz", "dev"]
-
-[[package]]
-name = "phi-rlbench"
-version = "0.1.0"
-source = { editable = "workspace/phi-rlbench" }
-dependencies = [
-    { name = "h5py" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
-    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu118') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cpu' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu126') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu118' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu128') or (extra == 'extra-20-action-bridge-policy-cu126' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-cu128' and extra == 'extra-20-action-bridge-policy-cu130') or (extra == 'extra-20-action-bridge-policy-jax-cpu' and extra == 'extra-20-action-bridge-policy-jax-cu13')" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "h5py", specifier = ">=3.10,<4" },
-    { name = "imageio", marker = "extra == 'viz'", specifier = ">=2.34,<3" },
-    { name = "imageio-ffmpeg", marker = "extra == 'viz'", specifier = ">=0.5,<1" },
-    { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.22,<5" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11,<2" },
-    { name = "natsort", marker = "extra == 'sim'", specifier = ">=8.4,<9" },
-    { name = "numpy", specifier = ">=1.26,<3" },
-    { name = "pillow", marker = "extra == 'sim'", specifier = ">=10,<13" },
-    { name = "pillow", marker = "extra == 'viz'", specifier = ">=10,<13" },
-    { name = "pyquaternion", marker = "extra == 'sim'", specifier = ">=0.9.9,<1" },
-    { name = "pyrep", marker = "extra == 'sim'", git = "https://github.com/stepjam/PyRep.git?rev=8f420be8064b1970aae18a9cfbc978dfb15747ef" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<10" },
-    { name = "rlbench", marker = "extra == 'sim'", git = "https://github.com/stepjam/RLBench.git?rev=02720bba4c73fe02eb75df946b8791b806028a9d" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9,<1" },
-    { name = "scipy", marker = "extra == 'sim'", specifier = ">=1.11,<2" },
-    { name = "torch", marker = "extra == 'torch'", specifier = ">=2" },
-]
-provides-extras = ["sim", "torch", "viz", "dev"]
+provides-extras = ["viz", "dev"]
 
 [[package]]
 name = "pillow"

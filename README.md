@@ -10,10 +10,10 @@ authorized collaboration group.
 
 This branch supports Python 3.11 and 3.12. RLBench-neutral Action Bridge code
 and RLBench training currently share that project-level requirement because
-`phi-rlbench` itself is restricted to `>=3.11,<3.13`.
+`phi-coppeliasim` itself is restricted to `>=3.11,<3.13`.
 
 The current simulator dependency sources are editable development checkouts at
-`workspace/phi-rlbench`, `workspace/phi-mujoco`, and
+`workspace/phi-coppeliasim`, `workspace/phi-mujoco`, and
 `workspace/phi-isaaclab`. Those directories are
 ignored by this repository and are not present in a fresh clone, so the
 checked-in source settings are suitable only for local co-development. With
@@ -46,7 +46,7 @@ organization and 40-character revision:
 
 ```toml
 [tool.uv.sources]
-phi-rlbench = { git = "ssh://git@github.com/<PHI-ORG>/phi-rlbench.git", rev = "<FULL-COMMIT>" }
+phi-coppeliasim = { git = "ssh://git@github.com/<PHI-ORG>/phi-coppeliasim.git", rev = "<FULL-COMMIT>" }
 phi-mujoco = { git = "ssh://git@github.com/<PHI-ORG>/phi-mujoco.git", rev = "<FULL-COMMIT>" }
 phi-isaaclab = { git = "ssh://git@github.com/<PHI-ORG>/phi-isaaclab.git", rev = "<FULL-COMMIT>" }
 ```
