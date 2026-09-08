@@ -99,6 +99,18 @@ The task configs use the existing Action Bridge model. Their default is the
 no-latent reference/controller variant, with width 256. They are starting
 settings, not tuned contact-task baselines.
 
+For a roughly 5-million-parameter **continuous-latent** Square model, add:
+
+```text
+model.latent_type=continuous model.hidden_dim=736 model.h_emb_dim=736
+chunk_horizon=8 eval.actions_per_plan=4
+```
+
+This has 5,069,631 total parameters, including the training-only posterior;
+3,395,223 are in the inference path. The trainer prints the parameter count.
+The continuous latent remains four-dimensional. A larger model is an
+experiment, not a guarantee of higher task success.
+
 Before training, Action Bridge copies the backend's normalized windows into
 CPU RAM, with a short loading progress bar. Training and validation then read
 these arrays, not HDF5. Square at horizon eight needs about 13 MiB of window
@@ -111,15 +123,27 @@ Training preserves the official 180 train / 20 validation episodes. It fits
 normalization only on those 180 training episodes. There is no offline test
 split, so final offline metrics are labelled validation metrics. By default,
 periodic validation and final offline evaluation use the complete validation
-loader. For quicker smoke tests, `logging.validation_max_batches` and
+loader. Validation generates the full action chunk autoregressively from the
+history-conditioned prior (by default its deterministic mean), feeding back
+its own predicted actions. It compares these with held-out expert actions in
+the original action coordinates, before clipping. It never uses the posterior
+or future expert actions as prediction inputs. For quicker smoke tests,
+`logging.validation_max_batches` and
 `eval.offline_max_batches` cap them respectively; zero means all batches.
 
 Runs are written under `workspace/experiments/mujoco/$run_id/` with config,
 source/lock provenance, training and validation metrics, and
 `checkpoints/best.pt` plus `checkpoints/latest.pt`. Checkpoints contain the
 integration specification, dataset hashes and splits, normalization, histories,
-and action horizon. `best.pt` means lowest validation loss, not best simulator
-success rate.
+and action horizon. `best.pt` means lowest **validation action MSE** across the
+full predicted horizon, not lowest training loss or highest simulator success.
+`latest.pt` is always the most recently saved model. Validation scores are in
+`metrics/val_metrics.csv` (`action_mse`) and, when enabled, W&B `val/action_mse`.
+The final offline report uses the separate W&B prefix `offline_val` (or
+`offline_test` for datasets with a test split).
+There is no step-zero validation-loss calculation in this trainer anymore.
+New checkpoints record `checkpoint_metric=val_action_mse`; start a fresh run
+instead of resuming a checkpoint selected using the old loss metric.
 
 ## 4. Evaluate in simulation
 
@@ -165,3 +189,76 @@ Earlier planar experiments reached 99/100 successes for direct chunk BC
 (5,000 steps), 94/100 for no-latent Action Bridge (20,000 steps), and 18/100 for
 continuous-latent Action Bridge (5,000 steps). Those are historical results
 from the previous connection, not Robomimic results.
+
+## 5. Run on the HPC
+
+`hpc/mujoco_robomimic_square_5m_h200_1gpu.sbatch` requests one H200 through
+`gpuq` + `gpu:1`, matching the existing cluster jobs, for **10 hours**. It
+checks that the allocated GPU is an H200, then trains the 5.07M-parameter
+continuous-latent Square policy for 50,000 steps, horizon eight/execution four.
+It does not run a simulator or submit additional jobs.
+
+The commands below use SSH alias `peano` and a dedicated `~/abp-square-hpc`
+directory on its shared home filesystem. If you prefer project/scratch
+storage, replace that root consistently. Commit the intended Action Bridge
+changes before transferring so the run records the exact policy revision;
+no push to GitHub is required. The transfer includes `.git` for provenance.
+
+From this workstation:
+
+```bash
+cd /home/rvalperga/action_bridge_policy
+
+ssh peano 'mkdir -p abp-square-hpc/action_bridge_policy/data/robomimic_square abp-square-hpc/action_bridge_policy/hpc/logs abp-square-hpc/phi-mujoco'
+
+rsync -a --info=progress2 \
+  --exclude='.venv*/' --exclude='__pycache__/' --exclude='.*cache*/' \
+  --exclude='/workspace/' --exclude='/data/' --exclude='/outputs/' \
+  --exclude='/wandb/' --exclude='/hpc/logs/' \
+  ./ peano:abp-square-hpc/action_bridge_policy/
+
+rsync -a --info=progress2 \
+  --exclude='.venv*/' --exclude='__pycache__/' --exclude='.*cache*/' \
+  --exclude='/datasets/' --exclude='/runs/' \
+  /home/rvalperga/phi-mujoco/ peano:abp-square-hpc/phi-mujoco/
+
+rsync -a --info=progress2 \
+  /home/rvalperga/phi-mujoco/datasets/processed/robomimic_square-20260908T122032Z/ \
+  peano:abp-square-hpc/action_bridge_policy/data/robomimic_square/
+```
+
+The data transfer is only `manifest.json` and `episodes.hdf5` (about 6.7 MiB).
+The manifest already contains the official 180/20 split; no separate index is
+needed. Window indices and RAM arrays are built at startup. Do not transfer raw
+demonstrations, old runs/checkpoints, virtual environments, native simulator
+installations, or the other `phi-*` repositories.
+
+On Peano's login node, with `uv` available:
+
+```bash
+cd "$HOME/abp-square-hpc/action_bridge_policy"
+export UV_CACHE_DIR="$PWD/workspace/.uv-cache"
+
+uv sync --frozen --python 3.11 --extra cu128 --extra robomimic \
+  --no-install-package phi-isaaclab \
+  --no-install-package phi-coppeliasim
+
+.venv/bin/phi-mujoco validate-cache "$PWD/data/robomimic_square"
+
+mkdir -p hpc/logs
+sbatch hpc/mujoco_robomimic_square_5m_h200_1gpu.sbatch
+```
+
+This is intentionally a **MuJoCo-only environment**: the lock includes other
+backends, but neither is imported by this training path. The two
+`--no-install-package` options skip them without modifying `pyproject.toml` or
+`uv.lock`. The job uses `uv run --no-sync` so it does not try to reinstall
+them or download dependencies on a compute node. Do not run an ordinary
+unfiltered `uv sync` in this copy unless you also install its other backends.
+There is no additional package-index file to transfer: PyTorch's index is in
+`pyproject.toml` and resolved versions are in `uv.lock`.
+
+Logs go to `hpc/logs/square_latent_5m_<job-id>.out` and `.err`. Checkpoints go
+to `workspace/experiments/mujoco/square-latent-5m-h8-exec4-<job-id>-<timestamp>/checkpoints/`.
+The Slurm job ID makes each run directory unique. Use `squeue -u "$USER"` to
+check the allocation and job status.

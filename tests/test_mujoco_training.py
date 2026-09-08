@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 
 import numpy as np
@@ -8,6 +9,8 @@ import torch
 from phi_mujoco.offline import EpisodeData, get_integration, write_processed_bundle
 
 from action_bridge.config import apply_overrides, load_config
+from action_bridge.training import train_mujoco
+from action_bridge.training.common import build_model, load_config_from_checkpoint
 from action_bridge.training.train_mujoco import train
 
 
@@ -79,6 +82,14 @@ def test_train_robomimic_without_offline_test_split(tmp_path, task, latent_type)
     checkpoint = torch.load(run / "checkpoints" / "latest.pt", weights_only=False)
     assert checkpoint["step"] == 2
     assert np.isfinite(checkpoint["best_metric"])
+    assert checkpoint["config"]["checkpoint_metric"] == "val_action_mse"
+    with (run / "metrics" / "val_metrics.csv").open() as stream:
+        validation_rows = list(csv.DictReader(stream))
+    assert [int(row["step"]) for row in validation_rows] == [1, 2]
+    assert all("val_loss" not in row for row in validation_rows)
+    assert checkpoint["best_metric"] == min(
+        float(row["action_mse"]) for row in validation_rows
+    )
     assert checkpoint["config"]["data"]["normalization"]["source_episode_indices"] == [
         0,
         1,
@@ -104,3 +115,120 @@ def test_train_robomimic_without_offline_test_split(tmp_path, task, latent_type)
     )
     with pytest.raises(ValueError, match="online metadata disagrees"):
         train(resume_config)
+
+    resume_config = load_config_from_checkpoint(run / "checkpoints" / "latest.pt")
+    resume_config.optim.max_steps = 3
+    assert train(resume_config) == run
+    resumed = torch.load(run / "checkpoints" / "latest.pt", weights_only=False)
+    assert resumed["step"] == 3
+    assert resumed["config"]["checkpoint_metric"] == "val_action_mse"
+    assert resumed["best_metric"] <= checkpoint["best_metric"]
+
+
+def test_best_checkpoint_uses_validation_action_mse_not_training_loss(
+    tmp_path, monkeypatch
+):
+    bundle = _cache(tmp_path / "cache", "robomimic_square")
+    config = apply_overrides(
+        load_config("mujoco_robomimic_square"),
+        [
+            f"data.cache_root={bundle.root}",
+            f"output_dir={tmp_path / 'runs'}",
+            "run_id=selection",
+            "device=cpu",
+            "model.latent_type=continuous",
+            "model.hidden_dim=16",
+            "model.h_emb_dim=16",
+            "model.encoder_depth=1",
+            "model.control_depth=1",
+            "optim.batch_size=2",
+            "optim.max_steps=2",
+            "logging.progress=false",
+            "logging.log_every_steps=1",
+            "logging.eval_every_steps=1",
+            "logging.validation_max_batches=1",
+            "eval.batch_size=2",
+            "eval.offline_max_batches=1",
+        ],
+    )
+    scores = iter([0.1, 0.3, 0.3])  # Two validation calls and the final report.
+    evaluations = []
+
+    def evaluate(model, dataset, config, device, *, output_dir=None, max_batches=0):
+        assert dataset.split == "val"
+        evaluations.append((output_dir, max_batches))
+        return {"action_mse": next(scores)}
+
+    loss_function = train_mujoco.model_loss
+
+    def decreasing_loss(model, batch, loss_config, *, global_step):
+        result = loss_function(model, batch, loss_config, global_step=global_step)
+        # Loss improves, while the held-out inference score deliberately worsens.
+        result["loss"] = result["loss"] * 0 + (3 - global_step)
+        return result
+
+    logged = []
+    monkeypatch.setattr(train_mujoco, "evaluate_mujoco_offline", evaluate)
+    monkeypatch.setattr(train_mujoco, "model_loss", decreasing_loss)
+    monkeypatch.setattr(
+        train_mujoco,
+        "log_wandb_scalars",
+        lambda run, metrics, *, step, prefix: logged.append((prefix, step, metrics)),
+    )
+
+    run = train(config)
+
+    best = torch.load(run / "checkpoints" / "best.pt", weights_only=False)
+    latest = torch.load(run / "checkpoints" / "latest.pt", weights_only=False)
+    assert best["step"] == 1
+    assert latest["step"] == 2
+    assert best["best_metric"] == latest["best_metric"] == 0.1
+    assert best["config"]["checkpoint_metric"] == "val_action_mse"
+    assert evaluations == [(None, 1), (None, 1), (run, 1)]
+    with (run / "metrics" / "val_metrics.csv").open() as stream:
+        assert list(csv.DictReader(stream)) == [
+            {"step": "1", "action_mse": "0.1"},
+            {"step": "2", "action_mse": "0.3"},
+        ]
+    with (run / "metrics" / "train_metrics.csv").open() as stream:
+        assert [float(row["loss"]) for row in csv.DictReader(stream)] == [2.0, 1.0]
+    assert any(
+        prefix == "val" and step == 1 and metrics["action_mse"] == 0.1
+        for prefix, step, metrics in logged
+    )
+
+
+@pytest.mark.parametrize("old_metric", [None, "val_loss"])
+def test_resume_rejects_checkpoint_with_other_selection_metric(tmp_path, old_metric):
+    config = load_config("mujoco_robomimic_square")
+    if old_metric is not None:
+        config.checkpoint_metric = old_metric
+    checkpoint = tmp_path / "old-selection.pt"
+    torch.save({"config": config.to_dict(), "best_metric": -1.0}, checkpoint)
+    config.resume_from = str(checkpoint)
+    config.device = "cpu"
+    with pytest.raises(ValueError, match="checkpoint_metric"):
+        train(config)
+
+
+def test_square_continuous_latent_configuration_has_about_five_million_parameters():
+    config = apply_overrides(
+        load_config("mujoco_robomimic_square"),
+        [
+            "model.latent_type=continuous",
+            "model.hidden_dim=736",
+            "model.h_emb_dim=736",
+            "chunk_horizon=8",
+            "eval.actions_per_plan=4",
+        ],
+    )
+    model = build_model(config)
+    assert sum(parameter.numel() for parameter in model.parameters()) == 5_069_631
+    assert (
+        sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+        == 5_069_624
+    )

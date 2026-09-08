@@ -36,7 +36,6 @@ from action_bridge.training.train_toy import (
     maybe_init_wandb,
     maybe_update_reference_ema,
     save_checkpoint,
-    validation_loss,
 )
 
 
@@ -77,6 +76,11 @@ def train(config):
         raise ValueError("train_mujoco requires benchmark='mujoco'")
     if config.get("resume_from"):
         previous_config = load_config_from_checkpoint(config.resume_from)
+        if previous_config.get("checkpoint_metric") != "val_action_mse":
+            raise ValueError(
+                "resuming requires checkpoint_metric='val_action_mse'; "
+                "start a new run for checkpoints selected by the old validation loss"
+            )
         previous_metadata = previous_config.get("online_evaluation")
         if previous_metadata is None:
             raise ValueError(
@@ -84,6 +88,7 @@ def train(config):
             )
         # Validate against the actual checkpoint even for programmatic train(config).
         config.online_evaluation = previous_metadata
+    config.checkpoint_metric = "val_action_mse"
 
     train_set = build_dataset(config, split="train")
     normalization_stats = getattr(train_set, "normalization_stats", None)
@@ -129,14 +134,18 @@ def train(config):
         shuffle=True,
         drop_last=False,
     )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=batch_size,
-        shuffle=False,
-    )
     batches = cycle(train_loader)
 
     model = build_model(config).to(device)
+    config.parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameters = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    print(
+        f"Policy parameters: {config.parameter_count:,} total, "
+        f"{trainable_parameters:,} trainable; best checkpoint: val/action_mse",
+        flush=True,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(config.optim.lr),
@@ -160,10 +169,10 @@ def train(config):
         raise ValueError("logging.validation_max_batches must be non-negative")
 
     start_step = 1
-    best_val = float("inf")
+    best_mse = float("inf")
     resume_from = config.get("resume_from")
     if resume_from:
-        start_step, best_val = restore_training_state(
+        start_step, best_mse = restore_training_state(
             resume_from, model, optimizer, device
         )
 
@@ -203,26 +212,27 @@ def train(config):
                 progress.set_postfix(loss=f"{row['loss']:.4f}")
 
             if step % eval_every == 0 or step == max_steps:
-                val_loss = validation_loss(
+                metrics = evaluate_mujoco_offline(
                     model,
-                    val_loader,
+                    val_set,
                     config,
                     device,
-                    max_batches=validation_max_batches or len(val_loader),
+                    max_batches=validation_max_batches,
                 )
-                row = {"step": step, "val_loss": val_loss}
+                val_mse = metrics["action_mse"]
+                row = {"step": step, **metrics}
                 append_csv(run_dir / "metrics" / "val_metrics.csv", row)
                 log_wandb_scalars(wandb_run, row, step=step, prefix="val")
-                tqdm.write(f"step {step}: val_loss={val_loss:.6f}")
-                if val_loss < best_val:
-                    best_val = val_loss
+                tqdm.write(f"step {step}: val_action_mse={val_mse:.6f}")
+                if val_mse < best_mse:
+                    best_mse = val_mse
                     save_checkpoint(
                         run_dir / "checkpoints" / "best.pt",
                         model,
                         optimizer,
                         config,
                         step,
-                        best_val,
+                        best_mse,
                     )
                 save_checkpoint(
                     run_dir / "checkpoints" / "latest.pt",
@@ -230,7 +240,7 @@ def train(config):
                     optimizer,
                     config,
                     step,
-                    best_val,
+                    best_mse,
                 )
 
             if (
@@ -254,7 +264,7 @@ def train(config):
                     optimizer,
                     config,
                     step,
-                    best_val,
+                    best_mse,
                 )
 
         final_step = max_steps if start_step <= max_steps else start_step - 1
@@ -264,7 +274,7 @@ def train(config):
             optimizer,
             config,
             final_step,
-            best_val,
+            best_mse,
         )
         final_split = "test" if test_set is not None else "val"
         metrics = evaluate_mujoco_offline(
@@ -276,7 +286,9 @@ def train(config):
             max_batches=_offline_max_batches(config),
         )
         save_json(run_dir / "metrics" / f"{final_split}_metrics.json", metrics)
-        log_wandb_scalars(wandb_run, metrics, step=final_step, prefix=final_split)
+        log_wandb_scalars(
+            wandb_run, metrics, step=final_step, prefix=f"offline_{final_split}"
+        )
         print(f"Run directory: {run_dir}", flush=True)
         print(metrics, flush=True)
         return run_dir

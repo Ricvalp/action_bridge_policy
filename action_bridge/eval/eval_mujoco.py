@@ -63,7 +63,9 @@ def evaluate_mujoco_offline(
     Undo training normalization before computing errors. These coordinates are
     torques for planar reach and normalized controller commands for Robomimic.
     Predictions remain unclipped for errors; the integration's public projection
-    reports how many action values would change before execution.
+    reports how many action values would change before execution. Predictions
+    use the history-conditioned prior and their own previous generated actions,
+    never the future-conditioned posterior or teacher-forced expert actions.
     """
 
     eval_config = config.get("eval", {})
@@ -99,7 +101,7 @@ def evaluate_mujoco_offline(
         batch = move_to_device(batch, device)
         prediction = predict_actions(
             model,
-            batch,
+            {"obs_hist": batch["obs_hist"], "act_hist": batch["act_hist"]},
             deterministic=bool(config.get("inference", {}).get("deterministic", True)),
             mode="mode",
         )
@@ -155,6 +157,7 @@ def evaluate_mujoco_offline(
             output_dir / "metrics" / "mujoco_offline_metadata.json",
             {
                 "integration_spec": spec.to_dict(),
+                "prediction_protocol": "prior_autoregressive_chunk",
                 "action_metric_coordinates": "original action profile, before projection",
                 "action_metric_units": (
                     "action profile units; squared for MSE metrics. "

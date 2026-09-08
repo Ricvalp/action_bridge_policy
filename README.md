@@ -271,6 +271,10 @@ prediction horizon, and four executed actions before replanning. They preserve
 the official 180/20 train/validation partition. The settings are starting
 points for experiments, not tuned results.
 
+MuJoCo checkpoints are selected by held-out action MSE from prior-generated,
+autoregressive chunks, not teacher-forced training loss. Closed-loop task
+success is evaluated separately in simulation.
+
 Available experiment configs are:
 
 - `mujoco_planar_reach_direct_chunk_bc`;
