@@ -19,12 +19,12 @@ test -f pyproject.toml || {
   echo "Expected action_bridge_policy at PROJECT_DIR=$PROJECT_DIR" >&2
   exit 2
 }
-test -f workspace/phi-mujoco/pyproject.toml || {
-  echo "Missing the pinned phi-mujoco checkout at workspace/phi-mujoco" >&2
+test -f ../phi-mujoco/pyproject.toml || {
+  echo "Missing the pinned phi-mujoco checkout at ../phi-mujoco" >&2
   exit 2
 }
 
-COLLECTION_ROOT="${COLLECTION_ROOT:?Export the absolute completed collection path.}"
+COLLECTION_ROOT="${COLLECTION_ROOT:?Export the absolute processed-cache path.}"
 case "$COLLECTION_ROOT" in
   /*) ;;
   *)
@@ -74,16 +74,14 @@ mkdir -p "$OUTPUT_ROOT" "$UV_CACHE_DIR" "$XDG_CACHE_HOME" "$TORCH_HOME" "$TMPDIR
 "$PYTHON" - <<'PY'
 import os
 
-from phi_mujoco.dataset import validate_collection_bundle
+from phi_mujoco.offline import validate_collection_bundle
 
 bundle = validate_collection_bundle(os.environ["COLLECTION_ROOT"])
-if not bundle.runtime_cleanup_succeeded:
-    raise SystemExit("collection records unsuccessful runtime cleanup")
-if bundle.successful_episodes != bundle.requested_episodes:
+if bundle.successful_episodes != bundle.episode_count:
     raise SystemExit("collection does not contain only successful demonstrations")
 print(
     "validated collection",
-    bundle.manifest_sha256,
+    bundle.data_sha256,
     bundle.successful_episodes,
     bundle.total_steps,
     flush=True,
@@ -108,7 +106,7 @@ echo "device=$DEVICE"
 
 "$PYTHON" -m action_bridge.training.train_mujoco \
   --config-name "$CONFIG_NAME" \
-  data.collection_root="$COLLECTION_ROOT" \
+  data.cache_root="$COLLECTION_ROOT" \
   device="$DEVICE" \
   seed="$SEED" \
   output_dir="$OUTPUT_ROOT" \

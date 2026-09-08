@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 from ml_collections import ConfigDict
+from phi_mujoco.offline import get_integration
 
 from action_bridge.config import load_config
 from action_bridge.training.train_toy import save_checkpoint
@@ -21,7 +22,9 @@ def test_mujoco_configs_bind_the_expected_lowdim_contract() -> None:
     bridge_no_latent = load_config("mujoco_planar_reach_no_latent")
     baseline = load_config("mujoco_planar_reach_direct_chunk_bc")
     for config in (bridge, bridge_no_latent, baseline):
-        assert config.benchmark == "mujoco_planar_reach"
+        assert config.benchmark == "mujoco"
+        assert config.data.integration == "planar_reach"
+        assert config.data.cache_root is None
         assert (config.obs_dim, config.action_dim) == (8, 2)
         assert (config.obs_history, config.action_history, config.chunk_horizon) == (
             2,
@@ -35,6 +38,31 @@ def test_mujoco_configs_bind_the_expected_lowdim_contract() -> None:
     assert bridge_no_latent.model.policy_type == "action_bridge"
     assert bridge_no_latent.model.latent_type == "none"
     assert baseline.model.policy_type == "direct_bc"
+
+
+@pytest.mark.parametrize(
+    "task,obs_dim,max_steps", [("square", 23, 400), ("tool_hang", 53, 700)]
+)
+def test_robomimic_configs_match_public_integration_specs(
+    task: str, obs_dim: int, max_steps: int
+) -> None:
+    config = load_config(f"mujoco_robomimic_{task}")
+    spec = get_integration(f"robomimic_{task}").spec
+    assert config.benchmark == "mujoco"
+    assert config.data.integration == spec.name
+    assert config.data.cache_root is None
+    assert (config.obs_dim, config.action_dim) == (obs_dim, 7)
+    assert (config.obs_history, config.action_history, config.chunk_horizon) == (
+        2,
+        2,
+        8,
+    )
+    assert config.inference.n_exec == config.eval.actions_per_plan == 4
+    assert config.eval.online_max_steps == max_steps
+    assert config.data.observation_profile == spec.observation_profile
+    assert config.data.action_profile == spec.action_profile
+    assert config.model.policy_type == "action_bridge"
+    assert config.model.latent_type == "none"
 
 
 def test_torch_checkpoint_copies_online_evaluation_metadata_to_top_level(

@@ -13,7 +13,7 @@ dependencies = [
   "ml-collections>=0.1.1",
   "numpy>=1.24",
   "phi-isaaclab>=0.1.0,<0.2",
-  "phi-mujoco>=0.1.0,<0.2",
+  "phi-mujoco==0.2.0",
   "phi-coppeliasim>=0.1.0,<0.2",
   "plotly>=6.0",
   "tqdm>=4.66",
@@ -41,6 +41,7 @@ pusht-sim = [
   "gym-pusht>=0.1.5",
   "pymunk<7",
 ]
+robomimic = ["phi-mujoco[robomimic,viz]==0.2.0"]
 test = ["pytest>=8.0"]
 
 [tool.uv]
@@ -70,7 +71,7 @@ include = [
 
 [tool.uv.sources]
 phi-isaaclab = { path = "workspace/phi-isaaclab", editable = true }
-phi-mujoco = { path = "workspace/phi-mujoco", editable = true }
+phi-mujoco = { path = "../phi-mujoco", editable = true }
 phi-coppeliasim = { path = "workspace/phi-coppeliasim", editable = true }
 torch = [
   { index = "pytorch-cpu", extra = "cpu" },

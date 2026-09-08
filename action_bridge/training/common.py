@@ -109,28 +109,27 @@ def build_dataset(config: Dict, split: str):
             normalization_eps=float(data_cfg.get("normalization_eps", 1e-6)),
             pad_episode_starts=bool(data_cfg.get("pad_episode_starts", False)),
         )
-    if benchmark == "mujoco_planar_reach":
-        from phi_mujoco.windows import (
-            PlanarReachWindowDataset,
-            SplitConfig,
-            WindowConfig,
-        )
+    if benchmark == "mujoco":
+        from phi_mujoco.offline import SplitConfig, WindowConfig
 
-        collection_root = data_cfg.get("collection_root")
-        if not collection_root:
+        from action_bridge.data.mujoco_adapter import MujocoStateDataset
+
+        cache_root = data_cfg.get("cache_root")
+        if not cache_root:
             raise ValueError(
-                "MuJoCo demonstrations are not configured. Set data.collection_root "
-                "to a completed phi-mujoco collection bundle."
+                "MuJoCo demonstrations are not configured. Set data.cache_root "
+                "to a converted phi-mujoco processed cache."
             )
         if data_cfg.get("max_episodes") is not None:
             raise ValueError(
-                "data.max_episodes is not supported for immutable MuJoCo split identity; "
-                "collect a smaller explicit bundle instead."
+                "data.max_episodes would change the MuJoCo dataset split; "
+                "use an explicitly smaller processed cache instead."
             )
         if not bool(data_cfg.get("pad_episode_starts", True)):
-            raise ValueError("MuJoCo v1 windows require pad_episode_starts=true")
-        return PlanarReachWindowDataset(
-            collection_root,
+            raise ValueError("MuJoCo windows require pad_episode_starts=true")
+        return MujocoStateDataset(
+            cache_root,
+            integration=str(data_cfg["integration"]),
             split=split,
             window_config=WindowConfig(
                 observation_history=int(config.get("obs_history", 2)),

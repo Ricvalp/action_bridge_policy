@@ -1,147 +1,125 @@
 from __future__ import annotations
 
-import json
 from copy import deepcopy
 
 import pytest
+from phi_mujoco.integrations import get_integration
+from phi_mujoco.offline import StandardNormalization
 
 from action_bridge.eval.mujoco_online.metadata import (
     OnlineEvaluationMetadata,
     OnlineMetadataError,
-    load_online_metadata,
     resolve_online_metadata,
     validate_checkpoint_config,
 )
 
 
-def _metadata_dict(**overrides: object) -> dict[str, object]:
-    value: dict[str, object] = {
-        "schema_name": "action_bridge.mujoco_online",
-        "schema_version": 1,
-        "task_name": "planar_reach",
-        "variation_id": 0,
-        "observation_profile": "phi.mujoco.planar_reach.state.v1",
-        "action_profile": "phi.mujoco.planar_reach.joint_torque.v1",
-        "observation_dim": 8,
-        "action_dim": 2,
-        "observation_history": 2,
-        "action_history": 2,
-        "action_horizon": 3,
-        "actions_per_plan": 1,
-        "action_lower": [-2.0, -2.0],
-        "action_upper": [2.0, 2.0],
-        "control_timestep_s": 0.02,
-        "normalization": {
-            "type": "standard",
-            "eps": 1e-6,
-            "obs_mean": [0.0] * 8,
-            "obs_std": [1.0] * 8,
-            "action_mean": [0.0, 0.0],
-            "action_std": [1.0, 1.0],
-        },
-        "collection_identity": {
-            "schema_name": "phi.mujoco.episode_npz",
-            "schema_version": 1,
-            "manifest_sha256": "a" * 64,
-        },
-        "policy_type": "direct_bc",
-        "latent_commitment": "episode",
-        "deterministic_latent": True,
-        "clip_actions": False,
-    }
-    value.update(overrides)
-    return value
+def make_metadata(
+    name="robomimic_square", *, policy_type="direct_bc", actions_per_plan=2
+):
+    spec = get_integration(name).spec
+    obs_dim, action_dim = spec.observations["state"].shape[0], spec.action.shape[0]
+    return OnlineEvaluationMetadata(
+        integration=spec,
+        normalization=StandardNormalization(
+            "state",
+            (0, 1),
+            1e-6,
+            (0.0,) * obs_dim,
+            (1.0,) * obs_dim,
+            (0.0,) * action_dim,
+            (1.0,) * action_dim,
+        ),
+        collection_identity={"manifest_sha256": "a" * 64, "data_sha256": "b" * 64},
+        splits={"train": [0, 1], "val": [2], "test": []},
+        observation_history=2,
+        action_history=2,
+        action_horizon=3,
+        actions_per_plan=actions_per_plan,
+        policy_type=policy_type,
+        latent_commitment="episode",
+        deterministic_latent=True,
+        clip_actions=True,
+    )
 
 
-def _checkpoint_config(metadata: dict[str, object]) -> dict[str, object]:
+def make_config(metadata=None):
+    metadata = metadata or make_metadata()
     return {
-        "benchmark": "mujoco_planar_reach",
-        "obs_dim": metadata["observation_dim"],
-        "action_dim": metadata["action_dim"],
-        "obs_history": metadata["observation_history"],
-        "action_history": metadata["action_history"],
-        "chunk_horizon": metadata["action_horizon"],
-        "model": {"policy_type": metadata["policy_type"]},
-        "inference": {
-            "deterministic": metadata["deterministic_latent"],
-            "latent_commitment": metadata["latent_commitment"],
+        "benchmark": "mujoco",
+        "obs_dim": metadata.observation_dim,
+        "action_dim": metadata.action_dim,
+        "obs_history": 2,
+        "action_history": 2,
+        "chunk_horizon": 3,
+        "model": {
+            "policy_type": metadata.policy_type,
+            "hidden_dim": 8,
+            "h_emb_dim": 8,
+            "depth": 2,
         },
+        "inference": {"deterministic": True, "latent_commitment": "episode"},
+        "eval": {"actions_per_plan": metadata.actions_per_plan, "clip_actions": True},
         "data": {
-            "normalize": True,
-            "normalization_stats": deepcopy(metadata["normalization"]),
-            "collection_identity": deepcopy(metadata["collection_identity"]),
+            "integration": metadata.integration.name,
+            "observation_profile": metadata.integration.observation_profile,
+            "action_profile": metadata.integration.action_profile,
+            "normalization": metadata.normalization.to_dict(),
+            "collection_identity": metadata.collection_identity,
         },
+        "online_evaluation": metadata.to_json_dict(),
     }
-
-
-def test_metadata_round_trip_uses_exact_phi_mujoco_contract() -> None:
-    value = _metadata_dict()
-    metadata = OnlineEvaluationMetadata.from_mapping(value)
-
-    assert metadata.to_json_dict() == value
-    validate_checkpoint_config(_checkpoint_config(value), metadata)
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    "name", ["planar_reach", "robomimic_square", "robomimic_tool_hang"]
+)
+def test_metadata_roundtrip_and_config_agreement(name):
+    metadata = make_metadata(name)
+    assert OnlineEvaluationMetadata.from_mapping(metadata.to_json_dict()) == metadata
+    validate_checkpoint_config(make_config(metadata), metadata)
+
+
+@pytest.mark.parametrize(
+    "field", ["observation_profile", "action_profile", "upstream_task_id"]
+)
+def test_stale_integration_profile_is_rejected(field):
+    data = make_metadata().to_json_dict()
+    data["integration"][field] = "stale"
+    with pytest.raises(OnlineMetadataError, match="integration/profile"):
+        OnlineEvaluationMetadata.from_mapping(data)
+
+
+def test_old_or_missing_metadata_is_rejected():
+    with pytest.raises(OnlineMetadataError, match="embedded"):
+        resolve_online_metadata({})
+    data = make_metadata().to_json_dict()
+    data["schema_version"] = 1
+    with pytest.raises(OnlineMetadataError, match="retrain"):
+        OnlineEvaluationMetadata.from_mapping(data)
+
+
+def test_normalization_must_use_exact_train_partition():
+    data = make_metadata().to_json_dict()
+    data["normalization"]["source_episode_indices"] = [0, 2]
+    with pytest.raises(OnlineMetadataError, match="train split"):
+        OnlineEvaluationMetadata.from_mapping(data)
+
+
+@pytest.mark.parametrize(
+    "section,field,value",
     [
-        ("task_name", "another_task"),
-        ("observation_profile", "unknown"),
-        ("action_history", 1),
-        ("actions_per_plan", 2),
-        ("action_lower", [-1.0, -2.0]),
-        ("control_timestep_s", 0.01),
-        ("latent_commitment", "sticky"),
-        ("clip_actions", 1),
+        (None, "obs_dim", 8),
+        ("data", "integration", "robomimic_tool_hang"),
+        ("eval", "actions_per_plan", 3),
+        ("inference", "deterministic", False),
+        ("data", "observation_profile", "stale"),
+        ("data", "action_profile", "stale"),
     ],
 )
-def test_metadata_rejects_runtime_semantic_drift(field: str, value: object) -> None:
-    with pytest.raises(OnlineMetadataError):
-        OnlineEvaluationMetadata.from_mapping(_metadata_dict(**{field: value}))
-
-
-def test_metadata_rejects_unknown_keys_and_invalid_statistics() -> None:
-    with pytest.raises(OnlineMetadataError, match="extra"):
-        OnlineEvaluationMetadata.from_mapping(_metadata_dict(unknown=True))
-
-    value = _metadata_dict()
-    normalization = deepcopy(value["normalization"])
-    assert isinstance(normalization, dict)
-    normalization["obs_std"] = [1.0] * 7 + [0.0]
-    with pytest.raises(OnlineMetadataError, match="positive"):
-        OnlineEvaluationMetadata.from_mapping(_metadata_dict(normalization=normalization))
-
-
-def test_strict_json_loader_rejects_duplicate_keys(tmp_path) -> None:
-    path = tmp_path / "online.json"
-    path.write_text('{"schema_name":"one","schema_name":"two"}', encoding="utf-8")
-
-    with pytest.raises(OnlineMetadataError, match="duplicate JSON key"):
-        load_online_metadata(path)
-
-
-def test_metadata_resolution_requires_explicit_agreement(tmp_path) -> None:
-    embedded = _metadata_dict()
-    checkpoint = {"online_evaluation": embedded}
-    assert resolve_online_metadata(checkpoint).to_json_dict() == embedded
-
-    explicit = deepcopy(embedded)
-    explicit["clip_actions"] = True
-    path = tmp_path / "online.json"
-    path.write_text(json.dumps(explicit), encoding="utf-8")
+def test_checkpoint_config_drift_is_rejected(section, field, value):
+    metadata = make_metadata()
+    config = deepcopy(make_config(metadata))
+    (config if section is None else config[section])[field] = value
     with pytest.raises(OnlineMetadataError, match="disagrees"):
-        resolve_online_metadata(checkpoint, explicit_path=path)
-
-
-def test_checkpoint_config_must_repeat_data_contract() -> None:
-    value = _metadata_dict()
-    metadata = OnlineEvaluationMetadata.from_mapping(value)
-    config = _checkpoint_config(value)
-    data = config["data"]
-    assert isinstance(data, dict)
-    identity = data["collection_identity"]
-    assert isinstance(identity, dict)
-    identity["manifest_sha256"] = "b" * 64
-
-    with pytest.raises(OnlineMetadataError, match="collection_identity disagrees"):
         validate_checkpoint_config(config, metadata)

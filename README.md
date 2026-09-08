@@ -13,8 +13,9 @@ and RLBench training currently share that project-level requirement because
 `phi-coppeliasim` itself is restricted to `>=3.11,<3.13`.
 
 The current simulator dependency sources are editable development checkouts at
-`workspace/phi-coppeliasim`, `workspace/phi-mujoco`, and
-`workspace/phi-isaaclab`. Those directories are
+`workspace/phi-coppeliasim`, `../phi-mujoco`, and
+`workspace/phi-isaaclab`. MuJoCo uses the standalone sibling checkout
+(`/home/rvalperga/phi-mujoco` on this workstation). Those directories are
 ignored by this repository and are not present in a fresh clone, so the
 checked-in source settings are suitable only for local co-development. With
 all three backend directories present, run from this directory:
@@ -258,10 +259,17 @@ Toy evaluation reports action MSE, goal error, path length, collision rate, mini
 
 ## MuJoCo
 
-The `phi-mujoco` integration provides immutable scripted demonstration
-collections, deterministic low-dimensional windows, a dedicated Torch trainer,
-checkpoint metadata, and native closed-loop evaluation. The default planar
-reach horizon is four actions and online evaluation replans after every action.
+Action Bridge uses the standalone `phi-mujoco` backend for processed datasets,
+training windows, and closed-loop simulation. Models and training stay in this
+project. Both Robomimic PH low-dimensional v1.5 tasks are supported:
+
+- `mujoco_robomimic_square`: 23D state and 7D pose-delta/gripper actions;
+- `mujoco_robomimic_tool_hang`: 53D state and the same 7D action profile.
+
+These configurations start with a no-latent Action Bridge, an eight-action
+prediction horizon, and four executed actions before replanning. They preserve
+the official 180/20 train/validation partition. The settings are starting
+points for experiments, not tuned results.
 
 Available experiment configs are:
 
@@ -270,9 +278,9 @@ Available experiment configs are:
   a latent bottleneck;
 - `mujoco_planar_reach_continuous` for the continuous-latent experiment.
 
-See [MUJOCO.md](MUJOCO.md) for exact collection, validation, training, trusted
-checkpoint evaluation, and HPC commands. The current analytic-PD task is a
-pipeline benchmark; it is not yet a multimodal demonstration benchmark.
+See [MUJOCO.md](MUJOCO.md) for setup, processed-cache paths, training commands,
+and checkpoint evaluation with videos. The current connection uses the v0.2
+backend API; old planar-reach caches and checkpoints are not supported.
 
 ## Isaac Lab
 

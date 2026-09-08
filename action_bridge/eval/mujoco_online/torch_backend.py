@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import os
-import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -26,44 +24,9 @@ from action_bridge.training.common import build_model, resolve_device
 
 
 def _checkpoint_snapshot(path: str | Path) -> tuple[bytes, str]:
-    """Read one stable regular-file snapshot and identify its exact bytes."""
-
-    source = Path(path).expanduser().absolute()
-    try:
-        visible = os.lstat(source)
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"checkpoint does not exist: {source}") from exc
-    if stat.S_ISLNK(visible.st_mode) or not stat.S_ISREG(visible.st_mode):
-        raise ValueError(f"checkpoint must be a regular non-symlink file: {source}")
-    descriptor = os.open(
-        source,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0),
-    )
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
-            visible.st_dev,
-            visible.st_ino,
-        ):
-            raise ValueError("checkpoint changed while it was opened.")
-        digest = hashlib.sha256()
-        chunks: list[bytes] = []
-        while chunk := os.read(descriptor, 1024 * 1024):
-            chunks.append(chunk)
-            digest.update(chunk)
-        final = os.fstat(descriptor)
-        if (
-            final.st_size != opened.st_size
-            or final.st_mtime_ns != opened.st_mtime_ns
-            or final.st_ctime_ns != opened.st_ctime_ns
-        ):
-            raise ValueError("checkpoint changed while it was read.")
-    finally:
-        os.close(descriptor)
-    return b"".join(chunks), f"sha256:{digest.hexdigest()}"
+    """Hash the same checkpoint bytes that will be deserialized."""
+    payload = Path(path).expanduser().read_bytes()
+    return payload, f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
 class TorchInferenceBackend:
@@ -110,7 +73,11 @@ class TorchInferenceBackend:
             return (
                 latent,
                 model.latent.embed(latent),
-                {"latent_l2": float(torch.linalg.vector_norm(latent).detach().cpu().item())},
+                {
+                    "latent_l2": float(
+                        torch.linalg.vector_norm(latent).detach().cpu().item()
+                    )
+                },
             )
         if model.latent_type == "categorical":
             logits = model.latent.prior_logits(h_emb)
@@ -134,9 +101,15 @@ class TorchInferenceBackend:
         self, batch: Mapping[str, NDArray[np.float32]]
     ) -> tuple[NDArray[np.float32], Mapping[str, object]]:
         if not self._reset:
-            raise RuntimeError("Torch inference backend must be reset before prediction.")
-        obs_hist = torch.as_tensor(batch["obs_hist"], dtype=torch.float32, device=self.device)
-        act_hist = torch.as_tensor(batch["act_hist"], dtype=torch.float32, device=self.device)
+            raise RuntimeError(
+                "Torch inference backend must be reset before prediction."
+            )
+        obs_hist = torch.as_tensor(
+            batch["obs_hist"], dtype=torch.float32, device=self.device
+        )
+        act_hist = torch.as_tensor(
+            batch["act_hist"], dtype=torch.float32, device=self.device
+        )
         tensor_batch = {"obs_hist": obs_hist, "act_hist": act_hist}
         diagnostics: dict[str, object] = {
             "framework": "torch",
@@ -154,9 +127,13 @@ class TorchInferenceBackend:
                 latent_embedding = self._episode_latent_embedding
                 latent_diagnostics = self._episode_latent_diagnostics
             else:
-                latent, latent_embedding, latent_diagnostics = self._latent(self.model, h_emb)
+                latent, latent_embedding, latent_diagnostics = self._latent(
+                    self.model, h_emb
+                )
                 if self.metadata.latent_commitment == "episode":
-                    self._episode_latent = None if latent is None else latent.detach().clone()
+                    self._episode_latent = (
+                        None if latent is None else latent.detach().clone()
+                    )
                     self._episode_latent_embedding = latent_embedding.detach().clone()
                     self._episode_latent_diagnostics = dict(latent_diagnostics)
             output = generate_chunk(
@@ -173,7 +150,9 @@ class TorchInferenceBackend:
             output = predict_actions(self.model, tensor_batch, deterministic=True)
         path_kl = output.get("path_kl_energy")
         if path_kl is not None:
-            diagnostics["normalized_path_kl_energy"] = float(path_kl.detach().mean().cpu().item())
+            diagnostics["normalized_path_kl_energy"] = float(
+                path_kl.detach().mean().cpu().item()
+            )
         actions = output["actions"].detach().cpu().numpy().astype(np.float32, copy=True)
         return np.ascontiguousarray(actions), diagnostics
 
@@ -181,9 +160,9 @@ class TorchInferenceBackend:
 def load_torch_policy_adapter(
     checkpoint_path: str | Path,
     *,
-    online_metadata_path: str | Path | None = None,
     trusted_checkpoint: bool = False,
     device: str = "cpu",
+    actions_per_plan: int | None = None,
 ) -> ActionBridgeMujocoPolicyAdapter:
     """Load one explicitly trusted checkpoint without launching MuJoCo."""
 
@@ -206,18 +185,22 @@ def load_torch_policy_adapter(
     config = checkpoint["config"]
     if not isinstance(config, Mapping):
         raise TypeError("Action Bridge checkpoint config must be a mapping.")
-    metadata = resolve_online_metadata(checkpoint, explicit_path=online_metadata_path)
+    metadata = resolve_online_metadata(checkpoint)
     validate_checkpoint_config(config, metadata)
     model = build_model(config).to(resolved_device)
     state = checkpoint["model_state"]
     if not isinstance(state, Mapping):
         raise TypeError("Action Bridge checkpoint model_state must be a mapping.")
     model.load_state_dict(state, strict=True)
-    backend = TorchInferenceBackend(model=model, metadata=metadata, device=resolved_device)
+    backend = TorchInferenceBackend(
+        model=model, metadata=metadata, device=resolved_device
+    )
     return ActionBridgeMujocoPolicyAdapter(
         metadata=metadata,
         backend=backend,
         checkpoint_identifier=identifier,
+        actions_per_plan=actions_per_plan,
+        provenance=config.get("provenance", {}),
     )
 
 

@@ -1,96 +1,68 @@
 from __future__ import annotations
 
+import hashlib
 from copy import deepcopy
-from typing import ClassVar
+from types import SimpleNamespace
 
 import pytest
+from ml_collections import ConfigDict
+from phi_mujoco.offline import MANIFEST_FILENAME, EpisodeSplit, WindowConfig
+from test_mujoco_online_metadata import make_config, make_metadata
 
-from action_bridge.config import load_config
+from action_bridge.eval.mujoco_online.metadata import (
+    OnlineEvaluationMetadata,
+    validate_checkpoint_config,
+)
 from action_bridge.training.mujoco_online_metadata import (
     configure_mujoco_online_metadata,
 )
 
 
-class _Dataset:
-    obs_dim = 8
-    action_dim = 2
-    normalization_stats: ClassVar[dict[str, object]] = {
-        "type": "standard",
-        "eps": 1e-6,
-        "obs_mean": [0.0] * 8,
-        "obs_std": [1.0] * 8,
-        "action_mean": [0.0] * 2,
-        "action_std": [1.0] * 2,
-    }
-    collection_identity: ClassVar[dict[str, object]] = {
-        "schema_name": "phi.mujoco.episode_npz",
-        "schema_version": 1,
-        "manifest_sha256": "a" * 64,
-    }
-
-
-def test_training_metadata_binds_dataset_profiles_geometry_and_normalization() -> None:
-    config = load_config("mujoco_planar_reach_continuous")
-    metadata = configure_mujoco_online_metadata(
-        config,
-        _Dataset(),
-        _Dataset(),
-        _Dataset(),
+def dataset_and_config(tmp_path):
+    metadata = make_metadata()
+    config = ConfigDict(make_config(metadata))
+    del config.online_evaluation
+    (tmp_path / MANIFEST_FILENAME).write_text('{"example":true}\n')
+    dataset = SimpleNamespace(
+        spec=metadata.integration,
+        obs_dim=23,
+        action_dim=7,
+        normalization=metadata.normalization,
+        normalization_stats={"type": "standard", **metadata.normalization.to_dict()},
+        bundle=SimpleNamespace(root=tmp_path, data_sha256="b" * 64),
+        window_config=WindowConfig(
+            observation_history=2, action_history=2, prediction_horizon=3
+        ),
+        split_plan=EpisodeSplit(None, True, (0, 1, 2), (0, 1), (2,), ()),
     )
-    assert metadata["schema_name"] == "action_bridge.mujoco_online"
-    assert metadata["task_name"] == "planar_reach"
-    assert metadata["observation_dim"] == 8
-    assert metadata["action_dim"] == 2
-    assert metadata["action_lower"] == [-2.0, -2.0]
-    assert metadata["control_timestep_s"] == pytest.approx(0.02)
-    assert metadata["normalization"] == _Dataset.normalization_stats
-    assert metadata["collection_identity"] == _Dataset.collection_identity
-    assert metadata["latent_commitment"] == "chunk"
-    assert metadata["clip_actions"] is False
-    assert config.online_evaluation.to_dict() == metadata
-    assert config.data.collection_identity.to_dict() == _Dataset.collection_identity
+    return dataset, config
 
 
-def test_training_metadata_rejects_split_contract_drift() -> None:
-    config = load_config("mujoco_planar_reach_continuous")
-    validation = _Dataset()
-    validation.normalization_stats = deepcopy(_Dataset.normalization_stats)
-    validation.normalization_stats["action_mean"] = [0.1, 0.0]
-    with pytest.raises(ValueError, match="validation dataset normalization_stats"):
-        configure_mujoco_online_metadata(
-            config,
-            _Dataset(),
-            validation,
-            _Dataset(),
-        )
+def test_training_metadata_records_exact_cache_and_optional_test_split(tmp_path):
+    dataset, config = dataset_and_config(tmp_path)
+    value = configure_mujoco_online_metadata(config, dataset, deepcopy(dataset))
+    assert value["splits"] == {"train": [0, 1], "val": [2], "test": []}
+    assert value["collection_identity"]["data_sha256"] == "b" * 64
+    assert (
+        value["collection_identity"]["manifest_sha256"]
+        == hashlib.sha256((tmp_path / MANIFEST_FILENAME).read_bytes()).hexdigest()
+    )
+    validate_checkpoint_config(
+        config.to_dict(), OnlineEvaluationMetadata.from_mapping(value)
+    )
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("action_history", 1, "at least 2"),
-        ("actions_per_plan", 2, "requires eval.actions_per_plan=1"),
-        ("latent_commitment", "trajectory", "must be 'chunk' or 'episode'"),
-    ],
-)
-def test_training_metadata_rejects_unsupported_online_geometry(
-    field: str,
-    value: int | str,
-    message: str,
-) -> None:
-    config = load_config("mujoco_planar_reach_continuous")
-    if field == "actions_per_plan":
-        config.eval.actions_per_plan = value
-    elif field == "latent_commitment":
-        config.inference.latent_commitment = value
-    else:
-        setattr(config, field, value)
-    with pytest.raises(ValueError, match=message):
-        configure_mujoco_online_metadata(config, _Dataset(), _Dataset(), _Dataset())
+def test_training_metadata_rejects_split_contract_drift(tmp_path):
+    dataset, config = dataset_and_config(tmp_path)
+    validation = deepcopy(dataset)
+    validation.bundle.data_sha256 = "c" * 64
+    with pytest.raises(ValueError, match="validation dataset disagrees"):
+        configure_mujoco_online_metadata(config, dataset, validation)
 
 
-def test_training_metadata_rejects_resume_metadata_drift() -> None:
-    config = load_config("mujoco_planar_reach_continuous")
-    config.online_evaluation = {"schema_name": "stale"}
-    with pytest.raises(ValueError, match="disagrees"):
-        configure_mujoco_online_metadata(config, _Dataset(), _Dataset(), _Dataset())
+def test_training_metadata_rejects_changed_cache_on_resume(tmp_path):
+    dataset, config = dataset_and_config(tmp_path)
+    configure_mujoco_online_metadata(config, dataset, dataset)
+    (tmp_path / MANIFEST_FILENAME).write_text('{"different":true}\n')
+    with pytest.raises(ValueError, match="metadata disagrees"):
+        configure_mujoco_online_metadata(config, dataset, dataset)

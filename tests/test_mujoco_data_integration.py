@@ -1,191 +1,181 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
+import pytest
 import torch
-from phi_mujoco.collection import CollectionConfig, CollectionRunner
-from phi_mujoco.evaluation import PolicyInput, PolicyOutput
+from phi_mujoco.offline import EpisodeData, get_integration, write_processed_bundle
 from torch.utils.data import DataLoader
 
 from action_bridge.config import load_config
-from action_bridge.eval.mujoco_online.torch_backend import load_torch_policy_adapter
 from action_bridge.training.common import (
     build_dataset,
     build_model,
-    move_to_device,
     writable_numpy_collate,
 )
 from action_bridge.training.losses import model_loss
-from action_bridge.training.mujoco_online_metadata import (
-    configure_mujoco_online_metadata,
-)
-from action_bridge.training.train_toy import save_checkpoint
 
 
-@dataclass
-class _Observation:
-    values: np.ndarray
+def make_cache(tmp_path: Path, integration_name: str) -> Path:
+    """Three synthetic episodes with an explicit held-out validation episode."""
 
-
-@dataclass
-class _Reset:
-    observation: _Observation
-    info: dict[str, object]
-    seed_report: dict[str, object]
-
-
-@dataclass
-class _Step:
-    observation: _Observation
-    reward: float
-    terminated: bool
-    truncated: bool
-    success: bool
-    info: dict[str, object]
-
-
-class _Runtime:
-    def __init__(self) -> None:
-        self.seed = 0
-        self.step_index = 0
-
-    def _observation(self) -> _Observation:
-        seed = float(self.seed)
-        step = float(self.step_index)
-        return _Observation(
-            np.asarray(
-                [seed, step, seed + step, seed - step, step, -step, 0.2, -0.1],
-                dtype=np.float32,
+    integration = get_integration(integration_name)
+    obs_dim = integration.spec.observations["state"].shape[0]
+    action_dim = integration.spec.action.shape[0]
+    steps = 12
+    episodes = []
+    for index in range(3):
+        state = (
+            np.arange((steps + 1) * obs_dim, dtype=np.float32).reshape(
+                steps + 1, obs_dim
+            )
+            / 100
+            + index * 100
+        )
+        actions = (
+            np.linspace(-0.9, 0.3, steps * action_dim, dtype=np.float32).reshape(
+                steps, action_dim
+            )
+            + index * 0.3
+        )
+        success = np.zeros(steps, dtype=np.bool_)
+        success[-1] = True
+        episodes.append(
+            EpisodeData(
+                episode_index=index,
+                seed=index,
+                observations={"state": state},
+                actions=actions,
+                action_history_padding=np.zeros(action_dim, dtype=np.float32),
+                rewards=success.astype(np.float64),
+                terminated=success.copy(),
+                truncated=np.zeros(steps, dtype=np.bool_),
+                success=success,
+                termination_reason="success",
+                source_episode_id=f"demo_{index}",
             )
         )
-
-    def reset(self, *, seed: int | None = None) -> _Reset:
-        self.seed = 0 if seed is None else seed
-        self.step_index = 0
-        return _Reset(
-            observation=self._observation(),
-            info={},
-            seed_report={
-                "generator": "test.sequence",
-                "requested_seed": self.seed,
-                "resolved_seed": self.seed,
-            },
-        )
-
-    def step(self, action: np.ndarray) -> _Step:
-        assert action.shape == (2,)
-        self.step_index += 1
-        success = self.step_index == 6
-        return _Step(
-            observation=self._observation(),
-            reward=-float(self.step_index),
-            terminated=success,
-            truncated=False,
-            success=success,
-            info={},
-        )
-
-    def close(self) -> None:
-        return None
-
-
-class _Policy:
-    def reset(self, *, task_name: str, variation_id: int, seed: int) -> None:
-        del task_name, variation_id, seed
-
-    def predict(self, observation: PolicyInput) -> PolicyOutput:
-        value = 0.1 * (observation.episode_step + 1)
-        return PolicyOutput(np.asarray([value, -value], dtype=np.float32))
-
-
-def _provenance() -> dict[str, object]:
-    return {
-        "backend": {},
-        "cache": {},
-        "environment": {},
-        "generated_at_utc": "2026-08-19T12:00:00+00:00",
-        "host": {},
-        "preprocessing": None,
-        "schema_name": "phi.robotics.provenance",
-        "schema_version": 1,
-        "simulator": {},
-        "software": {},
-    }
-
-
-def _collection(tmp_path: Path) -> Path:
-    root = tmp_path / "collection"
-    CollectionRunner(
-        runtime=_Runtime(),
-        policy=_Policy(),
-        config=CollectionConfig(episodes=6, max_steps=6, base_seed=100),
-    ).run(
-        output_directory=root,
-        provenance=_provenance(),
-        resolved_config={"fixture": "action-bridge-mujoco-integration"},
+    root = tmp_path / integration_name
+    write_processed_bundle(
+        root,
+        integration=integration,
+        episodes=episodes,
+        splits={"train": [0, 1], "val": [2], "test": []},
     )
     return root
 
 
-def test_validated_bundle_reaches_loss_checkpoint_and_online_adapter(
-    tmp_path: Path,
+@pytest.mark.parametrize("task,obs_dim", [("square", 23), ("tool_hang", 53)])
+def test_official_splits_train_only_stats_and_aligned_windows(
+    tmp_path: Path, task: str, obs_dim: int
 ) -> None:
-    config = load_config("mujoco_planar_reach_direct_chunk_bc")
-    config.device = "cpu"
-    config.data.collection_root = str(_collection(tmp_path))
-    config.eval.clip_actions = True
+    config = load_config(f"mujoco_robomimic_{task}")
+    config.data.cache_root = str(make_cache(tmp_path, f"robomimic_{task}"))
+    # Manifest partitions take precedence over these fallback fractions.
+    config.data.train_fraction = 0.5
+    config.data.val_fraction = 0.25
+    config.data.split_seed = 123
+    train = build_dataset(config, split="train")
+    config.data.normalization = train.normalization.to_dict()
+    validation = build_dataset(config, split="val")
+
+    assert train.split_plan.config is None
+    assert train.episode_indices == (0, 1)
+    assert validation.episode_indices == (2,)
+    assert train.split_plan.test_episode_indices == ()
+    assert validation.normalization == train.normalization
+    assert train.normalization.source_episode_indices == (0, 1)
+    assert train.normalization_stats["type"] == "standard"
+    assert (train.obs_dim, train.action_dim) == (obs_dim, 7)
+    episodes = [train.bundle.load_episode(i) for i in train.episode_indices]
+    expected_states = np.concatenate(
+        [episode.observations["state"] for episode in episodes]
+    )
+    expected_actions = np.concatenate([episode.actions for episode in episodes])
+    np.testing.assert_allclose(
+        train.normalization.obs_mean, expected_states.mean(0), rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        train.normalization.action_mean, expected_actions.mean(0), atol=1e-7
+    )
+
+    start = train.item_from_episode_time(0, 0)
+    assert start["obs_hist"].shape == (2, obs_dim)
+    assert start["future_actions"].shape == (8, 7)
+    assert start["obs_history_mask"].tolist() == [False, True]
+    assert start["action_history_mask"].tolist() == [False, False]
+    np.testing.assert_array_equal(start["obs_hist"][0], start["obs_hist"][1])
+    np.testing.assert_allclose(
+        start["act_hist"],
+        train.normalization.normalize_actions(np.zeros((2, 7), dtype=np.float32)),
+    )
+    item = train.item_from_episode_time(0, 3)
+    np.testing.assert_allclose(
+        item["obs_hist"],
+        train.normalization.normalize_observations(
+            episodes[0].observations["state"][2:4]
+        ),
+    )
+    np.testing.assert_allclose(
+        item["act_hist"],
+        train.normalization.normalize_actions(episodes[0].actions[1:3]),
+    )
+    np.testing.assert_allclose(
+        item["future_actions"],
+        train.normalization.normalize_actions(episodes[0].actions[3:11]),
+    )
+    assert item["future_action_mask"].all()
+    assert len(train) == 2 * (12 - 8 + 1)
+    assert train.sample_batch(3, np.random.default_rng(0))["obs_hist"].shape == (
+        3,
+        2,
+        obs_dim,
+    )
+    with pytest.raises(ValueError, match="no eligible episodes"):
+        build_dataset(config, split="test")
+
+
+@pytest.mark.parametrize("task", ["square", "tool_hang"])
+@pytest.mark.parametrize("latent_type", ["none", "continuous"])
+def test_robomimic_state_windows_train_existing_bridge_model(
+    tmp_path: Path, task: str, latent_type: str
+) -> None:
+    config = load_config(f"mujoco_robomimic_{task}")
+    config.data.cache_root = str(make_cache(tmp_path, f"robomimic_{task}"))
+    config.model.latent_type = latent_type
     config.model.hidden_dim = 8
     config.model.h_emb_dim = 8
-    config.model.depth = 1
-
+    config.reference.hidden_dim = 8
     train = build_dataset(config, split="train")
     config.data.normalization_stats = train.normalization_stats
-    config.data.normalization = train.normalization.to_json_dict()
-    validation = build_dataset(config, split="val")
-    test = build_dataset(config, split="test")
-    metadata = configure_mujoco_online_metadata(config, train, validation, test)
-
-    assert len(train) > 0 and len(validation) > 0 and len(test) > 0
-    assert metadata["collection_identity"] == train.collection_identity
-    first = train.item_from_episode_time(train.episode_indices[0], 0)
-    assert first["action_history_mask"].tolist() == [False, False]
-
-    loader = DataLoader(
-        train,
-        batch_size=2,
-        shuffle=False,
-        collate_fn=writable_numpy_collate,
+    batch = next(
+        iter(DataLoader(train, batch_size=2, collate_fn=writable_numpy_collate))
     )
-    batch = move_to_device(next(iter(loader)), torch.device("cpu"))
     model = build_model(config)
-    output = model_loss(model, batch, config.loss, global_step=1)
-    assert torch.isfinite(output["loss"])
+    loss = model_loss(model, batch, config.loss, global_step=1)["loss"]
+    assert torch.isfinite(loss)
+    loss.backward()
+    gradients = [
+        parameter.grad for parameter in model.parameters() if parameter.grad is not None
+    ]
+    assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
 
-    optimizer = torch.optim.AdamW(model.parameters())
-    checkpoint = tmp_path / "checkpoint.pt"
-    save_checkpoint(
-        checkpoint,
-        model,
-        optimizer,
-        config,
-        1,
-        float(output["loss"].detach()),
+
+def test_offline_mujoco_adapter_does_not_import_simulator() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from action_bridge.config import load_config; "
+            "load_config('mujoco_robomimic_square'); "
+            "import action_bridge.data.mujoco_adapter; "
+            "assert not {'mujoco', 'robosuite', 'gymnasium'} & sys.modules.keys()",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
     )
-    adapter = load_torch_policy_adapter(
-        checkpoint,
-        trusted_checkpoint=True,
-        device="cpu",
-    )
-    adapter.reset(task_name="planar_reach", variation_id=0, seed=5)
-    policy_output = adapter.predict(
-        PolicyInput(
-            observation=np.zeros(8, dtype=np.float32),
-            task_name="planar_reach",
-            variation_id=0,
-            episode_step=0,
-        )
-    )
-    assert policy_output.actions.shape == (config.chunk_horizon, 2)
-    assert np.isfinite(policy_output.actions).all()
+    assert result.returncode == 0, result.stderr

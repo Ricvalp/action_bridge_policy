@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -27,7 +28,9 @@ def _normalization(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
         return None
     stats = data.get("normalization_stats")
     if not isinstance(stats, Mapping):
-        raise TypeError("normalized MuJoCo evaluation requires data.normalization_stats")
+        raise TypeError(
+            "normalized MuJoCo evaluation requires data.normalization_stats"
+        )
     return stats
 
 
@@ -37,8 +40,12 @@ def _denormalize_actions(
 ) -> torch.Tensor:
     if stats is None:
         return actions
-    mean = torch.as_tensor(stats["action_mean"], dtype=actions.dtype, device=actions.device)
-    std = torch.as_tensor(stats["action_std"], dtype=actions.dtype, device=actions.device)
+    mean = torch.as_tensor(
+        stats["action_mean"], dtype=actions.dtype, device=actions.device
+    )
+    std = torch.as_tensor(
+        stats["action_std"], dtype=actions.dtype, device=actions.device
+    )
     return actions * std + mean
 
 
@@ -52,11 +59,12 @@ def evaluate_mujoco_offline(
     output_dir: Path | None = None,
     max_batches: int = 0,
 ) -> dict[str, float]:
-    """Evaluate predicted torque chunks in physical units.
+    """Evaluate action chunks in the integration's original action coordinates.
 
-    This evaluator deliberately contains no planar-arm plotting or simulator
-    rollout logic.  Closed-loop metrics are produced by phi-mujoco's native
-    ``EvaluationRunner`` through the downstream online adapter.
+    Undo training normalization before computing errors. These coordinates are
+    torques for planar reach and normalized controller commands for Robomimic.
+    Predictions remain unclipped for errors; the integration's public projection
+    reports how many action values would change before execution.
     """
 
     eval_config = config.get("eval", {})
@@ -68,8 +76,9 @@ def evaluate_mujoco_offline(
         collate_fn=writable_numpy_collate,
     )
     stats = _normalization(config)
-    lower = torch.tensor([-2.0, -2.0], dtype=torch.float64, device=device)
-    upper = torch.tensor([2.0, 2.0], dtype=torch.float64, device=device)
+    integration = dataset.integration
+    spec = dataset.spec
+    action_dim = spec.action.shape[0]
 
     squared_error = 0.0
     absolute_error = 0.0
@@ -79,8 +88,8 @@ def evaluate_mujoco_offline(
     target_norm = 0.0
     path_kl = 0.0
     bound_violations = 0
-    target_saturated = 0
     action_values = 0
+    actions = 0
     first_action_values = 0
     chunks = 0
     batches = 0
@@ -99,13 +108,17 @@ def evaluate_mujoco_offline(
         predicted = _denormalize_actions(prediction["actions"], stats).to(torch.float64)
         target = _denormalize_actions(batch["future_actions"], stats).to(torch.float64)
         history = _denormalize_actions(batch["act_hist"], stats).to(torch.float64)
-        if predicted.shape != target.shape or predicted.ndim != 3 or predicted.shape[-1] != 2:
+        if (
+            predicted.shape != target.shape
+            or predicted.ndim != 3
+            or predicted.shape[-1] != action_dim
+        ):
             raise ValueError(
-                "MuJoCo prediction and target must have matching [B,H,2] shapes; "
+                f"MuJoCo prediction and target must have matching [B,H,{action_dim}] shapes; "
                 f"got {tuple(predicted.shape)} and {tuple(target.shape)}"
             )
         if not torch.isfinite(predicted).all():
-            raise ValueError("MuJoCo offline prediction contains non-finite torques")
+            raise ValueError("MuJoCo offline prediction contains non-finite actions")
 
         difference = predicted - target
         squared_error += float(difference.square().sum().cpu())
@@ -115,33 +128,48 @@ def evaluate_mujoco_offline(
         predicted_norm += float(torch.linalg.vector_norm(predicted, dim=-1).sum().cpu())
         target_norm += float(torch.linalg.vector_norm(target, dim=-1).sum().cpu())
         path_kl += float(prediction["path_kl_energy"].to(torch.float64).sum().cpu())
-        bound_violations += int(((predicted < lower) | (predicted > upper)).sum().cpu())
-        target_saturated += int(
-            ((target - lower).abs() <= 1e-6).logical_or((target - upper).abs() <= 1e-6).sum().cpu()
-        )
+        raw_actions = predicted.cpu().numpy().astype(spec.action.dtype)
+        projected_actions = integration.project_action(raw_actions)
+        bound_violations += int(np.count_nonzero(raw_actions != projected_actions))
         action_values += int(target.numel())
+        actions += int(target.shape[0] * target.shape[1])
         first_action_values += int(target[:, 0].numel())
         chunks += int(target.shape[0])
         batches += 1
 
     if batches == 0 or chunks == 0 or action_values == 0:
         raise ValueError("MuJoCo offline evaluation received no batches")
-    horizon_actions = action_values // 2
     metrics = {
-        "action_mse_nm2": squared_error / action_values,
-        "action_l1_nm": absolute_error / action_values,
-        "first_action_mse_nm2": first_squared_error / first_action_values,
-        "chunk_boundary_mse_nm2": boundary_error / first_action_values,
-        "predicted_torque_norm_nm": predicted_norm / horizon_actions,
-        "target_torque_norm_nm": target_norm / horizon_actions,
+        "action_mse": squared_error / action_values,
+        "action_l1": absolute_error / action_values,
+        "first_action_mse": first_squared_error / first_action_values,
+        "chunk_boundary_mse": boundary_error / first_action_values,
+        "predicted_action_norm": predicted_norm / actions,
+        "target_action_norm": target_norm / actions,
         "predicted_bound_violation_rate": bound_violations / action_values,
-        "target_saturation_rate": target_saturated / action_values,
-        "path_kl_energy": path_kl / chunks,
+        "normalized_path_kl_energy": path_kl / chunks,
         "evaluated_chunks": float(chunks),
         "evaluated_batches": float(batches),
     }
     if output_dir is not None:
         save_json(output_dir / "metrics" / "mujoco_offline_metrics.json", metrics)
+        save_json(
+            output_dir / "metrics" / "mujoco_offline_metadata.json",
+            {
+                "integration_spec": spec.to_dict(),
+                "action_metric_coordinates": "original action profile, before projection",
+                "action_metric_units": (
+                    "action profile units; squared for MSE metrics. "
+                    "Robomimic uses normalized controller commands; planar reach uses Nm."
+                ),
+                "normalization_stats": stats,
+                "path_kl_coordinates": (
+                    "training-normalized actions"
+                    if stats is not None
+                    else "original action profile"
+                ),
+            },
+        )
     return metrics
 
 

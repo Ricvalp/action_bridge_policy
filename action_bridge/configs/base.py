@@ -354,29 +354,35 @@ def pusht_lowdim_config(latent_type: str) -> ConfigDict:
     return config
 
 
-def mujoco_planar_reach_config(latent_type: str) -> ConfigDict:
-    """Return the first native-MuJoCo imitation-learning experiment config.
+def mujoco_config(
+    integration: str,
+    latent_type: str,
+    *,
+    chunk_horizon: int = 8,
+    actions_per_plan: int = 4,
+) -> ConfigDict:
+    """State-based Action Bridge settings for one phi-mujoco integration.
 
-    The model and loss are the existing low-dimensional Action Bridge stack,
-    while the data and evaluation fields bind it to phi-mujoco's named
-    planar-reach state and direct-torque profiles.  These defaults are an
-    integration baseline, not a tuned research result.
+    Dimensions and task semantics come from the backend's public specification.
+    Training defaults are starting settings, not tuned benchmark results.
     """
 
-    config = _toy_common("mujoco_planar_reach")
+    from phi_mujoco.offline import get_integration
+
+    spec = get_integration(integration).spec
+    config = _toy_common("mujoco")
     config.device = "cuda"
-    # Planar-reach demonstrations are roughly 30 steps long.  A four-step
-    # target keeps near-goal transitions in the full-horizon training set while
-    # retaining a genuinely chunked prediction problem.
-    config.chunk_horizon = 4
+    config.chunk_horizon = chunk_horizon
     config.obs_history = 2
     config.action_history = 2
-    config.obs_dim = 8
-    config.action_dim = 2
+    config.obs_dim = spec.observations["state"].shape[0]
+    config.action_dim = spec.action.shape[0]
     config.output_dir = "workspace/experiments/mujoco"
 
     config.data = ConfigDict()
-    config.data.collection_root = None
+    config.data.integration = integration
+    config.data.cache_root = None
+    # Used only for caches without an official train/validation partition.
     config.data.train_fraction = 0.8
     config.data.val_fraction = 0.1
     config.data.split_seed = 0
@@ -386,15 +392,17 @@ def mujoco_planar_reach_config(latent_type: str) -> ConfigDict:
     config.data.normalization = None
     config.data.normalization_eps = 1e-6
     config.data.pad_episode_starts = True
-    config.data.observation_profile = "phi.mujoco.planar_reach.state.v1"
-    config.data.action_profile = "phi.mujoco.planar_reach.joint_torque.v1"
+    config.data.observation_profile = spec.observation_profile
+    config.data.action_profile = spec.action_profile
 
-    config.model = _toy_model(latent_type)
+    config.model = _toy_model("continuous" if latent_type == "none" else latent_type)
+    if latent_type == "none":
+        # Keep continuous-latent settings available for a one-field override.
+        config.model.latent_type = "none"
     config.model.hidden_dim = 256
     config.model.h_emb_dim = 256
     config.model.z_embed_dim = 32
-    # Normalized torques regularly require O(1) residuals from the continuation
-    # reference; the toy-policy default of 0.05 cannot represent them.
+    # Standardized actions need residuals of order one from the reference.
     config.model.control_scale = 2.0
     if latent_type == "continuous":
         config.model.z_dim = 4
@@ -420,26 +428,32 @@ def mujoco_planar_reach_config(latent_type: str) -> ConfigDict:
 
     config.inference = _toy_inference()
     config.inference.deterministic = True
-    # The current scripted collection is single-mode.  Episode commitment is
-    # supported by the adapter and should be used for a future paired-mode set.
     config.inference.latent_commitment = "chunk"
-    config.inference.n_exec = 1
+    config.inference.n_exec = actions_per_plan
 
     config.logging = _logging_config()
     config.logging.full_eval_every_steps = 0
     config.logging.sim_eval_enabled = False
     config.logging.sim_eval_async = False
+    config.logging.validation_max_batches = 0
+    config.logging.progress = True
 
     config.eval = ConfigDict()
     config.eval.batch_size = 256
     config.eval.offline_max_batches = 0
     config.eval.online_episodes = 50
     config.eval.online_seed = 1_000_000
-    config.eval.online_max_steps = 200
-    config.eval.actions_per_plan = 1
-    config.eval.clip_actions = False
+    config.eval.online_max_steps = spec.default_episode_steps
+    config.eval.actions_per_plan = actions_per_plan
+    config.eval.clip_actions = True
     config.eval.record_video = False
     return config
+
+
+def mujoco_planar_reach_config(latent_type: str) -> ConfigDict:
+    """Short-horizon settings for the simple planar-reach integration."""
+
+    return mujoco_config("planar_reach", latent_type, chunk_horizon=4, actions_per_plan=1)
 
 
 def isaaclab_franka_cube_lift_config(latent_type: str) -> ConfigDict:
