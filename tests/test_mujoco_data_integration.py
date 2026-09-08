@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import h5py
 import numpy as np
 import pytest
 import torch
@@ -136,6 +137,97 @@ def test_official_splits_train_only_stats_and_aligned_windows(
     )
     with pytest.raises(ValueError, match="no eligible episodes"):
         build_dataset(config, split="test")
+
+
+@pytest.mark.parametrize("task", ["square", "tool_hang"])
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("split", ["train", "val"])
+def test_ram_windows_match_backend_without_batch_time_disk_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task: str,
+    normalize: bool,
+    split: str,
+) -> None:
+    config = load_config(f"mujoco_robomimic_{task}")
+    config.data.cache_root = str(make_cache(tmp_path, f"robomimic_{task}"))
+    config.data.normalize = normalize
+    dataset = build_dataset(config, split=split)
+
+    # Use the backend's public window API as the numerical reference, including
+    # the padded first window and the last full prediction horizon per episode.
+    expected = []
+    for index in range(len(dataset)):
+        item = dataset.windows[index]
+        expected.append({**item, "obs_hist": item["obs_hist"]["state"]})
+    reference_batch = dataset.windows.sample_batch(7, np.random.default_rng(42))
+    reference_batch["obs_hist"] = reference_batch["obs_hist"]["state"]
+    expected_arrays = {
+        key: np.stack([item[key] for item in expected]) for key in expected[0]
+    }
+    assert dataset.cached_nbytes == sum(
+        value.nbytes for value in expected_arrays.values()
+    )
+    assert dataset.normalization is dataset.windows.normalization
+    assert dataset.split_plan == dataset.windows.split_plan
+    assert dataset.episode_indices == ((0, 1) if split == "train" else (2,))
+    if normalize:
+        assert dataset.normalization.source_episode_indices == (0, 1)
+    else:
+        assert dataset.normalization is None
+        assert dataset.normalization_stats is None
+
+    def unexpected_hdf5_read(*args, **kwargs):
+        pytest.fail("RAM-resident training windows must not reopen HDF5 files")
+
+    # No backend source changes or patches: guard file access only after all
+    # data and numerical references have been prepared.
+    monkeypatch.setattr(h5py, "File", unexpected_hdf5_read)
+
+    def assert_same_arrays(actual, reference):
+        assert actual.keys() == reference.keys()
+        for key, expected_value in reference.items():
+            value = np.asarray(actual[key])
+            assert value.shape == expected_value.shape, key
+            assert value.dtype == expected_value.dtype, key
+            assert value.flags.c_contiguous, key
+            np.testing.assert_array_equal(value, expected_value, err_msg=key)
+
+    for index, item in enumerate(expected):
+        assert_same_arrays(dataset[index], item)
+        assert_same_arrays(
+            dataset.item_from_episode_time(
+                int(item["episode_index"]), int(item["time_index"])
+            ),
+            item,
+        )
+    assert_same_arrays(dataset[-1], expected[-1])
+    assert_same_arrays(
+        dataset.sample_batch(7, np.random.default_rng(42)), reference_batch
+    )
+
+    # Augmentation or tensor conversion may mutate returned arrays, but must
+    # never corrupt the cached data used by a later minibatch.
+    item = dataset[0]
+    item["obs_hist"].fill(-12345)
+    assert_same_arrays(dataset[0], expected[0])
+    batch = dataset.sample_batch(7, np.random.default_rng(42))
+    batch["future_actions"].fill(-12345)
+    assert_same_arrays(
+        dataset.sample_batch(7, np.random.default_rng(42)), reference_batch
+    )
+
+    batches = list(DataLoader(dataset, batch_size=3, shuffle=False))
+    for key, values in expected_arrays.items():
+        actual = np.concatenate([batch[key].numpy() for batch in batches])
+        np.testing.assert_array_equal(actual, values, err_msg=key)
+
+    with pytest.raises(IndexError):
+        dataset[len(dataset)]
+    with pytest.raises(ValueError):
+        dataset.item_from_episode_time(99, 0)
+    with pytest.raises(ValueError):
+        dataset.item_from_episode_time(dataset.episode_indices[0], 5)
 
 
 @pytest.mark.parametrize("task", ["square", "tool_hang"])

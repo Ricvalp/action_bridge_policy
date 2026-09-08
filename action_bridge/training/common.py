@@ -145,6 +145,7 @@ def build_dataset(config: Dict, split: str):
             normalize=bool(data_cfg.get("normalize", True)),
             normalization=to_plain_dict(data_cfg.get("normalization")),
             normalization_eps=float(data_cfg.get("normalization_eps", 1e-6)),
+            progress=bool(config.get("logging", {}).get("progress", False)),
         )
     if benchmark == "isaaclab_franka_cube_lift":
         # This package contains only the simulator-free HDF5/window layer.

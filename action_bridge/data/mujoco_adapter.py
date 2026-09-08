@@ -14,13 +14,15 @@ from phi_mujoco.offline import (
     WindowDataset,
     get_integration,
 )
+from tqdm.auto import tqdm
 
 
 class MujocoStateDataset:
-    """Use backend windowing, splits, and normalization without simulator imports.
+    """Keep the backend's low-dimensional training windows in CPU RAM.
 
-    The only batch conversion is replacing ``obs_hist['state']`` with the
-    state array expected by the low-dimensional Action Bridge model.
+    The backend defines splits, normalization, padding, and action alignment.
+    Materialize its outputs once so minibatches never reread HDF5 episodes.
+    Only ``obs_hist['state']`` is flattened into the model's batch format.
     """
 
     def __init__(
@@ -35,6 +37,7 @@ class MujocoStateDataset:
         normalize: bool = True,
         normalization: StandardNormalization | Mapping[str, object] | None = None,
         normalization_eps: float = 1e-6,
+        progress: bool = False,
     ) -> None:
         self.integration = get_integration(integration)
         self.spec = self.integration.spec
@@ -75,6 +78,33 @@ class MujocoStateDataset:
             else None
         )
 
+        first = self._model_batch(self.windows[0])
+        self._arrays = {
+            name: np.empty((len(self.windows), *value.shape), dtype=value.dtype)
+            for name, value in first.items()
+        }
+        for index in tqdm(
+            range(len(self.windows)),
+            desc=f"Caching {split} windows in RAM",
+            unit="window",
+            disable=not progress,
+        ):
+            item = first if index == 0 else self._model_batch(self.windows[index])
+            for name, value in item.items():
+                self._arrays[name][index] = value
+        self._window_indices = {
+            (int(episode), int(time)): index
+            for index, (episode, time) in enumerate(
+                zip(self._arrays["episode_index"], self._arrays["time_index"])
+            )
+        }
+
+    @property
+    def cached_nbytes(self) -> int:
+        """Array storage only, excluding small Python metadata objects."""
+
+        return sum(array.nbytes for array in self._arrays.values())
+
     @staticmethod
     def _model_batch(item: dict[str, Any]) -> dict[str, Any]:
         return {**item, "obs_hist": item["obs_hist"]["state"]}
@@ -83,14 +113,26 @@ class MujocoStateDataset:
         return len(self.windows)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        return self._model_batch(self.windows[index])
+        # Return independent writable arrays, as the backend does.
+        return {
+            name: np.array(array[index], copy=True)
+            for name, array in self._arrays.items()
+        }
 
     def item_from_episode_time(
         self, episode_index: int, time_index: int
     ) -> dict[str, Any]:
-        return self._model_batch(
-            self.windows.item_from_episode_time(episode_index, time_index)
-        )
+        try:
+            index = self._window_indices[episode_index, time_index]
+        except KeyError as exc:
+            raise ValueError(
+                f"no cached window for episode {episode_index}, time {time_index} "
+                f"in split {self.split!r}"
+            ) from exc
+        return self[index]
 
     def sample_batch(self, batch_size: int, rng: np.random.Generator) -> dict[str, Any]:
-        return self._model_batch(self.windows.sample_batch(batch_size, rng))
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        indices = rng.integers(0, len(self), size=batch_size)
+        return {name: array[indices] for name, array in self._arrays.items()}

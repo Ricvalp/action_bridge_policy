@@ -24,7 +24,6 @@ from action_bridge.training.common import (
     save_json,
     seed_everything,
     tensor_metrics_to_float,
-    writable_numpy_collate,
 )
 from action_bridge.training.losses import model_loss
 from action_bridge.training.mujoco_online_metadata import (
@@ -103,6 +102,12 @@ def train(config):
     configure_mujoco_online_metadata(config, train_set, val_set, test_set)
     config.provenance = training_provenance()
 
+    cached_nbytes = sum(
+        dataset.cached_nbytes
+        for dataset in (train_set, val_set, test_set)
+        if dataset is not None
+    )
+
     run_dir = make_run_dir(config)
     save_config(config, run_dir / "config.json")
     save_json(run_dir / "provenance.json", config.provenance.to_dict())
@@ -111,7 +116,8 @@ def train(config):
         f"{len(train_set.split_plan.val_episode_indices)} validation / "
         f"{len(train_set.split_plan.test_episode_indices)} test episodes; "
         f"state={train_set.obs_dim}, action={train_set.action_dim}, "
-        f"horizon={config.chunk_horizon}; device={device}",
+        f"horizon={config.chunk_horizon}; device={device}; "
+        f"window arrays in RAM={cached_nbytes / 1024**2:.1f} MiB",
         flush=True,
     )
     batch_size = int(config.optim.batch_size)
@@ -122,13 +128,11 @@ def train(config):
         batch_size=batch_size,
         shuffle=True,
         drop_last=False,
-        collate_fn=writable_numpy_collate,
     )
     val_loader = DataLoader(
         val_set,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=writable_numpy_collate,
     )
     batches = cycle(train_loader)
 

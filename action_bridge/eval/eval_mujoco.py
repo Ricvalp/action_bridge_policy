@@ -15,7 +15,6 @@ from action_bridge.eval.rollout import predict_actions
 from action_bridge.training.common import (
     move_to_device,
     save_json,
-    writable_numpy_collate,
 )
 
 
@@ -73,7 +72,6 @@ def evaluate_mujoco_offline(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=writable_numpy_collate,
     )
     stats = _normalization(config)
     integration = dataset.integration

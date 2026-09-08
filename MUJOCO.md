@@ -99,6 +99,14 @@ The task configs use the existing Action Bridge model. Their default is the
 no-latent reference/controller variant, with width 256. They are starting
 settings, not tuned contact-task baselines.
 
+Before training, Action Bridge copies the backend's normalized windows into
+CPU RAM, with a short loading progress bar. Training and validation then read
+these arrays, not HDF5. Square at horizon eight needs about 13 MiB of window
+arrays across both splits; the trainer prints the actual size. This adds a
+one-time startup cost but avoids rereading whole episodes every minibatch.
+No reconversion, extra cache files, or backend changes are needed. This simple
+in-memory path is for small state datasets, not large image/point-cloud data.
+
 Training preserves the official 180 train / 20 validation episodes. It fits
 normalization only on those 180 training episodes. There is no offline test
 split, so final offline metrics are labelled validation metrics. By default,
