@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Setup and transfer instructions: MUJOCO.md, "Run on the HPC".
 # Submit from action_bridge_policy after creating hpc/logs.
+# Log in once on the HPC before submitting: .venv/bin/wandb login
 # gpuq + gpu:1 is the H200 allocation used by the existing jobs here.
 #SBATCH --job-name=square_latent_5m
 #SBATCH --partition=gpuq
@@ -54,4 +55,5 @@ uv run --frozen --no-sync --extra cu128 --extra robomimic \
   eval.actions_per_plan=4 \
   inference.latent_commitment=chunk \
   optim.batch_size=256 \
-  optim.max_steps=50000
+  optim.max_steps=100000 \
+  logging.wandb.enabled=true
