@@ -44,7 +44,7 @@ run_id="square-latent-5m-h8-exec4-${SLURM_JOB_ID}-$(date -u +%Y%m%dT%H%M%SZ)"
 uv run --frozen --no-sync --extra cu128 --extra robomimic \
   python -m action_bridge.training.train_mujoco \
   --config-name mujoco_robomimic_square \
-  data.cache_root="$PWD/data/robomimic_square" \
+  data.cache_root="$PWD/../phi-mujoco/datasets/processed/robomimic_square-20260908T122032Z" \
   run_id="$run_id" \
   device=cuda \
   model.latent_type=continuous \
