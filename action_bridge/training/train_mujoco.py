@@ -30,13 +30,26 @@ from action_bridge.training.mujoco_online_metadata import (
     configure_mujoco_online_metadata,
 )
 from action_bridge.training.mujoco_provenance import training_provenance
+from action_bridge.training.mujoco_sim_eval import AsyncMujocoEvaluator
 from action_bridge.training.train_toy import (
     attach_wandb_run_metadata,
-    log_wandb_scalars,
     maybe_init_wandb,
     maybe_update_reference_ema,
     save_checkpoint,
 )
+
+
+def log_wandb_scalars(wandb_run, metrics: dict, *, step: int, prefix: str) -> None:
+    """Use explicit chart axes so delayed simulation results cannot rewind W&B."""
+    if wandb_run is None:
+        return
+    payload = {
+        f"{prefix}/{key}": value
+        for key, value in metrics.items()
+        if isinstance(value, (float, int)) and not isinstance(value, bool)
+    }
+    payload[f"{prefix}/step"] = step
+    wandb_run.log(payload)
 
 
 def _offline_max_batches(config) -> int:
@@ -161,12 +174,16 @@ def train(config):
     checkpoint_every = int(logging.checkpoint_every_steps)
     full_eval_every = int(logging.get("full_eval_every_steps", 0))
     validation_max_batches = int(logging.get("validation_max_batches", 0))
+    sim_eval_enabled = bool(logging.get("sim_eval_enabled", False))
+    sim_eval_every = int(logging.get("sim_eval_every_steps", 2_000))
     if log_every < 1 or eval_every < 1:
         raise ValueError(
             "logging.log_every_steps and eval_every_steps must be positive"
         )
     if validation_max_batches < 0:
         raise ValueError("logging.validation_max_batches must be non-negative")
+    if sim_eval_enabled and sim_eval_every < 1:
+        raise ValueError("logging.sim_eval_every_steps must be positive")
 
     start_step = 1
     best_mse = float("inf")
@@ -177,6 +194,10 @@ def train(config):
         )
 
     wandb_run = maybe_init_wandb(config, run_dir)
+    if wandb_run is not None:
+        for prefix in ("train", "val", "offline_eval", "offline_val", "offline_test"):
+            wandb_run.define_metric(f"{prefix}/step")
+            wandb_run.define_metric(f"{prefix}/*", step_metric=f"{prefix}/step")
     attach_wandb_run_metadata(config, wandb_run)
     save_config(config, run_dir / "config.json")
     progress = tqdm(
@@ -185,8 +206,13 @@ def train(config):
         unit="step",
         disable=not bool(logging.get("progress", True)),
     )
+    sim_evaluator = None
     try:
+        if sim_eval_enabled:
+            sim_evaluator = AsyncMujocoEvaluator(config, run_dir, wandb_run)
         for step in progress:
+            if sim_evaluator is not None:
+                sim_evaluator.poll()
             model.train()
             batch = move_to_device(next(batches), device)
             output = model_loss(model, batch, config.loss, global_step=step)
@@ -266,6 +292,12 @@ def train(config):
                     step,
                     best_mse,
                 )
+            if (
+                sim_evaluator is not None
+                and step % sim_eval_every == 0
+                and step != max_steps
+            ):
+                sim_evaluator.submit(model, optimizer, config, step, best_mse)
 
         final_step = max_steps if start_step <= max_steps else start_step - 1
         save_checkpoint(
@@ -289,10 +321,18 @@ def train(config):
         log_wandb_scalars(
             wandb_run, metrics, step=final_step, prefix=f"offline_{final_split}"
         )
+        if sim_evaluator is not None:
+            # Drain the previous snapshot, then always evaluate the final model.
+            # This wait is after optimization, never inside a training step.
+            sim_evaluator.finish()
+            sim_evaluator.submit(model, optimizer, config, final_step, best_mse)
+            sim_evaluator.finish()
         print(f"Run directory: {run_dir}", flush=True)
         print(metrics, flush=True)
         return run_dir
     finally:
+        if sim_evaluator is not None:
+            sim_evaluator.close()
         progress.close()
         if wandb_run is not None:
             wandb_run.finish()

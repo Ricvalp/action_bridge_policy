@@ -232,3 +232,82 @@ def test_square_continuous_latent_configuration_has_about_five_million_parameter
         )
         == 5_069_624
     )
+
+
+@pytest.mark.parametrize("fail_training", [False, True])
+def test_background_simulation_lifecycle(tmp_path, monkeypatch, fail_training):
+    bundle = _cache(tmp_path / "cache", "robomimic_square")
+    config = apply_overrides(
+        load_config("mujoco_robomimic_square"),
+        [
+            f"data.cache_root={bundle.root}",
+            f"output_dir={tmp_path / 'runs'}",
+            "run_id=async-hooks",
+            "device=cpu",
+            "model.hidden_dim=16",
+            "model.h_emb_dim=16",
+            "optim.batch_size=2",
+            "optim.max_steps=4",
+            "logging.progress=false",
+            "logging.eval_every_steps=4",
+            "logging.validation_max_batches=1",
+            "eval.offline_max_batches=1",
+            "logging.sim_eval_enabled=true",
+            "logging.sim_eval_every_steps=2",
+        ],
+    )
+    events = []
+
+    class Evaluator:
+        def __init__(self, config, run_dir, wandb_run):
+            events.append("init")
+
+        def poll(self):
+            events.append("poll")
+
+        def submit(self, model, optimizer, config, step, best_mse):
+            events.append(("submit", step))
+            return True
+
+        def finish(self):
+            events.append("finish")
+
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(train_mujoco, "AsyncMujocoEvaluator", Evaluator)
+    if fail_training:
+        def fail(*args, **kwargs):
+            raise RuntimeError("training failed")
+
+        monkeypatch.setattr(train_mujoco, "model_loss", fail)
+        with pytest.raises(RuntimeError, match="training failed"):
+            train(config)
+        assert events == ["init", "poll", "close"]
+    else:
+        train(config)
+        assert events == [
+            "init", "poll", "poll", ("submit", 2), "poll", "poll",
+            "finish", ("submit", 4), "finish", "close",
+        ]
+
+
+def test_wandb_scalars_use_chart_step_not_global_history_step():
+    class Run:
+        def __init__(self):
+            self.rows = []
+
+        def log(self, payload):
+            self.rows.append(payload)
+
+    run = Run()
+    train_mujoco.log_wandb_scalars(
+        run, {"loss": 0.2, "ignored": "text"}, step=100, prefix="train"
+    )
+    train_mujoco.log_wandb_scalars(
+        run, {"action_mse": 0.1}, step=100, prefix="val"
+    )
+    assert run.rows == [
+        {"train/loss": 0.2, "train/step": 100},
+        {"val/action_mse": 0.1, "val/step": 100},
+    ]

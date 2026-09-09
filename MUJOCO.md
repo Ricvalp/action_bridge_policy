@@ -190,75 +190,124 @@ Earlier planar experiments reached 99/100 successes for direct chunk BC
 continuous-latent Action Bridge (5,000 steps). Those are historical results
 from the previous connection, not Robomimic results.
 
-## 5. Run on the HPC
+### Background success-rate evaluation
 
-`hpc/mujoco_robomimic_square_5m_h200_1gpu.sbatch` requests one H200 through
-`gpuq` + `gpu:1`, matching the existing cluster jobs, for **10 hours**. It
-checks that the allocated GPU is an H200, then trains the 5.07M-parameter
-continuous-latent Square policy for 50,000 steps, horizon eight/execution four.
-It does not run a simulator or submit additional jobs.
+MuJoCo training can evaluate checkpoint snapshots in separate CPU processes
+while GPU training continues. No RLlib or additional dependencies are needed.
+Add these overrides to a training command:
 
-The commands below use SSH alias `peano` and a dedicated `~/abp-square-hpc`
-directory on its shared home filesystem. If you prefer project/scratch
-storage, replace that root consistently. Commit the intended Action Bridge
-changes before transferring so the run records the exact policy revision;
-no push to GitHub is required. The transfer includes `.git` for provenance.
-
-From this workstation:
-
-```bash
-cd /home/rvalperga/action_bridge_policy
-
-ssh peano 'mkdir -p abp-square-hpc/action_bridge_policy/data/robomimic_square abp-square-hpc/action_bridge_policy/hpc/logs abp-square-hpc/phi-mujoco'
-
-rsync -a --info=progress2 \
-  --exclude='.venv*/' --exclude='__pycache__/' --exclude='.*cache*/' \
-  --exclude='/workspace/' --exclude='/data/' --exclude='/outputs/' \
-  --exclude='/wandb/' --exclude='/hpc/logs/' \
-  ./ peano:abp-square-hpc/action_bridge_policy/
-
-rsync -a --info=progress2 \
-  --exclude='.venv*/' --exclude='__pycache__/' --exclude='.*cache*/' \
-  --exclude='/datasets/' --exclude='/runs/' \
-  /home/rvalperga/phi-mujoco/ peano:abp-square-hpc/phi-mujoco/
-
-rsync -a --info=progress2 \
-  /home/rvalperga/phi-mujoco/datasets/processed/robomimic_square-20260908T122032Z/ \
-  peano:abp-square-hpc/action_bridge_policy/data/robomimic_square/
+```text
+logging.sim_eval_enabled=true
+logging.sim_eval_every_steps=2000
+logging.sim_eval_episodes=40
+logging.sim_eval_num_workers=8
+logging.sim_eval_worker_threads=1
+logging.sim_eval_n_exec=8
 ```
 
-The data transfer is only `manifest.json` and `episodes.hdf5` (about 6.7 MiB).
-The manifest already contains the official 180/20 split; no separate index is
-needed. Window indices and RAM arrays are built at startup. Do not transfer raw
-demonstrations, old runs/checkpoints, virtual environments, native simulator
-installations, or the other `phi-*` repositories.
+Each worker owns its simulator and CPU policy copy. The same 40 seeds starting
+at `logging.sim_eval_seed=2000000` are used for every snapshot. Keep the final
+evaluation seeds (default `1000000`) separate from this checkpoint-selection
+set. Set `sim_eval_n_exec` explicitly when comparing execution horizons; it
+otherwise follows `eval.actions_per_plan`.
 
-On Peano's login node, with `uv` available:
+Only one evaluation batch runs at a time. If it is still busy at the next
+interval, that interval is skipped. Training polls results without waiting;
+after the last optimizer step it waits for outstanding work and evaluates the
+final checkpoint too. Checkpoint saving itself still has a small cost.
+
+When W&B is enabled, `sim_eval/success_rate` is plotted against
+`sim_eval/checkpoint_step`, not the training step when results arrive. Local
+results are in `metrics/sim_eval_metrics.csv` and `eval/sim_step_*/summary.json`.
+`checkpoints/best_success.pt` stores the exact snapshot with highest measured
+success rate (ties keep the earlier snapshot). `best.pt` still means best
+offline validation MSE. Temporary evaluation snapshots are removed after use;
+set `logging.sim_eval_keep_checkpoints=true` to retain them. Simulator errors
+are reported separately, never silently scored as failed episodes.
+
+Videos are optional:
+
+```text
+logging.sim_eval_success_videos=3
+logging.sim_eval_failure_videos=3
+logging.sim_eval_video_backend=egl
+```
+
+Scoring runs without rendering. Afterwards, up to three successful and three
+failed seeds are rerun with rendering; only the selected clips are uploaded to
+W&B. Rerun outcomes are checked and labelled as actually observed, without
+changing the original success rate. Zero successes means no successful videos.
+Rendering errors do not discard the success-rate result. EGL uses the allocated
+GPU; `osmesa` uses software rendering if its system libraries are installed.
+Leave both quotas at zero to avoid rendering entirely.
+
+## 5. Run on the HPC
+
+Keep the two clones as siblings: `action_bridge_policy/` and `phi-mujoco/`.
+The backend must be clean at commit
+`528bdf97471493a9d63da424872141ff1279be4b`. Copy only `manifest.json` and
+`episodes.hdf5` into:
+
+```text
+phi-mujoco/datasets/processed/robomimic_square-20260908T122032Z/
+```
+
+No separate index, raw dataset, simulator installation, or virtual environment
+needs transferring. If direct workstation-to-Peano SSH is unavailable, transfer
+the cache via the laptop. Commit/push policy changes and pull them on Peano.
+
+From the policy clone on Peano's login node, prepare the environment once:
 
 ```bash
-cd "$HOME/abp-square-hpc/action_bridge_policy"
 export UV_CACHE_DIR="$PWD/workspace/.uv-cache"
-
 uv sync --frozen --python 3.11 --extra cu128 --extra robomimic \
   --no-install-package phi-isaaclab \
   --no-install-package phi-coppeliasim
 
-.venv/bin/phi-mujoco validate-cache "$PWD/data/robomimic_square"
-
+.venv/bin/phi-mujoco validate-cache \
+  "$PWD/../phi-mujoco/datasets/processed/robomimic_square-20260908T122032Z"
+.venv/bin/wandb login
 mkdir -p hpc/logs
+```
+
+The two exclusions skip unused backends without changing `pyproject.toml` or
+`uv.lock`. The jobs use the prepared `.venv`; no package installation happens
+on compute nodes. Existing training environments need no new dependencies.
+
+First test EGL **inside a GPU allocation**, not on the login node:
+
+```bash
+sbatch hpc/mujoco_egl_smoke.sbatch
+```
+
+Check `hpc/logs/mujoco_egl_smoke_<job-id>.out` and `.err`. A passing test prints
+`PASS: headless EGL rendering and MP4 encoding/decoding succeeded.` It also
+saves a frame and a short Square video under
+`workspace/experiments/mujoco/egl-smoke-<job-id>/`. This test uses the same
+Robosuite rendering path as evaluation. If Slurm GPU indices are remapped or
+UUID-based, it stops rather than guessing a device; share both logs so we can
+check the cluster's EGL mapping.
+
+Then submit training:
+
+```bash
 sbatch hpc/mujoco_robomimic_square_5m_h200_1gpu.sbatch
 ```
 
-This is intentionally a **MuJoCo-only environment**: the lock includes other
-backends, but neither is imported by this training path. The two
-`--no-install-package` options skip them without modifying `pyproject.toml` or
-`uv.lock`. The job uses `uv run --no-sync` so it does not try to reinstall
-them or download dependencies on a compute node. Do not run an ordinary
-unfiltered `uv sync` in this copy unless you also install its other backends.
-There is no additional package-index file to transfer: PyTorch's index is in
-`pyproject.toml` and resolved versions are in `uv.lock`.
+This requests **one H200, 16 CPUs, 32 GiB RAM, and 10 hours**, using the existing
+`gpuq`/`gpu:1` allocation and verifying the GPU model after allocation. It trains
+the 5.07M-parameter latent policy for 100,000 steps, horizon eight/execution eight,
+and enables W&B, eight CPU evaluation workers, 40 episodes every 2,000 steps,
+and up to three successful/three failed videos. These workers share the same
+Slurm allocation; no additional jobs are submitted.
 
-Logs go to `hpc/logs/square_latent_5m_<job-id>.out` and `.err`. Checkpoints go
-to `workspace/experiments/mujoco/square-latent-5m-h8-exec4-<job-id>-<timestamp>/checkpoints/`.
-The Slurm job ID makes each run directory unique. Use `squeue -u "$USER"` to
-check the allocation and job status.
+If EGL is not ready, keep success-rate evaluation but disable videos:
+
+```bash
+SIM_EVAL_VIDEOS=0 sbatch hpc/mujoco_robomimic_square_5m_h200_1gpu.sbatch
+```
+
+Logs are `hpc/logs/square_latent_5m_<job-id>.out` and `.err`. Runs are under
+`workspace/experiments/mujoco/square-latent-5m-h8-exec8-<job-id>-<timestamp>/`.
+Use `squeue -u "$USER"` for status. Changing the sbatch file does not change
+an already-running job or its CPU allocation.

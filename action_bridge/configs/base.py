@@ -434,9 +434,22 @@ def mujoco_config(
     config.logging = _logging_config()
     config.logging.full_eval_every_steps = 0
     config.logging.sim_eval_enabled = False
-    config.logging.sim_eval_async = False
+    config.logging.sim_eval_async = True
     config.logging.validation_max_batches = 0
     config.logging.progress = True
+    # Optional background CPU simulations. Final evaluation uses different seeds.
+    config.logging.sim_eval_every_steps = 2_000
+    config.logging.sim_eval_episodes = 40
+    config.logging.sim_eval_num_workers = 8
+    config.logging.sim_eval_worker_threads = 1
+    config.logging.sim_eval_seed = 2_000_000
+    config.logging.sim_eval_max_steps = None
+    config.logging.sim_eval_keep_checkpoints = False
+    config.logging.sim_eval_success_videos = 0
+    config.logging.sim_eval_failure_videos = 0
+    config.logging.sim_eval_video_backend = "egl"
+    config.logging.sim_eval_render_width = 640
+    config.logging.sim_eval_render_height = 480
 
     config.eval = ConfigDict()
     config.eval.batch_size = 256
