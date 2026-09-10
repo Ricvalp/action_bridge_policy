@@ -20,6 +20,7 @@ from action_bridge.eval.mujoco_online.metadata import (
 )
 from action_bridge.eval.rollout import generate_chunk, predict_actions
 from action_bridge.models.action_bridge_policy import ActionBridgePolicy
+from action_bridge.models.diffusion_policy import DiffusionPolicy
 from action_bridge.training.common import build_model, resolve_device
 
 
@@ -114,9 +115,9 @@ class TorchInferenceBackend:
         diagnostics: dict[str, object] = {
             "framework": "torch",
             "device": str(self.device),
-            "latent_commitment": self.metadata.latent_commitment,
         }
         if isinstance(self.model, ActionBridgePolicy):
+            diagnostics["latent_commitment"] = self.metadata.latent_commitment
             h_emb = self.model.encode_history(obs_hist, act_hist)
             reuse_episode_latent = (
                 self.metadata.latent_commitment == "episode"
@@ -147,7 +148,15 @@ class TorchInferenceBackend:
             diagnostics.update(latent_diagnostics)
             diagnostics["episode_latent_reused"] = reuse_episode_latent
         else:
-            output = predict_actions(self.model, tensor_batch, deterministic=True)
+            output = predict_actions(
+                self.model,
+                tensor_batch,
+                deterministic=True,
+                generator=self._generator,
+            )
+            if isinstance(self.model, DiffusionPolicy):
+                diagnostics["sampler"] = "ddim"
+                diagnostics["sampling_seed"] = self._generator.initial_seed()
         path_kl = output.get("path_kl_energy")
         if path_kl is not None:
             diagnostics["normalized_path_kl_energy"] = float(

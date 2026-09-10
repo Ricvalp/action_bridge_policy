@@ -1,4 +1,4 @@
-"""Train low-dimensional Action Bridge policies on validated PHI MuJoCo demos."""
+"""Train low-dimensional policies on validated PHI MuJoCo demos."""
 
 from __future__ import annotations
 
@@ -146,6 +146,8 @@ def train(config):
         batch_size=batch_size,
         shuffle=True,
         drop_last=False,
+        # Model initialization and diffusion noise must not change batch order.
+        generator=torch.Generator().manual_seed(int(config.get("seed", 0))),
     )
     batches = cycle(train_loader)
 
@@ -231,7 +233,9 @@ def train(config):
                     {
                         key: round(value, 6) if isinstance(value, float) else value
                         for key, value in row.items()
-                        if key in {"step", "loss", "action_mse", "path_kl", "latent_kl"}
+                        if key in {
+                            "step", "loss", "noise_mse", "action_mse", "path_kl", "latent_kl"
+                        }
                     }
                 )
                 tqdm.write(message)

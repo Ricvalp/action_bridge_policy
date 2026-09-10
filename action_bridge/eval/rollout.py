@@ -8,6 +8,7 @@ import torch
 
 from action_bridge.models.action_bridge_policy import ActionBridgePolicy
 from action_bridge.models.baselines import AutoregressiveBCPolicy, DirectChunkBCPolicy
+from action_bridge.models.diffusion_policy import DiffusionPolicy
 
 
 @torch.no_grad()
@@ -103,7 +104,22 @@ def generate_chunk(
 
 
 @torch.no_grad()
-def predict_actions(model, batch: Dict[str, torch.Tensor], deterministic: bool = True, mode: str = "sample") -> Dict[str, torch.Tensor]:
+def predict_actions(
+    model,
+    batch: Dict[str, torch.Tensor],
+    deterministic: bool = True,
+    mode: str = "sample",
+    *,
+    generator: Optional[torch.Generator] = None,
+) -> Dict[str, torch.Tensor]:
+    if isinstance(model, DiffusionPolicy):
+        # DDIM eta=0 is deterministic given its initial noise, not noise-free.
+        # Keep that noise on a caller-owned RNG for repeatable evaluation.
+        return {
+            "actions": model.generate(
+                batch["obs_hist"], batch["act_hist"], generator=generator
+            )
+        }
     if isinstance(model, ActionBridgePolicy):
         return generate_chunk(model, batch["obs_hist"], batch["act_hist"], mode=mode, deterministic=deterministic)
     if isinstance(model, DirectChunkBCPolicy):

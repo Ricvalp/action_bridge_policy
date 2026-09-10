@@ -10,7 +10,11 @@ from phi_mujoco.offline import EpisodeData, get_integration, write_processed_bun
 
 from action_bridge.config import apply_overrides, load_config
 from action_bridge.training import train_mujoco
-from action_bridge.training.common import build_model, load_config_from_checkpoint
+from action_bridge.training.common import (
+    build_dataset,
+    build_model,
+    load_config_from_checkpoint,
+)
 from action_bridge.training.train_mujoco import train
 
 
@@ -45,6 +49,103 @@ def _cache(root, integration_name, seed_offset=0):
         episodes=episodes,
         splits={"train": [0, 1], "val": [2]},
     )
+
+
+def test_diffusion_uses_identical_windows_and_normalization(tmp_path):
+    bundle = _cache(tmp_path / "cache", "robomimic_square")
+    datasets = []
+    for name in ("mujoco_robomimic_square", "mujoco_robomimic_square_diffusion"):
+        config = apply_overrides(
+            load_config(name),
+            [f"data.cache_root={bundle.root}", "logging.progress=false"],
+        )
+        datasets.append(build_dataset(config, split="train"))
+    bridge, diffusion = datasets
+    assert bridge.window_config == diffusion.window_config
+    assert bridge.split_plan == diffusion.split_plan
+    assert bridge.normalization == diffusion.normalization
+    assert len(bridge) == len(diffusion)
+    for index in range(len(bridge)):
+        for name, value in bridge[index].items():
+            np.testing.assert_array_equal(value, diffusion[index][name])
+
+
+def test_diffusion_trains_and_resumes_with_shared_trainer(tmp_path):
+    pytest.importorskip("diffusers")
+    bundle = _cache(tmp_path / "cache", "robomimic_square")
+    config = apply_overrides(
+        load_config("mujoco_robomimic_square_diffusion"),
+        [
+            f"data.cache_root={bundle.root}",
+            f"output_dir={tmp_path / 'runs'}",
+            "run_id=diffusion",
+            "device=cpu",
+            "model.unet_channels=[8,16,32]",
+            "model.hidden_dim=16",
+            "model.h_emb_dim=16",
+            "model.time_emb_dim=16",
+            "model.num_inference_steps=5",
+            "optim.batch_size=2",
+            "optim.max_steps=2",
+            "logging.progress=false",
+            "logging.log_every_steps=1",
+            "logging.eval_every_steps=1",
+            "logging.validation_max_batches=1",
+            "eval.batch_size=2",
+            "eval.offline_max_batches=1",
+        ],
+    )
+    run = train(config)
+    checkpoint = torch.load(run / "checkpoints" / "latest.pt", weights_only=False)
+    assert checkpoint["step"] == 2
+    assert checkpoint["config"]["checkpoint_metric"] == "val_action_mse"
+    assert checkpoint["online_evaluation"]["policy_type"] == "diffusion"
+    assert checkpoint["online_evaluation"]["action_horizon"] == 8
+    assert checkpoint["online_evaluation"]["actions_per_plan"] == 4
+    assert checkpoint["config"]["data"]["normalization"]["source_episode_indices"] == [0, 1]
+    with (run / "metrics" / "train_metrics.csv").open() as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 2
+    assert all(float(row["loss"]) == float(row["noise_mse"]) for row in rows)
+    assert all("action_mse" not in row and "path_kl" not in row for row in rows)
+    with (run / "metrics" / "val_metrics.csv").open() as stream:
+        rows = list(csv.DictReader(stream))
+    assert checkpoint["best_metric"] == min(float(row["action_mse"]) for row in rows)
+    assert all("noise_mse" not in row for row in rows)
+    resumed = load_config_from_checkpoint(run / "checkpoints" / "latest.pt")
+    resumed.optim.max_steps = 3
+    assert train(resumed) == run
+    assert torch.load(run / "checkpoints" / "latest.pt", weights_only=False)["step"] == 3
+
+
+def test_batch_order_is_shared_across_bridge_and_diffusion(tmp_path, monkeypatch):
+    pytest.importorskip("diffusers")
+    bundle = _cache(tmp_path / "cache", "robomimic_square")
+    observed = []
+    loss_function = train_mujoco.model_loss
+
+    def record_batch(model, batch, loss_config, *, global_step):
+        observed.append((batch["episode_index"].tolist(), batch["time_index"].tolist()))
+        return loss_function(model, batch, loss_config, global_step=global_step)
+
+    monkeypatch.setattr(train_mujoco, "model_loss", record_batch)
+    orders = []
+    for name in ("mujoco_robomimic_square", "mujoco_robomimic_square_diffusion"):
+        observed.clear()
+        config = apply_overrides(load_config(name), [
+            f"data.cache_root={bundle.root}", f"output_dir={tmp_path / 'runs'}",
+            f"run_id={name}", "device=cpu", "seed=42",
+            "model.hidden_dim=16", "model.h_emb_dim=16",
+            "model.unet_channels=[8,16,32]", "model.time_emb_dim=16",
+            "model.num_inference_steps=2", "optim.batch_size=2",
+            "optim.max_steps=4", "logging.progress=false",
+            "logging.eval_every_steps=2", "logging.validation_max_batches=1",
+            "eval.batch_size=2", "eval.offline_max_batches=1",
+        ])
+        train(config)
+        orders.append(list(observed))
+    assert len(orders[0]) == 4
+    assert orders[0] == orders[1]
 
 
 @pytest.mark.parametrize(

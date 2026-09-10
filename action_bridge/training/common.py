@@ -20,6 +20,7 @@ from action_bridge.data.toy_annular import AnnularObstacleDataset
 from action_bridge.data.toy_obstacle import DelayedBranchObstacleDataset
 from action_bridge.models.action_bridge_policy import ActionBridgePolicy
 from action_bridge.models.baselines import AutoregressiveBCPolicy, DirectChunkBCPolicy
+from action_bridge.models.diffusion_policy import DiffusionPolicy
 
 
 def seed_everything(seed: int) -> None:
@@ -215,6 +216,8 @@ def build_model(config: Dict):
         return DirectChunkBCPolicy(**args)
     if policy_type in {"autoregressive_bc", "ar_bc"}:
         return AutoregressiveBCPolicy(**args)
+    if policy_type == "diffusion":
+        return DiffusionPolicy(**args)
     raise ValueError(f"Unknown model.policy_type {policy_type!r}.")
 
 

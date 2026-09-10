@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from action_bridge.models.action_bridge_policy import ActionBridgePolicy
 from action_bridge.models.baselines import AutoregressiveBCPolicy, DirectChunkBCPolicy
+from action_bridge.models.diffusion_policy import DiffusionPolicy
 from action_bridge.models.latents import categorical_entropy, categorical_kl, gaussian_kl
 from action_bridge.training.passive_targets import passive_target_from_batch
 from action_bridge.training.schedules import linear_warmup
@@ -1147,6 +1148,8 @@ def autoregressive_bc_loss(
 
 
 def model_loss(model, batch: Dict[str, torch.Tensor], loss_config: Dict, global_step: int = 0) -> Dict[str, torch.Tensor]:
+    if isinstance(model, DiffusionPolicy):
+        return model.diffusion_loss(batch)
     if isinstance(model, ActionBridgePolicy):
         return bridge_loss(model, batch, loss_config, global_step=global_step)
     if isinstance(model, DirectChunkBCPolicy):

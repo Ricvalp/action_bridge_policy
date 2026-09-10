@@ -296,8 +296,8 @@ sbatch hpc/mujoco_robomimic_square_5m_h200_1gpu.sbatch
 
 This requests **one H200, 16 CPUs, 32 GiB RAM, and 10 hours**, using the existing
 `gpuq`/`gpu:1` allocation and verifying the GPU model after allocation. It trains
-the 5.07M-parameter latent policy for 100,000 steps, horizon eight/execution eight,
-and enables W&B, eight CPU evaluation workers, 40 episodes every 2,000 steps,
+the 5.07M-parameter latent policy for 100,000 steps, horizon eight/execution four,
+and enables W&B, eight CPU evaluation workers, 40 episodes every 5,000 steps,
 and up to three successful/three failed videos. These workers share the same
 Slurm allocation; no additional jobs are submitted.
 
@@ -308,6 +308,78 @@ SIM_EVAL_VIDEOS=0 sbatch hpc/mujoco_robomimic_square_5m_h200_1gpu.sbatch
 ```
 
 Logs are `hpc/logs/square_latent_5m_<job-id>.out` and `.err`. Runs are under
-`workspace/experiments/mujoco/square-latent-5m-h8-exec8-<job-id>-<timestamp>/`.
+`workspace/experiments/mujoco/square-latent-5m-h8-exec4-<job-id>-<timestamp>/`.
 Use `squeue -u "$USER"` for status. Changing the sbatch file does not change
 an already-running job or its CPU allocation.
+
+### DDIM diffusion baseline
+
+`mujoco_robomimic_square_diffusion` replaces Action Bridge with a small
+conditional temporal UNet with 5,258,455 parameters. It uses the same processed
+cache, train/validation split, observation/action histories, training loop, and
+closed-loop evaluator.
+No backend changes or data reconversion are needed. The trainer prints the
+exact parameter count.
+
+The model learns to predict added Gaussian noise with MSE. Sampling uses
+`diffusers` DDIM with 100 training noise levels, 20 denoising steps, and
+`eta=0`; it predicts the whole eight-action chunk and executes four actions
+before replanning. `train/loss` is **noise MSE**, not Action Bridge's training
+loss or action MSE. Compare policies using `val/action_mse` and, especially,
+`sim_eval/success_rate`. Validation samples chunks with DDIM rather than
+teacher forcing or a future-conditioned latent.
+
+Actions retain the same train-fitted mean/std normalization. DDIM does **not**
+clip standardized actions to `[-1, 1]`; physical action limits are applied
+after denormalization by the existing simulator adapter.
+
+The scheduler uses DDIM's default `leading` timestep spacing. With 100 noise
+levels and 20 sampling steps, it starts at level 95, avoiding the near-zero
+signal level 99 where small noise-prediction errors are greatly amplified.
+Training still samples all 100 levels. We do not add EMA or change optimizer
+settings for this first controlled comparison.
+
+Fresh runs use a separate seeded batch-shuffling generator, so model
+initialization and diffusion noise do not affect sample order. Validation uses
+its own fixed sampling seed (`eval.sampling_seed=0`). This does not change an
+already-running Action Bridge job or make resumed runs bitwise identical.
+
+On Peano's login node, update the policy environment with the pinned optional
+dependency (`diffusers==0.39.0`), then submit:
+
+```bash
+uv sync --frozen --python 3.11 --extra cu128 --extra robomimic --extra diffusion \
+  --no-install-package phi-isaaclab \
+  --no-install-package phi-coppeliasim
+
+.venv/bin/wandb login
+mkdir -p hpc/logs
+sbatch hpc/mujoco_robomimic_square_diffusion_h200_1gpu.sbatch
+```
+
+The job requests one H200, 16 CPUs, 32 GiB RAM, and 10 hours. It trains for
+100,000 steps with batch size 256, and evaluates 40 episodes with eight CPU
+workers every 5,000 training steps. W&B is enabled. Videos default to **zero**
+while EGL is being checked on Peano; after a passing smoke test, submit with
+`SIM_EVAL_VIDEOS=3` to request up to three clips per outcome.
+These settings apply to new submissions, not to already-running jobs.
+
+DDIM requires multiple UNet passes per prediction, so CPU evaluations may take
+longer than Action Bridge evaluations. Busy evaluation intervals are skipped
+as described above; there is no growing queue of checkpoints.
+Full offline validation also requires DDIM sampling and remains synchronous.
+
+Scheduler settings are configurable in the training command:
+
+```text
+model.num_train_timesteps=100
+model.num_inference_steps=20
+```
+
+Runs are saved under
+`workspace/experiments/mujoco/square-diffusion-h8-exec4-<job-id>-<timestamp>/`;
+Slurm logs use `hpc/logs/square_diffusion_<job-id>.out` and `.err`.
+`best.pt` still selects validation action MSE; `best_success.pt` selects
+closed-loop success. To evaluate a diffusion checkpoint, use the command in
+section 4, adding `--extra diffusion --no-sync` to `uv run` so the prepared
+environment, including `diffusers`, is retained.

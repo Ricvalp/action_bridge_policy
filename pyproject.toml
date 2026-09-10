@@ -42,6 +42,7 @@ pusht-sim = [
   "pymunk<7",
 ]
 robomimic = ["phi-mujoco[robomimic,viz]==0.2.0"]
+diffusion = ["diffusers==0.39.0"]
 test = ["pytest>=8.0"]
 
 [tool.uv]

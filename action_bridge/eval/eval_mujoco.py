@@ -12,6 +12,9 @@ from torch.utils.data import DataLoader
 
 from action_bridge.config import to_plain_dict
 from action_bridge.eval.rollout import predict_actions
+from action_bridge.models.action_bridge_policy import ActionBridgePolicy
+from action_bridge.models.baselines import AutoregressiveBCPolicy
+from action_bridge.models.diffusion_policy import DiffusionPolicy
 from action_bridge.training.common import (
     move_to_device,
     save_json,
@@ -64,17 +67,37 @@ def evaluate_mujoco_offline(
     torques for planar reach and normalized controller commands for Robomimic.
     Predictions remain unclipped for errors; the integration's public projection
     reports how many action values would change before execution. Predictions
-    use the history-conditioned prior and their own previous generated actions,
-    never the future-conditioned posterior or teacher-forced expert actions.
+    use only past observations and actions: Action Bridge generates from its
+    prior autoregressively; diffusion jointly denoises the future action chunk.
+    Neither uses future targets as inputs. Diffusion uses a fixed local RNG, so
+    repeated validation compares checkpoints using the same initial noises.
     """
 
     eval_config = config.get("eval", {})
     batch_size = int(eval_config.get("batch_size", 256))
+    sampling_seed = int(eval_config.get("sampling_seed", 0))
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
+        # Even a non-shuffled DataLoader draws a worker seed when iterated.
+        # Do not let validation alter the training RNG sequence.
+        generator=torch.Generator().manual_seed(sampling_seed),
     )
+    is_diffusion = isinstance(model, DiffusionPolicy)
+    sampling_generator = (
+        torch.Generator(device=device).manual_seed(sampling_seed)
+        if is_diffusion
+        else None
+    )
+    if is_diffusion:
+        prediction_protocol = "conditional_diffusion_chunk"
+    elif isinstance(model, ActionBridgePolicy):
+        prediction_protocol = "prior_autoregressive_chunk"
+    elif isinstance(model, AutoregressiveBCPolicy):
+        prediction_protocol = "autoregressive_chunk"
+    else:
+        prediction_protocol = "direct_chunk"
     stats = _normalization(config)
     integration = dataset.integration
     spec = dataset.spec
@@ -104,6 +127,7 @@ def evaluate_mujoco_offline(
             {"obs_hist": batch["obs_hist"], "act_hist": batch["act_hist"]},
             deterministic=bool(config.get("inference", {}).get("deterministic", True)),
             mode="mode",
+            generator=sampling_generator,
         )
         predicted = _denormalize_actions(prediction["actions"], stats).to(torch.float64)
         target = _denormalize_actions(batch["future_actions"], stats).to(torch.float64)
@@ -127,7 +151,8 @@ def evaluate_mujoco_offline(
         boundary_error += float((predicted[:, 0] - history[:, -1]).square().sum().cpu())
         predicted_norm += float(torch.linalg.vector_norm(predicted, dim=-1).sum().cpu())
         target_norm += float(torch.linalg.vector_norm(target, dim=-1).sum().cpu())
-        path_kl += float(prediction["path_kl_energy"].to(torch.float64).sum().cpu())
+        if not is_diffusion:
+            path_kl += float(prediction["path_kl_energy"].to(torch.float64).sum().cpu())
         raw_actions = predicted.cpu().numpy().astype(spec.action.dtype)
         projected_actions = integration.project_action(raw_actions)
         bound_violations += int(np.count_nonzero(raw_actions != projected_actions))
@@ -147,29 +172,34 @@ def evaluate_mujoco_offline(
         "predicted_action_norm": predicted_norm / actions,
         "target_action_norm": target_norm / actions,
         "predicted_bound_violation_rate": bound_violations / action_values,
-        "normalized_path_kl_energy": path_kl / chunks,
         "evaluated_chunks": float(chunks),
         "evaluated_batches": float(batches),
     }
+    if not is_diffusion:
+        metrics["normalized_path_kl_energy"] = path_kl / chunks
     if output_dir is not None:
         save_json(output_dir / "metrics" / "mujoco_offline_metrics.json", metrics)
+        metadata = {
+            "integration_spec": spec.to_dict(),
+            "prediction_protocol": prediction_protocol,
+            "action_metric_coordinates": "original action profile, before projection",
+            "action_metric_units": (
+                "action profile units; squared for MSE metrics. "
+                "Robomimic uses normalized controller commands; planar reach uses Nm."
+            ),
+            "normalization_stats": stats,
+        }
+        if is_diffusion:
+            metadata["sampling_seed"] = sampling_seed
+        else:
+            metadata["path_kl_coordinates"] = (
+                "training-normalized actions"
+                if stats is not None
+                else "original action profile"
+            )
         save_json(
             output_dir / "metrics" / "mujoco_offline_metadata.json",
-            {
-                "integration_spec": spec.to_dict(),
-                "prediction_protocol": "prior_autoregressive_chunk",
-                "action_metric_coordinates": "original action profile, before projection",
-                "action_metric_units": (
-                    "action profile units; squared for MSE metrics. "
-                    "Robomimic uses normalized controller commands; planar reach uses Nm."
-                ),
-                "normalization_stats": stats,
-                "path_kl_coordinates": (
-                    "training-normalized actions"
-                    if stats is not None
-                    else "original action profile"
-                ),
-            },
+            metadata,
         )
     return metrics
 

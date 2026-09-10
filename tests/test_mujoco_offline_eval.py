@@ -123,7 +123,7 @@ def test_offline_metrics_use_unclipped_action_profile_values(
     )
     assert metadata["integration_spec"] == dataset.spec.to_dict()
     assert metadata["normalization_stats"] == (stats if normalize else None)
-    assert metadata["prediction_protocol"] == "prior_autoregressive_chunk"
+    assert metadata["prediction_protocol"] == "direct_chunk"
 
 
 def test_offline_metrics_reject_nonfinite_predictions():
