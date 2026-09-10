@@ -386,6 +386,16 @@ validation action MSE, and background success rate; the stop-gradient variant
 also logs its passive-reference losses. Use `best_success.pt` for the best
 evaluated success rate; `best.pt` still selects validation action MSE.
 
+To test stronger free-running supervision in the joint model:
+
+```bash
+sbatch hpc/mujoco_robomimic_square_dissipative_unroll32_h200_1gpu.sbatch
+```
+
+This changes only `loss.lambda_unroll=32` and the job/run names. The 1,000-step
+unroll warmup, architecture, data, training budget, and evaluation settings stay
+the same. It starts fresh rather than resuming either earlier model.
+
 ### DDIM diffusion baseline
 
 `mujoco_robomimic_square_diffusion` replaces Action Bridge with a small
