@@ -185,6 +185,10 @@ class ActionBridgePolicy(nn.Module):
             return self.init_reference_ema()
         return self.reference_process_ema
 
+    def inference_reference(self) -> ReferenceProcess:
+        """Use the same reference the control residual was trained against."""
+        return getattr(self, "reference_process_ema", self.reference_process)
+
     @torch.no_grad()
     def update_reference_ema(self, decay: float = 0.995) -> None:
         ema = self.ema_reference()
@@ -236,30 +240,32 @@ class ActionBridgePolicy(nn.Module):
         z_emb: Optional[torch.Tensor],
         obs_state: Optional[torch.Tensor] = None,
         deterministic: bool = True,
+        reference: Optional[ReferenceProcess] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         if not self.uses_contact_langevin:
             raise RuntimeError("contact_step is only available for contact_langevin references.")
-        f_ref, aux = self.reference_process.force(q, p, h_emb, k, obs_state=obs_state)
+        ref = self.reference_process if reference is None else reference
+        f_ref, aux = ref.force(q, p, h_emb, k, obs_state=obs_state)
         u = self.contact_control(q, p, h_emb, k, z_emb)
-        sigma = self.reference_process.sigma_like(q)
-        if self.reference_process.control_is_whitened:
+        sigma = ref.sigma_like(q)
+        if ref.control_is_whitened:
             control_accel = sigma * u
         else:
             control_accel = u
-        if deterministic or self.reference_process.deterministic_inference:
+        if deterministic or ref.deterministic_inference:
             noise = torch.zeros_like(q)
         else:
-            noise = (self.reference_process.dt**0.5) * sigma * torch.randn_like(q)
-        p_next = p + self.reference_process.dt * (f_ref + control_accel) + noise
-        if hasattr(self.reference_process, "_denorm_action_delta") and getattr(self.reference_process, "max_step_norm", 0.0) > 0:
-            p_px = self.reference_process._denorm_action_delta(p_next)
+            noise = (ref.dt**0.5) * sigma * torch.randn_like(q)
+        p_next = p + ref.dt * (f_ref + control_accel) + noise
+        if hasattr(ref, "_denorm_action_delta") and getattr(ref, "max_step_norm", 0.0) > 0:
+            p_px = ref._denorm_action_delta(p_next)
             step_norm = torch.linalg.norm(p_px, dim=-1, keepdim=True)
-            scale = (float(self.reference_process.max_step_norm) / step_norm.clamp_min(1e-8)).clamp_max(1.0)
-            p_next = self.reference_process._norm_action_delta(p_px * scale)
-        q_next = q + self.reference_process.dt * p_next
-        if hasattr(self.reference_process, "_denorm_action") and bool(getattr(self.reference_process, "is_geometric_pusht", False)):
-            q_next_px = self.reference_process._denorm_action(q_next).clamp(0.0, 512.0)
-            q_next = self.reference_process._norm_action(q_next_px)
+            scale = (float(ref.max_step_norm) / step_norm.clamp_min(1e-8)).clamp_max(1.0)
+            p_next = ref._norm_action_delta(p_px * scale)
+        q_next = q + ref.dt * p_next
+        if hasattr(ref, "_denorm_action") and bool(getattr(ref, "is_geometric_pusht", False)):
+            q_next_px = ref._denorm_action(q_next).clamp(0.0, 512.0)
+            q_next = ref._norm_action(q_next_px)
         return q_next, p_next, u, aux
 
     def prior_logits(self, h_emb: torch.Tensor) -> torch.Tensor:

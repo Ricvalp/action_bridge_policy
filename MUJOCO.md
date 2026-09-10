@@ -44,6 +44,11 @@ but does not freeze the source checkout.
 
 ## 3. Train
 
+For the learned-potential/damping Action Bridge, use the
+[dissipative Square configs](#dissipative-action-bridge-square) below.
+The original `mujoco_robomimic_square` and `mujoco_robomimic_tool_hang`
+configs described here use the **older continuation reference**.
+
 Choose a task and its converted cache:
 
 | Config | State | Action | Default horizon / executed actions |
@@ -95,8 +100,8 @@ logging.wandb.enabled=true         # optional loss logging, off by default
 logging.progress=false            # disable the training progress bar
 ```
 
-The task configs use the existing Action Bridge model. Their default is the
-no-latent reference/controller variant, with width 256. They are starting
+These older task configs default to a no-latent continuation-reference model
+with width 256. They are starting
 settings, not tuned contact-task baselines.
 
 For a roughly 5-million-parameter **continuous-latent** Square model, add:
@@ -288,7 +293,7 @@ Robosuite rendering path as evaluation. If Slurm GPU indices are remapped or
 UUID-based, it stops rather than guessing a device; share both logs so we can
 check the cluster's EGL mapping.
 
-Then submit training:
+To reproduce the older **continuation-reference** latent baseline, submit:
 
 ```bash
 sbatch hpc/mujoco_robomimic_square_5m_h200_1gpu.sbatch
@@ -311,6 +316,75 @@ Logs are `hpc/logs/square_latent_5m_<job-id>.out` and `.err`. Runs are under
 `workspace/experiments/mujoco/square-latent-5m-h8-exec4-<job-id>-<timestamp>/`.
 Use `squeue -u "$USER"` for status. Changing the sbatch file does not change
 an already-running job or its CPU allocation.
+
+### Dissipative Action Bridge: Square
+
+These configs define their model, reference, and loss explicitly; neither
+imports a Push-T config. They reuse the existing MuJoCo data and runtime setup.
+
+| Config | Reference training |
+| --- | --- |
+| `mujoco_robomimic_square_dissipative` | Potential, damping, and control learn jointly from demonstrations. |
+| `mujoco_robomimic_square_dissipative_stopgrad` | Control fits demonstrations against a detached EMA reference; the live reference fits passive targets separately. |
+
+Both learn a quadratic potential (attractor and diagonal stiffness) and scalar
+damping, with reference acceleration `-K * (q - m) - gamma * p`. The controlled
+path adds `sigma * u`, without the old `tanh` bound. Its path-KL/control-energy
+penalty is `0.5 * sum(dt * ||u||²)`, weighted by **`reference.beta_kl`** (default
+0.001), not `loss.beta_R`.
+
+Here `q` is the standardized seven-dimensional controller command and `p` is
+its finite difference. These are **not physical end-effector poses/momenta**:
+XYZ delta commands, axis-angle delta commands, and gripper commands retain the
+dataset's original meaning. We use `sigma=0.5` in standardized command space.
+
+The stop-gradient variant's `passive_target=damped_continuation` projects each
+demonstrated command change onto a damped version of the previous change
+(`passive_alpha_max=0.4`). This is a training target, **not** the old continuation
+reference. Its reference has EMA decay 0.995, target weight 0.5, slow-change
+weight 0.01, and dissipation weight 0.0001. Task fitting does not backpropagate
+through that reference; the history encoder remains shared. Inference uses the
+EMA reference too, and checkpoints preserve both live and EMA weights.
+
+Both defaults have **5,148,502 trainable parameters**, no latent, horizon 8,
+execution 4, batch size 256, AdamW learning rate 0.0002, and 100,000 steps.
+Both use unroll-MSE weight 1 with a 1,000-step warmup; the stop-gradient version
+blocks unroll gradients through the reference. These are starting settings,
+not tuned results. Optional `model.latent_type=continuous` enables a
+four-dimensional latent and increases the parameter count.
+
+Train locally with either config name:
+
+```bash
+config=mujoco_robomimic_square_dissipative
+run_id="${config}-$(date -u +%Y%m%dT%H%M%S%NZ)"
+uv run --frozen --no-sync --extra cu128 --extra robomimic \
+  python -m action_bridge.training.train_mujoco \
+  --config-name "$config" \
+  data.cache_root="$PWD/../phi-mujoco/datasets/processed/robomimic_square-20260908T122032Z" \
+  run_id="$run_id" \
+  logging.wandb.enabled=true \
+  logging.sim_eval_enabled=true
+```
+
+On Peano, after the environment setup above, submit either or both:
+
+```bash
+mkdir -p hpc/logs
+sbatch hpc/mujoco_robomimic_square_dissipative_h200_1gpu.sbatch joint
+sbatch hpc/mujoco_robomimic_square_dissipative_h200_1gpu.sbatch stopgrad
+```
+
+Each job requests one H200 for 10 hours, enables W&B in `action-bridge-policy`,
+and scores 40 episodes on eight CPU workers every 5,000 steps (busy intervals
+are skipped). Videos default to off until EGL is verified. No new dependencies,
+backend changes, or data conversion are needed; start fresh runs, not resumes
+of continuation checkpoints. Evaluation uses the same command in section 4.
+
+W&B logs the task losses, path KL, unroll MSE, damping/stiffness statistics,
+validation action MSE, and background success rate; the stop-gradient variant
+also logs its passive-reference losses. Use `best_success.pt` for the best
+evaluated success rate; `best.pt` still selects validation action MSE.
 
 ### DDIM diffusion baseline
 

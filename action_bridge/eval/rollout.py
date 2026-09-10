@@ -37,6 +37,7 @@ def generate_chunk(
         )
     if bool(getattr(policy, "uses_contact_langevin", False)):
         adapter = policy.coordinate_adapter
+        ref = policy.inference_reference()
         q, p = adapter.init_qp_from_history({"obs_hist": obs_hist, "act_hist": act_hist})
         obs_state = obs_hist[:, -1]
         q_list = [q]
@@ -45,12 +46,15 @@ def generate_chunk(
         path_kl_steps = []
         path_kl = torch.zeros(obs_hist.shape[0], device=obs_hist.device, dtype=obs_hist.dtype)
         for k in range(policy.chunk_horizon):
-            q, p, u, _ = policy.contact_step(q, p, h_emb, k, z_emb, obs_state=obs_state, deterministic=deterministic)
-            sigma = policy.reference_process.sigma_like(q)
-            if policy.reference_process.control_is_whitened:
-                step_path_kl = 0.5 * policy.reference_process.dt * u.pow(2).sum(dim=-1)
+            q, p, u, _ = policy.contact_step(
+                q, p, h_emb, k, z_emb, obs_state=obs_state,
+                deterministic=deterministic, reference=ref,
+            )
+            sigma = ref.sigma_like(q)
+            if ref.control_is_whitened:
+                step_path_kl = 0.5 * ref.dt * u.pow(2).sum(dim=-1)
             else:
-                step_path_kl = 0.5 * policy.reference_process.dt * (u / sigma).pow(2).sum(dim=-1)
+                step_path_kl = 0.5 * ref.dt * (u / sigma).pow(2).sum(dim=-1)
             path_kl = path_kl + step_path_kl
             path_kl_steps.append(step_path_kl)
             controls.append(u)
