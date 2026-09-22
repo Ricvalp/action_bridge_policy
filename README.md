@@ -1,5 +1,9 @@
 # Latent Path-KL Action Bridge Policy
 
+For the separate whole-plan Push-T DDIM/FM/Schrödinger-bridge experiment, see
+[docs/SB_PUSHT.md](docs/SB_PUSHT.md). Its matching objectives are distinct from
+the original Action Bridge formulation described below.
+
 This sandbox implements a toy-first research pilot for action chunks as stochastic action-path laws. The main policy is a reference action process plus a learned control residual, with an optional latent variable held fixed over the chunk for path-level mode commitment. It is SB-inspired, but it is not an exact Schrodinger Bridge solver and does not use Sinkhorn, IPF, score matching, or diffusion noising.
 
 This checkout has no repository `LICENSE`; the project/institute must select

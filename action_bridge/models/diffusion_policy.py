@@ -46,8 +46,17 @@ class _ConditionalResidualBlock(nn.Module):
         return self.second(hidden) + self.residual(actions)
 
 
-class _ConditionalUnet1D(nn.Module):
-    def __init__(self, action_dim: int, channels: Sequence[int], condition_dim: int):
+class ConditionalUnet1D(nn.Module):
+    """Shared temporal backbone; input/output channels may differ for state lifts."""
+
+    def __init__(
+        self,
+        action_dim: int,
+        channels: Sequence[int],
+        condition_dim: int,
+        *,
+        output_dim: int | None = None,
+    ):
         super().__init__()
         self.padding_multiple = 2 ** (len(channels) - 1)
         self.down_blocks = nn.ModuleList()
@@ -90,7 +99,7 @@ class _ConditionalUnet1D(nn.Module):
         self.output = nn.Sequential(
             nn.GroupNorm(min(8, channels[0] // 2), channels[0]),
             nn.SiLU(),
-            nn.Conv1d(channels[0], action_dim, kernel_size=1),
+            nn.Conv1d(channels[0], action_dim if output_dim is None else output_dim, kernel_size=1),
         )
 
     def forward(self, actions: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
@@ -119,6 +128,10 @@ class _ConditionalUnet1D(nn.Module):
         return self.output(hidden).transpose(1, 2)[:, :horizon]
 
 
+# Retain the old internal name for existing imports; parameter names are unchanged.
+_ConditionalUnet1D = ConditionalUnet1D
+
+
 class DiffusionPolicy(nn.Module):
     def __init__(
         self,
@@ -128,6 +141,8 @@ class DiffusionPolicy(nn.Module):
         action_history: int,
         chunk_horizon: int,
         model_config: Mapping,
+        *,
+        history_encoder: nn.Module | None = None,
     ):
         super().__init__()
         # Import lazily so non-diffusion policies do not require Diffusers.
@@ -159,7 +174,7 @@ class DiffusionPolicy(nn.Module):
             raise ValueError(
                 "num_inference_steps must be between one and num_train_timesteps"
             )
-        self.history_encoder = HistoryEncoder(
+        self.history_encoder = history_encoder if history_encoder is not None else HistoryEncoder(
             obs_history, action_history, obs_dim, action_dim, history_dim, hidden_dim
         )
         self.time_embedding = nn.Sequential(
@@ -168,7 +183,7 @@ class DiffusionPolicy(nn.Module):
             nn.SiLU(),
             nn.Linear(4 * time_dim, time_dim),
         )
-        self.unet = _ConditionalUnet1D(action_dim, channels, history_dim + time_dim)
+        self.unet = ConditionalUnet1D(action_dim, channels, history_dim + time_dim)
         self.noise_scheduler = DDIMScheduler(
             num_train_timesteps=self.num_train_timesteps,
             beta_schedule=model_config.get("beta_schedule", "squaredcos_cap_v2"),
@@ -215,9 +230,9 @@ class DiffusionPolicy(nn.Module):
     ) -> torch.Tensor:
         history = self.encode_history(obs_hist, act_hist)
         actions = torch.randn(
-            (obs_hist.shape[0], self.chunk_horizon, self.action_dim),
-            device=obs_hist.device,
-            dtype=obs_hist.dtype,
+            (history.shape[0], self.chunk_horizon, self.action_dim),
+            device=history.device,
+            dtype=history.dtype,
             generator=generator,
         )
         self.noise_scheduler.set_timesteps(
@@ -234,4 +249,4 @@ class DiffusionPolicy(nn.Module):
         return self.generate(obs_hist, act_hist)
 
 
-__all__ = ["DiffusionPolicy"]
+__all__ = ["ConditionalUnet1D", "DiffusionPolicy"]

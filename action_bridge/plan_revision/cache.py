@@ -1,0 +1,73 @@
+"""Fixed proposal pairs and finite, detached DSBM coupling caches."""
+from __future__ import annotations
+
+import time
+
+import torch
+
+from action_bridge.plan_revision.contracts import take, tree_map
+from action_bridge.plan_revision.completion import complete_plan
+from action_bridge.plan_revision.gaussian import GaussianReference
+
+
+def reference_for(batch, config):
+    return GaussianReference(batch["precision"], batch["prior_mean"],
+                             kind="kinetic" if config["method"] == "sb_kinetic" else "ou",
+                             temperature=config["temperature"], gamma=config["revision_gamma"],
+                             mobility=batch.get("mobility"))
+
+
+def draw_records(records, count, device, *, completion=None, executed=None,
+                 source_std=0.01, endpoint_std=0.001):
+    """Uniform records, independent uniform completion IDs, explicit smoothing."""
+    indices = torch.randint(len(records["future_actions"]), (count,))
+    batch = take(records, indices, device)
+    batch["record_id"] = indices.to(device)
+    batch["completion_id"] = torch.randint(3, (count,), device=device)
+    if "old_actions" in batch:
+        with torch.no_grad():
+            source = complete_plan(batch["old_actions"], executed, batch["obs_hist"],
+                                   batch["act_hist"], batch["completion_id"], completion,
+                                   robot_dt=completion.robot_dt if completion is not None else 1.)
+        batch["source_actions"] = source + source_std * torch.randn_like(source)
+    batch["future_actions"] = (batch["future_actions"] +
+                               endpoint_std * torch.randn_like(batch["future_actions"]))
+    return batch
+
+
+@torch.no_grad()
+def refresh_coupling(records, count, device, config, completion, snapshot, direction):
+    """Reverse fit uses forward-generated pairs; forward fit uses reverse pairs.
+
+    snapshot includes its history encoder and is frozen for the entire phase.
+    Context/record/completion identifiers stay attached to both endpoints.
+    """
+    start = time.perf_counter()
+    pieces = []
+    for offset in range(0, count, config["batch_size"]):
+        batch = draw_records(records, min(config["batch_size"], count - offset), device,
+                             completion=completion, executed=config["execute"],
+                             source_std=config["source_std"], endpoint_std=config["endpoint_std"])
+        reference = reference_for(batch, config)
+        x0 = reference.augment(batch["source_actions"].flatten(1))
+        x1 = reference.augment(batch["future_actions"].flatten(1))
+        if snapshot is not None:
+            reverse = direction == "forward"
+            generated, _ = snapshot.rollout(x1 if reverse else x0, batch["obs_hist"],
+                                            batch["act_hist"], batch["completion_id"],
+                                            reference, reverse=reverse,
+                                            steps=config["coupling_steps"])
+            if reverse:
+                x0 = generated
+            else:
+                x1 = generated
+        batch["x0"], batch["x1"] = x0.detach(), x1.detach()
+        pieces.append(tree_map(lambda x: x.detach().cpu(), batch))
+    def concatenate(items):
+        if isinstance(items[0], dict):
+            return {key: concatenate([item[key] for item in items]) for key in items[0]}
+        return torch.cat(items)
+    return concatenate(pieces), {"cache_seconds": time.perf_counter() - start,
+                                 "cache_records": count,
+                                 "generated_endpoint": "none" if snapshot is None else
+                                 ("source" if direction == "forward" else "target")}
