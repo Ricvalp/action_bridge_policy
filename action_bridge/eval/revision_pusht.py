@@ -76,15 +76,29 @@ def _jsonable(value):
     return value
 
 
+def _save_video(frames, path):
+    """Write a 10 Hz Push-T rollout as a browser-playable MP4."""
+    import imageio.v2 as imageio
+
+    # Stream frames instead of creating another full copy of the rollout.
+    with imageio.get_writer(path, format="FFMPEG", fps=10, codec="libx264",
+                            pixelformat="yuv420p", macro_block_size=2) as writer:
+        for frame in frames:
+            writer.append_data(np.asarray(frame, dtype=np.uint8))
+
+
 @torch.no_grad()
 def evaluate(policy, config, metadata, dependencies, device, output=None,
-             completion_id=2, seeds=None, render=False):
-    """Evaluate one sample per seed; select first two successes/failures for GIFs.
+             completion_id=2, seeds=None, render=False, save_videos=True,
+             save_gifs=False):
+    """Evaluate one sample per seed; save first two successes/failures as MP4s.
 
     Uses the legacy benchmark success definition (termination, explicit success,
     or reward >= .95). ``env_success_rate`` also reports the stricter native
     environment flag, while coverage metrics use actual ``info['coverage']``.
     The first plan is the identical seeded frozen proposal for every method.
+    ``render=False`` disables all frame collection, regardless of media flags.
+    GIFs are optional; media stays in ``output`` and is not uploaded to W&B.
     """
     device = torch.device(device)
     if (config["obs_dim"], config["action_dim"]) != (5, 2):
@@ -139,7 +153,8 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
             bootstrap_nfe, bootstraps, clipped_count = 0, 0, 0
             terminated = truncated = False
             info = {}
-            collect_frames = render and (saved["success"] < 2 or saved["failure"] < 2)
+            collect_frames = (render and (save_videos or save_gifs)
+                              and (saved["success"] < 2 or saved["failure"] < 2))
             while len(actions) < config["max_episode_steps"]:
                 obs_tensor = torch.as_tensor(normalize_observations_np(obs_hist, stats)[None],
                                              device=device, dtype=torch.float32)
@@ -260,10 +275,16 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
             if output is not None:
                 bucket = "success" if success else "failure"
                 if frames and saved[bucket] < 2:
-                    filename = f"{bucket}-seed{seed}.gif"
-                    frames[0].save(output / filename, save_all=True, append_images=frames[1:],
-                                   duration=100, loop=0)
-                    episode["video"] = filename
+                    stem = f"{bucket}-seed{seed}"
+                    if save_videos:
+                        filename = f"{stem}.mp4"
+                        _save_video(frames, output / filename)
+                        episode["video"] = filename
+                    if save_gifs:
+                        filename = f"{stem}.gif"
+                        frames[0].save(output / filename, save_all=True, append_images=frames[1:],
+                                       duration=100, loop=0)
+                        episode["gif"] = filename
                     saved[bucket] += 1
                 with (output / f"episode-seed{seed}.json").open("w") as stream:
                     json.dump(_jsonable(episode), stream)

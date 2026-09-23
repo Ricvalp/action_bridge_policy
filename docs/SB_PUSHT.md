@@ -25,7 +25,7 @@ test -e "$PUSHT_DATASET"
 run_root="$PWD/workspace/sb_pusht/revision-v1"
 
 uv run --frozen --no-sync python -m action_bridge.scripts.sb_pusht all \
-  --dataset "$PUSHT_DATASET" --run-root "$run_root" --device cuda
+  --dataset "$PUSHT_DATASET" --run-root "$run_root" --device cuda --wandb
 ```
 
 This is a **long training run**, not a smoke test. Stages are:
@@ -42,7 +42,7 @@ Run any individual stage with the same arguments once its dependencies exist:
 
 ```bash
 uv run --frozen --no-sync python -m action_bridge.scripts.sb_pusht sb_kinetic \
-  --dataset "$PUSHT_DATASET" --run-root "$run_root" --device cuda
+  --dataset "$PUSHT_DATASET" --run-root "$run_root" --device cuda --wandb
 
 uv run --frozen --no-sync python -m action_bridge.scripts.sb_pusht evaluate \
   --run-root "$run_root" --device cuda
@@ -58,6 +58,102 @@ root when changing an experiment. Nothing is submitted to Slurm automatically.
 rounds of 37,500 reverse plus 37,500 forward updates. Keep
 `updates == 2 * rounds * phase_updates` if changing this. Reduced budgets are
 software checks, not the requested substantive experiment.
+
+## Evaluate one method
+
+These commands only need a trusted checkpoint, not the dataset, source cache,
+or other finished runs. They use its EMA weights, normalization, and saved
+dependencies (including the frozen DDIM/reference for revisers).
+
+```bash
+run_root="$PWD/workspace/sb_pusht/revision-v1"
+
+uv run --frozen --no-sync python -m action_bridge.scripts.eval_pusht_ddim \
+  --checkpoint "$run_root/ddim/best.pt" --device cuda --episodes 10
+
+uv run --frozen --no-sync python -m action_bridge.scripts.eval_pusht_sb_ou \
+  --checkpoint "$run_root/sb_ou/best.pt" --device cuda --episodes 10
+```
+
+Use your actual run directory. The five script names are `eval_pusht_ddim`,
+`eval_pusht_fm_paired`, `eval_pusht_fm_local_ot`, `eval_pusht_sb_ou`, and
+`eval_pusht_sb_kinetic`, all under `action_bridge.scripts`.
+
+Both `best.pt` and `latest.pt` work, including unfinished training. For SB, use
+`best.pt` or a forward-phase `latest.pt`; raw reverse-phase training checkpoints
+are rejected (asynchronous evaluation explicitly snapshots the forward policy).
+The checkpoint supplies horizon, execution length and episode step limit.
+Override the last two with `--execute 4 --max-steps 300`; `--seed 1000000` sets
+the first of consecutive episode seeds (default 10 episodes). Revisers also
+accept `--completion repeat`, `fixed_damped`, or `learned_dissipative`.
+
+Each invocation creates `workspace/sb_pusht/evaluation/<method>-<UTC timestamp>/`
+with `metrics.json`, episode traces, checkpoint/config provenance, and up to
+two successful and two failed rollout **MP4s**. Use `--no-save-videos` for metrics
+only, or `--output-dir /path/to/new-directory` to choose another destination.
+GIFs are optional with `--save-gifs`; videos are never uploaded to W&B.
+Existing output directories are never overwritten. `--device cpu` also works.
+The original `sb_pusht evaluate` remains the full, all-method comparison.
+
+## Evaluation during training
+
+All five policy trainers start a separate evaluation process every **10k updates**
+by default, on five fixed validation seeds. It uses a frozen EMA checkpoint,
+CPU inference and two CPU threads, while optimization continues on the training
+device. Configure with `--eval-every 5000 --eval-device cpu --eval-threads 2`.
+`validation_every` in the JSON config also sets the interval; the CLI overrides it.
+Changing the interval is allowed when resuming an existing run.
+
+One evaluation runs at a time; busy intervals are logged as skipped, not queued.
+After optimization, training waits for pending results and evaluates final weights
+if their interval was skipped. Checkpoint serialization still briefly uses the
+training process. Interrupting training cancels only its own evaluator.
+
+Results, worker logs and selected MP4s live under
+`<run-root>/<method>/sim_eval/step_<step>-<timestamp>/results/` (worker logs one
+directory above). Success rates also go to `validation.jsonl`, the terminal,
+and W&B when enabled. Worker failures are recorded in `sim_eval/errors.jsonl`,
+not reported as zero success. Use `--no-eval-videos` to skip training-evaluation
+videos, or `--no-sim-eval` to disable the worker entirely.
+
+SB evaluation always samples the forward policy, even during reverse training.
+Initial reverse-phase results have `forward_updates=0` and cannot select `best.pt`.
+The standalone reference pretrainer is not a deployable policy, so it keeps
+loss-based diagnostics only. `best.pt` preserves the exact evaluated EMA snapshot;
+its step and score are recorded in `best_eval.json`. Resume training from `latest.pt`.
+
+## W&B logging
+
+Run `uv run --frozen --no-sync wandb login` once, then add `--wandb` to any
+training command (`reference`, `ddim`, either FM, either SB, or `all`). Without
+that flag, training only saves local logs. The default project is
+`action-bridge-policy`; override it with `--wandb-project NAME` and optionally
+`--wandb-entity USER_OR_TEAM`.
+
+Each training stage has its own run, grouped by the run-root directory name:
+
+- `train/*`: loss, gradient norm and learning rate every `log_every` updates
+  (default 100), plus phase and timing for policy training.
+- `sim_eval/*`: asynchronous closed-loop success/coverage, plotted against
+  `sim_eval/checkpoint_step` even if the result arrives later. The standalone
+  reference logs its held-out prediction diagnostics under `val/*` at the end.
+- `examples/action_chunks`: three fixed validation histories, showing expert
+  versus generated **command targets**, the current pusher/T pose, and the goal T.
+  These use inference-time sampling from the EMA policy, not teacher forcing or
+  a physical rollout. Reference images show its autonomous prediction instead.
+
+Images are logged every 5k updates and at the end; SB images are generated only
+in forward phases, including each forward-phase end. Change this with
+`--wandb-images-every 2000 --wandb-image-count 3`; count 0 disables images.
+PNG copies remain in `<run-root>/<stage>/figures/`. Sampling and logging preserve
+training RNG state.
+
+You can enable logging when resuming the same training command/root; logging
+options do not change experiment compatibility. Online restarts reuse the
+stage's W&B run ID. Already-running processes must be restarted to use the new
+code; already-completed stages are skipped, not uploaded retroactively.
+For disconnected machines, use `--wandb --wandb-mode offline`: each invocation
+writes a separate local W&B run under `<run-root>/<stage>/wandb/` to sync later.
 
 ## Methods and shared data
 
@@ -122,8 +218,8 @@ Each method saves:
 
 - `latest.pt`: models, optimizers, EMA, RNG, frozen dependencies, normalizers,
   scheduler/reference specifications and full directional/cache resume state.
-- `best.pt`: highest success on five fixed validation seeds, every 75k updates
-  (after complete forward phases for DSBM), never selected on held-out test seeds.
+- `best.pt`: inference snapshot with highest success on the fixed validation
+  seeds, never selected on held-out test seeds; `best_eval.json` records its score.
 - `train.jsonl`, `validation.jsonl`: losses, timing and pairing diagnostics.
 
 These are trusted local Torch artifacts; do not load untrusted checkpoints.
@@ -133,7 +229,7 @@ clipping, NFE, latency and control energy. The inherited success rule is retaine
 `env_success_rate` additionally gives native environment success. Control energy
 is a diagnostic, not a certificate of exact path KL or optimal coupling.
 
-Evaluation saves the first two successes/failures as annotated GIFs, episode
+Evaluation saves the first two successes/failures as annotated MP4s, episode
 traces and a few internal candidate plans: gray old overlap, orange completion,
 purple revised plan, white actual pusher trail. Candidate plans are not physical
 trajectories. Fixed held-out probes compare before/after overlap and tail error,
@@ -147,7 +243,7 @@ One training seed cannot establish seed robustness or exact SB optimality.
 ## Another dataset
 
 Algorithms are in `action_bridge/plan_revision/`, without simulator imports.
-Only `data/revision_pusht.py` and `eval/revision_pusht.py` know Push-T specifics.
+Only `data/revision_pusht.py` and `eval/revision_pusht*.py` know Push-T specifics.
 Supply tensor records with `obs_hist` (tensor or mapping), `act_hist`,
 `future_actions`, `valid_mask` and causal earlier histories for source generation.
 Keep episode/time/split IDs as metadata, not learned inputs. Partial horizons

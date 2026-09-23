@@ -12,6 +12,12 @@ import numpy as np
 import torch
 
 
+def same_training_config(left, right):
+    """Evaluation cadence can change on resume without changing the learner."""
+    return ({key: value for key, value in left.items() if key != "validation_every"}
+            == {key: value for key, value in right.items() if key != "validation_every"})
+
+
 def digest(path):
     result = hashlib.sha256()
     with Path(path).open("rb") as stream:

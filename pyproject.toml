@@ -39,6 +39,7 @@ jax-cu13 = [
 ]
 pusht-sim = [
   "gym-pusht>=0.1.5",
+  "imageio[ffmpeg]>=2.37,<3",
   "pymunk<7",
 ]
 robomimic = ["phi-mujoco[robomimic,viz]==0.2.0"]

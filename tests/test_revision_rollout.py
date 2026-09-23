@@ -147,7 +147,7 @@ def test_full_execution_bootstraps_explicitly_and_video_selection(monkeypatch, t
     config.update(execute=4, evaluation_seeds=[1, 2, 3])
     policy = Revision()
     result = evaluator.evaluate(policy, config, metadata, dependencies, "cpu", completion_id=0,
-                                output=tmp_path, render=True)
+                                output=tmp_path, render=True, save_videos=False, save_gifs=True)
     assert result["bootstraps"] == 2.
     assert len(proposal.calls) == 6 and not policy.calls
     assert len(list(tmp_path.glob("failure-*.gif"))) == 2

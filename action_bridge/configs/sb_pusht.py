@@ -13,7 +13,7 @@ def get_config(method="ddim"):
                 updates=300_000, rounds=4, phase_updates=37_500,
                 batch_size=256, lr=1e-4, weight_decay=1e-6, ema_decay=.999,
                 grad_clip=1., checkpoint_every=5000, log_every=100,
-                validation_every=75_000, reference_updates=20_000,
+                validation_every=10_000, reference_updates=20_000,
                 reference_hidden_dim=64, innovation_floor=1e-3,
                 robot_dt=1., temperature=.05, revision_gamma=2.,
                 prior_ridge=.05, max_rate=4., mobility_smoothing=0.,
