@@ -55,14 +55,17 @@ class Proposal(nn.Module):
 
 
 class Revision(nn.Module):
-    def __init__(self):
+    def __init__(self, constant=None):
         super().__init__()
         self.calls = []
+        self.constant = constant
 
-    def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None, generator=None):
+    def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None, generator=None,
+               has_previous_plan=None):
         assert source_actions is not None
-        self.calls.append((obs_hist.clone(), act_hist.clone(), source_actions.clone(), mode))
-        return source_actions + 1, {"nfe": 32}
+        self.calls.append((obs_hist.clone(), act_hist.clone(), source_actions.clone(), mode, has_previous_plan))
+        generated = source_actions + 1 if self.constant is None else torch.full_like(source_actions, self.constant)
+        return generated, {"nfe": 32}
 
 
 def setup(monkeypatch, *, method="fm_paired", constant=None):
@@ -76,11 +79,9 @@ def setup(monkeypatch, *, method="fm_paired", constant=None):
                 "normalization": {"obs_mean": [0.] * 5, "obs_std": [1.] * 5}}
     completion = LearnedCompletion(5, 2, 2, 2, 4)
     proposal = Proposal(constant=constant)
-    dependencies = {"completion_config": {}, "completion_state": {},
-                    "proposal_config": {"method": "ddim"}, "proposal_state": {}}
+    dependencies = {"completion_config": {}, "completion_state": {}}
     monkeypatch.setattr(evaluator, "_make_pusht_env", lambda **kwargs: env)
     monkeypatch.setattr(evaluator, "restore_completion", lambda *args: completion)
-    monkeypatch.setattr(evaluator, "build_policy", lambda config: proposal)
     return env, config, metadata, dependencies, proposal
 
 
@@ -97,20 +98,20 @@ def test_actual_history_cached_alignment_reset_and_no_teacher_access(monkeypatch
     monkeypatch.setattr(evaluator, "PlanCache", ObservedCache)
     result = evaluator.evaluate(policy, config, metadata, dependencies, "cpu", output=tmp_path, completion_id=0)
     assert result["episodes"] == 2 and result["episode_length"] == 5
-    assert result["bootstraps"] == 1 and result["bootstrap_nfe"] == 32
+    assert result["startups"] == 1 and result["startup_nfe"] == 32
     assert result["nfe_per_replan"] == 32
-    assert len(proposal.calls) == 2  # Not queried again at every replan.
-    assert len(policy.calls) == 4  # Two revisions per episode.
+    assert not proposal.calls
+    assert len(policy.calls) == 6  # Own startup plus two revisions per episode.
     for episode_index in range(2):
-        initial_obs, initial_actions, source = proposal.calls[episode_index]
+        initial_obs, initial_actions, source, mode, available = policy.calls[3 * episode_index]
         assert torch.equal(initial_actions, torch.full_like(initial_actions, 100.))
-        assert source is None
-        _, executed_history, _, mode = policy.calls[2 * episode_index]
+        assert torch.equal(source, torch.full_like(source, 100.)) and not available.any()
+        _, executed_history, _, mode, available = policy.calls[3 * episode_index + 1]
         torch.testing.assert_close(executed_history[0], torch.from_numpy(np.stack(env.episodes[episode_index][:2])))
-        assert mode == 0
+        assert mode == 0 and available.all()
     first = json.loads((tmp_path / "episode-seed71.json").read_text())
     assert len(first["actions_raw"]) == 5
-    assert first["plan_traces"][0]["bootstrap"]
+    assert first["plan_traces"][0]["startup"]
     old_plan = np.array(first["plan_traces"][0]["final_raw"])
     next_trace = first["plan_traces"][1]
     np.testing.assert_array_equal(next_trace["aligned_old_raw"], old_plan[2:])
@@ -119,37 +120,40 @@ def test_actual_history_cached_alignment_reset_and_no_teacher_access(monkeypatch
     assert env.closed
 
 
-def test_common_first_seeded_prefix_for_ddim_and_reviser(monkeypatch):
+def test_ddim_and_reviser_generate_their_own_first_prefix(monkeypatch):
     env, config, metadata, dependencies, _ = setup(monkeypatch)
     evaluator.evaluate(Revision(), config, metadata, dependencies, "cpu", completion_id=0, seeds=[71])
     first_prefix = np.stack(env.episodes[0][:2])
     env, config, metadata, dependencies, _ = setup(monkeypatch, method="ddim")
     evaluator.evaluate(Proposal(constant=300.), config, metadata, dependencies, "cpu", seeds=[71])
-    np.testing.assert_array_equal(first_prefix, np.stack(env.episodes[0][:2]))
+    np.testing.assert_array_equal(first_prefix, np.full((2, 2), 101.))
+    np.testing.assert_array_equal(np.stack(env.episodes[0][:2]), np.full((2, 2), 300.))
     np.testing.assert_array_equal(env.episodes[0][2], [300., 300.])
 
 
 def test_clipped_commands_not_unexecuted_predictions_enter_history(monkeypatch, tmp_path):
     env, config, metadata, dependencies, _ = setup(monkeypatch, constant=600.)
-    policy = Revision()
+    policy = Revision(constant=600.)
     result = evaluator.evaluate(policy, config, metadata, dependencies, "cpu", completion_id=0,
                                 seeds=[1], output=tmp_path)
     assert result["clipping_rate"] == 1.
-    assert torch.equal(policy.calls[0][1], torch.full((1, 2, 2), 512.))
-    assert torch.equal(policy.calls[0][2], torch.full((1, 4, 2), 600.))
+    assert torch.equal(policy.calls[1][1], torch.full((1, 2, 2), 512.))
+    assert torch.equal(policy.calls[1][2], torch.full((1, 4, 2), 600.))
     trace = json.loads((tmp_path / "episode-seed1.json").read_text())
     assert trace["actions_preclipped_raw"][0] == [600., 600.]
     assert trace["actions_raw"][0] == [512., 512.]
 
 
-def test_full_execution_bootstraps_explicitly_and_video_selection(monkeypatch, tmp_path):
+def test_full_execution_reuses_observed_anchor_and_video_selection(monkeypatch, tmp_path):
     env, config, metadata, dependencies, proposal = setup(monkeypatch)
     config.update(execute=4, evaluation_seeds=[1, 2, 3])
     policy = Revision()
     result = evaluator.evaluate(policy, config, metadata, dependencies, "cpu", completion_id=0,
                                 output=tmp_path, render=True, save_videos=False, save_gifs=True)
-    assert result["bootstraps"] == 2.
-    assert len(proposal.calls) == 6 and not policy.calls
+    assert result["startups"] == 2.
+    assert not proposal.calls and len(policy.calls) == 6
+    assert not any(bool(call[-1]) for call in policy.calls)
+    torch.testing.assert_close(policy.calls[1][2], torch.full((1, 4, 2), 101.))
     assert len(list(tmp_path.glob("failure-*.gif"))) == 2
     assert (tmp_path / "failure-seed1.gif").exists() and (tmp_path / "failure-seed2.gif").exists()
 
@@ -166,8 +170,23 @@ def test_native_coverage_distinct_from_legacy_reward_threshold(monkeypatch):
     assert metrics["max_coverage"] == .912 and metrics["final_coverage"] == .912
 
 
-def test_missing_bootstrap_dependency_rejected(monkeypatch):
+def test_no_bootstrap_dependency_needed(monkeypatch):
     _, config, metadata, dependencies, _ = setup(monkeypatch)
-    del dependencies["proposal_state"]
-    with pytest.raises(ValueError, match="frozen DDIM"):
-        evaluator.evaluate(Revision(), config, metadata, dependencies, "cpu")
+    result = evaluator.evaluate(Revision(), config, metadata, dependencies, "cpu")
+    assert result["external_bootstrap"] is False
+
+
+def test_startup_anchor_normalizes_once_and_uses_no_future_command(monkeypatch):
+    env, config, metadata, dependencies, _ = setup(monkeypatch)
+    metadata["codec"].update(mean=[50., 20.], std=[10., 5.])
+    policy = Revision()
+    evaluator.evaluate(policy, config, metadata, dependencies, "cpu", seeds=[1], completion_id=0)
+    torch.testing.assert_close(policy.calls[0][2], torch.tensor([5., 16.]).expand(1, 4, 2))
+    np.testing.assert_array_equal(env.episodes[0][0], [110., 105.])
+
+
+def test_nonfinite_startup_is_surfaced_without_fallback(monkeypatch):
+    env, config, metadata, dependencies, _ = setup(monkeypatch)
+    with pytest.raises(ValueError, match="nonfinite"):
+        evaluator.evaluate(Revision(constant=float("nan")), config, metadata, dependencies, "cpu", seeds=[1])
+    assert env.closed and env.episodes[0] == []

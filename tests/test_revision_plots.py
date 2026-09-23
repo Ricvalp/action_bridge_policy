@@ -45,7 +45,8 @@ class FakePolicy(nn.Module):
         self.calls = []
         self.stochastic = stochastic
 
-    def sample(self, obs_hist, act_hist, mode, *, source_actions, reference, generator):
+    def sample(self, obs_hist, act_hist, mode, *, source_actions, reference, generator,
+               has_previous_plan=None):
         assert not self.training
         self.calls.append((obs_hist.clone(), act_hist.clone(), mode, source_actions, reference))
         shape = (len(obs_hist), 4, 2)
@@ -63,6 +64,19 @@ class FakeReference(nn.Module):
         assert not self.training
         zeros = act_hist.new_zeros(len(act_hist), self.horizon, self.action_dim)
         return zeros, zeros, zeros  # Constant observed command velocity.
+
+    def prior(self, obs_hist, act_hist, innovation_variance, **kwargs):
+        return {"precision": torch.eye(8).expand(len(act_hist), 8, 8),
+                "mean": torch.zeros(len(act_hist), 8)}
+
+
+def replay_examples():
+    config, records, metadata = examples()
+    config.update(horizon=4, batch_size=8, prior_ridge=.05, max_rate=4., mobility_smoothing=0.)
+    records["time_index"] = torch.tensor([0, 2, 4, 6, 0, 2, 4, 6])
+    records["valid_mask"] = torch.ones(8, 4, dtype=torch.bool)
+    records["startup_actions"] = records["act_hist"][:, -1:].expand(-1, 4, -1).clone()
+    return config, records, metadata
 
 
 def capture_plots(monkeypatch):
@@ -143,14 +157,11 @@ def test_reference_uses_autonomous_history_dynamics(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("method", ["fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic"])
-def test_revisers_use_completed_cached_plan_and_frozen_reference(tmp_path, monkeypatch, method):
-    config, records, metadata = examples()
+def test_revisers_replay_own_plans_with_frozen_reference(tmp_path, monkeypatch, method):
+    config, records, metadata = replay_examples()
     config = {**config, "method": method, "source_std": 0.}
-    records["old_actions"] = torch.tensor([[1., 2.], [2., 4.], [3., 6.], [4., 8.]]).repeat(8, 1, 1)
-    records["precision"] = torch.eye(8).repeat(8, 1, 1)
-    records["prior_mean"] = torch.zeros(8, 8)
     completion = FakeReference().eval()
-    dependencies = {"example": "frozen reference weights"}
+    dependencies = {"innovation_variance": torch.ones(2)}
     restored = []
 
     def restore(supplied, device):
@@ -160,6 +171,7 @@ def test_revisers_use_completed_cached_plan_and_frozen_reference(tmp_path, monke
         return completion
 
     monkeypatch.setattr(plots, "restore_completion", restore)
+    monkeypatch.setattr(plots, "immutable_snapshot", lambda model: model)
     seen = capture_plots(monkeypatch)
     rng = torch.get_rng_state().clone()
     plot = plots.make_action_chunk_plotter(records, config, metadata, tmp_path, "cpu",
@@ -168,12 +180,20 @@ def test_revisers_use_completed_cached_plan_and_frozen_reference(tmp_path, monke
     policy = FakePolicy()
     plot(policy, 4)
     assert restored == [True]
-    torch.testing.assert_close(policy.calls[0][3][0], torch.tensor([[3., 6.], [4., 8.], [5., 10.], [6., 12.]]))
+    assert len(policy.calls) == 3
+    torch.testing.assert_close(policy.calls[0][3][0], records["startup_actions"][0])
+    torch.testing.assert_close(policy.calls[-1][3][0], torch.full((4, 2), 2.))
     gaussian = policy.calls[0][4]
     assert (gaussian is not None) == method.startswith("sb_")
     if gaussian is not None:
         assert gaussian.kind == ("kinetic" if method == "sb_kinetic" else "ou")
-    np.testing.assert_allclose(seen[0]["source"], [[130., 320.], [140., 360.], [150., 400.], [160., 440.]])
+    np.testing.assert_allclose(seen[0]["source"], [[120., 240.]] * 4)
+    different_gt = {**records, "future_actions": records["future_actions"] + 900.}
+    second = plots.make_action_chunk_plotter(different_gt, config, metadata, tmp_path, "cpu",
+                                            dependencies=dependencies, count=1)
+    second(policy, 5)
+    np.testing.assert_array_equal(seen[0]["source"], seen[1]["source"])
+    np.testing.assert_array_equal(seen[0]["predicted"], seen[1]["predicted"])
 
 
 def test_no_images_or_invalid_count(tmp_path):
@@ -191,19 +211,17 @@ def test_real_policy_inference_smoke(tmp_path, monkeypatch, method):
     from action_bridge.plan_revision.completion import LearnedCompletion
     from action_bridge.plan_revision.models import build_policy
 
-    _, records, metadata = examples()
+    _, records, metadata = replay_examples()
     config = get_config(method) | {"horizon": 4, "execute": 2, "channels": [8, 16],
                                   "history_dim": 16, "hidden_dim": 16, "time_dim": 8,
                                   "num_inference_steps": 2}
     dependencies = None
     if method != "ddim":
-        records["old_actions"] = torch.zeros(8, 4, 2)
-        records["precision"] = torch.eye(8).repeat(8, 1, 1)
-        records["prior_mean"] = torch.zeros(8, 8)
         completion_config = {"obs_dim": 5, "action_dim": 2, "obs_history": 2,
                              "action_history": 2, "horizon": 4, "hidden_dim": 8}
         completion = LearnedCompletion(**completion_config)
-        dependencies = {"completion_config": completion_config, "completion_state": completion.state_dict()}
+        dependencies = {"completion_config": completion_config, "completion_state": completion.state_dict(),
+                        "innovation_variance": torch.ones(2)}
     policy = build_policy(config)
     seen = capture_plots(monkeypatch)
     before = torch.get_rng_state().clone()

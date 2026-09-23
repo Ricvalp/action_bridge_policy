@@ -180,7 +180,7 @@ def test_cli_forwards_tracking_to_every_stage_without_changing_model_config(tmp_
                           "--wandb-project", "research", "--wandb-entity", "lab",
                           "--wandb-mode", "offline", "--wandb-images-every", "123",
                           "--wandb-image-count", "2"]) == 0
-    assert [args[0] for args, _ in calls] == ["prepare", "reference", "ddim", "sources", *METHODS[1:], "evaluate", "report"]
+    assert [args[0] for args, _ in calls] == ["prepare", "reference", *METHODS, "evaluate", "report"]
     for args, kwargs in calls:
         assert args[3]["validation_every"] == 10000
         assert kwargs["evaluation"] == {"device": "cpu", "threads": 2, "save_videos": True}

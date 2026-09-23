@@ -24,23 +24,18 @@ def load_windows(path, config):
         split_ids[split] = dataset.episode_ids
         records = []
         for episode, t in dataset.indices:
-            if t < config["execute"]:
+            if t % config["execute"]:
                 continue
             now = dataset.item_from_episode_time(episode, t)
-            earlier = dataset.item_from_episode_time(episode, t - config["execute"])
             records.append({"obs_hist": now["obs_hist"], "act_hist": now["act_hist"],
                             "future_actions": now["future_actions"],
-                            "earlier_obs_hist": earlier["obs_hist"],
-                            "earlier_act_hist": earlier["act_hist"],
+                            # Missing command history is already padded with the
+                            # observed initial pusher, never the first expert action.
+                            "startup_actions": now["act_hist"][-1:].expand(config["horizon"], -1).clone(),
                             "valid_mask": torch.ones(config["horizon"], dtype=torch.bool),
                             "episode_id": torch.tensor(episode), "time_index": torch.tensor(t),
-                            "earlier_time_index": torch.tensor(t - config["execute"]),
                             "obs_history_mask": torch.arange(t - config["obs_history"] + 1, t + 1) >= 0,
-                            "act_history_mask": torch.arange(t - config["action_history"], t) >= 0,
-                            "earlier_obs_history_mask": torch.arange(t - config["execute"] -
-                                config["obs_history"] + 1, t - config["execute"] + 1) >= 0,
-                            "earlier_action_history_mask": torch.arange(t - config["execute"] -
-                                config["action_history"], t - config["execute"]) >= 0})
+                            "act_history_mask": torch.arange(t - config["action_history"], t) >= 0})
         if not records:
             raise ValueError(f"No complete causal windows in {split}")
         result[split] = {key: torch.stack([item[key] for item in records]) for key in records[0]}
@@ -52,9 +47,11 @@ def load_windows(path, config):
                 "normalizer_id": object_digest(stats), "codec": codec.specification(),
                 "observation_profile": "pusht/state/pusher_xy-block_xy-angle/v1",
                 "action_profile": "pusht/absolute_pusher_target_xy/pixels/v1",
+                "window_schema": "recorded_replan_grid_with_startup/v1",
+                "replan_grid": {"start": 0, "stride": config["execute"]},
                 "source_noise_pixels": [x * config["source_std"] for x in stats["action_std"]],
                 "endpoint_noise_pixels": [x * config["endpoint_std"] for x in stats["action_std"]],
-                "padding": "earlier observation repeats initial observation; missing executed commands use initial pusher xy",
+                "padding": "initial observation repeats; missing executed commands use initial pusher xy",
                 "windows": {key: len(value["future_actions"]) for key, value in result.items()}}
     return result, metadata
 
@@ -97,7 +94,6 @@ def neighbor_blocks(records, stats, size=8):
 
 def make_local_pairer(records, neighborhood, config):
     """Uniform anchor targets with batched, observation-local transport blocks."""
-    from action_bridge.plan_revision.completion import complete_plan
     from action_bridge.plan_revision.contracts import take
     from action_bridge.plan_revision.ot import batched_local_ot_pair
 
@@ -112,18 +108,17 @@ def make_local_pairer(records, neighborhood, config):
         raise ValueError("neighbour indices must be unique within each block")
     order = (neighbors == anchors[:, None]).long().argsort(dim=1, stable=True)
     blocks = torch.cat((anchors[:, None], neighbors.gather(1, order)[:, :size - 1]), dim=1)
-    fields = {key: records[key] for key in ("old_actions", "obs_hist", "act_hist", "future_actions")}
+    fields = {key: records[key] for key in
+              ("source_actions", "future_actions", "completion_id", "has_previous_plan")}
 
     @torch.no_grad()
     def pair(batch, completion, device):
         ids = blocks[batch["record_id"].cpu()]
         count = len(ids)
         block = take(fields, ids.flatten(), device)
-        mode = batch["completion_id"][:, None].expand(-1, size)
-        source = complete_plan(block["old_actions"], config["execute"], block["obs_hist"],
-                               block["act_hist"], mode.flatten(), completion,
-                               robot_dt=config.get("robot_dt", 1.))
-        source += config["source_std"] * torch.randn_like(source)
+        mode = block["completion_id"].reshape(count, size)
+        has_previous = block["has_previous_plan"].reshape(count, size)
+        source = block["source_actions"]
         source = source.reshape(count, size, *source.shape[1:])
         targets = block["future_actions"] + config["endpoint_std"] * torch.randn_like(block["future_actions"])
         targets = targets.reshape(count, size, *targets.shape[1:])
@@ -131,8 +126,10 @@ def make_local_pairer(records, neighborhood, config):
         targets[:, 0] = batch["future_actions"]
         features = neighborhood["features"][ids].to(device)
         distances = torch.cdist(features, features) / features.shape[-1] ** .5
+        compatible = ((distances <= neighborhood["radius"]) &
+                      (has_previous[:, :, None] == has_previous[:, None, :]))
         selected, _, metrics = batched_local_ot_pair(
-            source, targets, distances, distances <= neighborhood["radius"],
+            source, targets, distances, compatible,
             completion_ids=mode, radius=neighborhood["radius"],
             entropy=config["ot_entropy"], context_weight=config["ot_context_weight"],
             iterations=config.get("ot_iterations", 500), target_indices=[0])

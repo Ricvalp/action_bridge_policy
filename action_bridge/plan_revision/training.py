@@ -69,6 +69,98 @@ def restore_completion(dependencies, device, *, encoder=None):
     return model.eval().requires_grad_(False)
 
 
+def _block_sources(windows, ema, completion, dependencies, config, metadata,
+                   output, device, block, saved=None):
+    """Freeze one source law per block, or recover it from its original snapshot.
+
+    Source replay has its own seed and never advances the learner RNG. Only the
+    replay cache may be rebuilt: its immutable producer is never substituted by
+    a newer live EMA when resuming midway through a block.
+    """
+    from action_bridge.plan_revision.data import SourceReplayError, build_self_sources
+
+    seed = config.get("source_seed", 17) + block
+    probability = config["source_self_probabilities"][block]
+    identity = {
+        "protocol": "self_source_v1", "method": config["method"], "block": block,
+        "seed": seed, "p_self": probability,
+        "normalizer_schema_sha256": checkpoints.content_digest(metadata),
+        "completion_sha256": checkpoints.content_digest(dependencies["completion_state"]),
+        "reference_sha256": dependencies.get("reference_sha256", metadata.get("reference_hash")),
+        "innovation_sha256": checkpoints.content_digest(dependencies["innovation_variance"]),
+        "config_sha256": checkpoints.content_digest({key: value for key, value in config.items()
+                                           if key != "validation_every"}),
+    }
+    folder = Path(output) / "sources" / f"block_{block:03d}"
+    folder.mkdir(parents=True, exist_ok=True)
+    snapshot_path, cache_path = folder / "snapshot.pt", folder / "sources.pt"
+    producer = checkpoints.frozen_copy(ema)
+    with preserve_rng():
+        if saved is not None or snapshot_path.exists():
+            if not snapshot_path.exists():
+                raise ValueError(f"Missing immutable source snapshot: {snapshot_path}")
+            source_snapshot = checkpoints.load(snapshot_path, device)
+            if source_snapshot["source_identity"] != identity:
+                raise ValueError("Source snapshot protocol/config/reference identity mismatch")
+            if saved is None and checkpoints.content_digest(source_snapshot["ema"]) != checkpoints.content_digest(ema.state_dict()):
+                raise ValueError("Existing source snapshot does not match the EMA at this block boundary")
+            producer.load_state_dict(source_snapshot["ema"])
+            replay_device = source_snapshot["replay_device"]
+        else:
+            replay_device = str(device)
+            checkpoints.save(snapshot_path, dict(config=config, metadata=metadata,
+                             dependencies=dependencies, ema=producer.state_dict(),
+                             source_identity=identity, direction="forward", block=block,
+                             replay_device=replay_device))
+        provenance = {**identity, "snapshot_sha256": checkpoints.digest(snapshot_path),
+                      "snapshot_path": str(snapshot_path.relative_to(output)),
+                      "cache_path": str(cache_path.relative_to(output)),
+                      "replay_device": replay_device}
+        provenance["version"] = checkpoints.content_digest(provenance)
+        if saved is not None and any(saved.get(key) != value for key, value in provenance.items()):
+            raise ValueError("Source-cache provenance differs from the resumable checkpoint")
+        replay_seconds = 0.
+        if cache_path.exists():
+            artifact = torch.load(cache_path, map_location="cpu", weights_only=False)
+            if artifact["provenance"] != provenance:
+                raise ValueError("Source cache does not belong to this immutable block snapshot")
+            records, diagnostics = artifact["records"], artifact["diagnostics"]
+            records_sha256 = checkpoints.content_digest(records)
+            if records_sha256 != artifact["records_sha256"]:
+                raise ValueError("Source cache content hash mismatch")
+        else:
+            if str(device) != replay_device:
+                raise ValueError(f"Rebuild this missing source cache on its original device ({replay_device}), "
+                                 "or restore the existing cache before changing training devices")
+            seed_all(seed)
+            started = time.perf_counter()
+            try:
+                records, diagnostics = build_self_sources(
+                    windows, producer, completion, dependencies["innovation_variance"],
+                    config, device, block=block, seed=seed, p_self=probability)
+            except SourceReplayError as error:
+                log(Path(output) / "source_replay.jsonl", {**provenance, **error.diagnostics,
+                    "status": "failed", "error": str(error)})
+                raise
+            replay_seconds = time.perf_counter() - started
+            records_sha256 = checkpoints.content_digest(records)
+            if saved is not None and records_sha256 != saved["records_sha256"]:
+                raise ValueError("Rebuilt source cache differs from its original seeded replay")
+            temporary = cache_path.with_suffix(".pt.tmp")
+            torch.save(dict(records=records, diagnostics=diagnostics, provenance=provenance,
+                            records_sha256=records_sha256), temporary)
+            temporary.replace(cache_path)
+            log(Path(output) / "source_replay.jsonl", {**provenance, **diagnostics,
+                 "records_sha256": records_sha256, "source_cache_seconds": replay_seconds,
+                 "rebuilt": saved is not None})
+        if saved is not None and records_sha256 != saved["records_sha256"]:
+            raise ValueError("Source cache records do not match the resumable checkpoint")
+        if not {"source_actions", "completion_id", "has_previous_plan"} <= records.keys():
+            raise ValueError("self_source_v1 requires fixed completed sources, modes and startup masks")
+    provenance["records_sha256"] = records_sha256
+    return records, provenance, replay_seconds, diagnostics
+
+
 def fit_completion(records, validation, config, output, metadata, device, *, encoder=None,
                    tracker=None, visualize=None):
     """Standalone small reference fit; never optimize it through BC/DSBM."""
@@ -134,7 +226,7 @@ def fit_completion(records, validation, config, output, metadata, device, *, enc
 
 def train(records, config, output, metadata, dependencies, device, *, pairer=None, validate=None,
           stop_after=None, encoder=None, completion_encoder=None, tracker=None, visualize=None,
-          evaluation_factory=None):
+          evaluation_factory=None, pairer_factory=None):
     """Resume exact optimizer/EMA/phase/cache state; `stop_after` is for tests.
 
     DSBM is Algorithm 1 of Shi et al. (2023): reverse projection, refresh from
@@ -152,16 +244,32 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
     policy = build_policy(config, encoder=encoder).to(device)
     ema = checkpoints.frozen_copy(policy)
     bridge = config["method"].startswith("sb_")
+    self_sources = config.get("protocol") == "self_source_v1" and config["method"] != "ddim"
     if bridge and config["updates"] != 2 * config["rounds"] * config["phase_updates"]:
         raise ValueError("DSBM total updates must equal rounds * 2 * phase_updates")
-    if config["method"] == "fm_local_ot" and pairer is None:
+    if self_sources:
+        blocks = config["training_blocks"]
+        if blocks < 1 or config["updates"] % blocks:
+            raise ValueError("Total updates must divide equally into the configured source blocks")
+        if len(config["source_self_probabilities"]) != blocks:
+            raise ValueError("Provide one source self-probability per training block")
+        if bridge and blocks != config["rounds"]:
+            raise ValueError("Each source block must be one complete reverse/forward DSBM round")
+        if "proposal_state" in dependencies or "proposal_config" in dependencies:
+            raise ValueError("self_source_v1 does not use an external proposal policy")
+        block_updates = config["updates"] // blocks
+    if config["method"] == "fm_local_ot" and pairer is None and pairer_factory is None:
         raise ValueError("Local OT requires an explicit context-distance/compatibility callback")
+    if self_sources and config["method"] == "fm_local_ot" and pairer_factory is None:
+        raise ValueError("Self-source local OT needs pairer_factory for each block's current records")
     modules = {"forward": policy.forward_field, "reverse": policy.reverse_field} if bridge else {"forward": policy}
     optimizers = {key: torch.optim.AdamW(module.parameters(), lr=config["lr"],
                                         weight_decay=config["weight_decay"]) for key, module in modules.items()}
     latest = output / "latest.pt"
     step, current_phase, cache, snapshot = 0, -1, None, None
     best, elapsed, cache_seconds = float("-inf"), 0., 0.
+    source_block, source_provenance, source_cache_seconds = -1, None, 0.
+    source_records = records
     cache_provenance = None
     resume_rng = None
     if latest.exists():
@@ -180,6 +288,10 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
             snapshot = checkpoints.frozen_copy(policy)
             snapshot.load_state_dict(state["opposite_snapshot"])
         best, elapsed, cache_seconds = state["best_validation"], state["training_seconds"], state["cache_seconds"]
+        if self_sources:
+            source_block = state["source_block"]
+            source_provenance = state["source_provenance"]
+            source_cache_seconds = state["source_cache_seconds"]
         # The saved dependency weights/statistics are authoritative after the
         # config and provenance hashes match; do not silently substitute a
         # caller's new completer into an existing coupling cache.
@@ -193,6 +305,14 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
         # Constructing modules consumes random numbers, even when their weights
         # are immediately replaced. Restore RNG only after all reconstruction.
         checkpoints.restore_rng(resume_rng)
+    if self_sources and source_provenance is not None:
+        source_records, source_provenance, seconds, _ = _block_sources(
+            records, ema, completion, dependencies, config, metadata, output,
+            device, source_block, saved=source_provenance)
+        source_cache_seconds += seconds
+        if pairer_factory is not None:
+            with preserve_rng():
+                pairer = pairer_factory(source_records)
     start = time.perf_counter()
 
     def payload(complete=False):
@@ -203,6 +323,8 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
                     step=step, phase=current_phase, outer_round=current_phase // 2 if bridge else 0,
                     direction=("reverse" if current_phase % 2 == 0 else "forward") if bridge else "forward",
                     coupling_cache=cache, cache_provenance=cache_provenance,
+                    source_block=source_block, source_provenance=source_provenance,
+                    source_cache_seconds=source_cache_seconds,
                     opposite_snapshot=None if snapshot is None else snapshot.state_dict(),
                     best_validation=best, training_seconds=elapsed + time.perf_counter() - start,
                     cache_seconds=cache_seconds, complete=complete,
@@ -221,7 +343,8 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
         # Immutable inference snapshot, not an optimizer/coupling-cache copy.
         keys = ("config", "metadata", "dependencies", "ema", "step", "phase", "outer_round",
                 "direction", "training_seconds", "cache_seconds", "complete", "scheduler",
-                "diffusers_version", "parameters")
+                "diffusers_version", "parameters", "source_block", "source_provenance",
+                "source_cache_seconds")
         candidate = {key: state[key] for key in keys}
         # SB deploys its forward field even when the reverse field is training.
         candidate.update(training_direction=state["direction"], direction="forward",
@@ -253,6 +376,19 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
     progress = tqdm(total=config["updates"], initial=step, desc=config["method"])
     try:
         while step < config["updates"]:
+            if self_sources and step // block_updates != source_block:
+                source_block = step // block_updates
+                source_records, source_provenance, seconds, diagnostics = _block_sources(
+                    records, ema, completion, dependencies, config, metadata, output,
+                    device, source_block)
+                source_cache_seconds += seconds
+                cache = None
+                track_metrics(tracker, step, {**diagnostics, "block": source_block,
+                              "self_probability": config["source_self_probabilities"][source_block],
+                              "cache_seconds": seconds}, "source")
+                if pairer_factory is not None:
+                    with preserve_rng():
+                        pairer = pairer_factory(source_records)
             phase = step // config["phase_updates"] if bridge else 0
             direction = "reverse" if bridge and phase % 2 == 0 else "forward"
             if phase != current_phase:
@@ -261,18 +397,24 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
                 cache = None
             if bridge:
                 if cache is None or step % config["coupling_refresh_every"] == 0:
-                    cache, cache_provenance = refresh_coupling(records, config["coupling_records"], device,
+                    cache, cache_provenance = refresh_coupling(source_records, config["coupling_records"], device,
                                                               config, completion, snapshot, direction)
                     cache_provenance.update(phase=phase, refresh_step=step,
-                                            source_hash=metadata["source_hash"],
+                                            source_hash=(source_provenance["version"] if self_sources
+                                                         else metadata["source_hash"]),
                                             snapshot_phase=phase - 1 if snapshot is not None else None)
+                    if self_sources:
+                        cache_provenance.update(protocol="self_source_v1", source_block=source_block,
+                                                direction=direction,
+                                                snapshot_sha256=None if snapshot is None else
+                                                checkpoints.content_digest(snapshot.state_dict()))
                     cache_seconds += cache_provenance["cache_seconds"]
                 indices = torch.randint(len(cache["x0"]), (config["batch_size"],), device="cpu")
                 batch = take(cache, indices, device)
                 losses = policy.loss(batch, reference_for(batch, config), direction=direction,
                                      x0=batch["x0"], x1=batch["x1"])
             else:
-                batch = draw_records(records, config["batch_size"], device, completion=completion,
+                batch = draw_records(source_records, config["batch_size"], device, completion=completion,
                                      executed=config["execute"], source_std=config["source_std"],
                                      endpoint_std=config["endpoint_std"])
                 pairing_metrics = {}
@@ -298,7 +440,10 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
                            reverse_phase=int(direction == "reverse"),
                            grad_norm=float(grad_norm), lr=optimizer.param_groups[0]["lr"],
                            elapsed_seconds=elapsed + time.perf_counter() - start,
-                           cache_seconds=cache_seconds)
+                           cache_seconds=cache_seconds, source_cache_seconds=source_cache_seconds)
+                if self_sources:
+                    row.update(source_block=source_block,
+                               self_probability=config["source_self_probabilities"][source_block])
                 log(output / "train.jsonl", row)
                 track_metrics(tracker, step, row, "train")
                 progress.set_postfix(loss=f"{row['loss']:.4g}", phase=current_phase)

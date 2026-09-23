@@ -30,6 +30,32 @@ def object_digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def content_digest(value):
+    """Stable tensor-tree identity, including buffers, shapes and numeric types.
+
+    Unlike a serialized-file digest, this is independent of torch.save archive
+    metadata. Source replay can therefore verify a reproducibly rebuilt cache.
+    """
+    digest = hashlib.sha256()
+
+    def update(item):
+        if isinstance(item, torch.Tensor):
+            tensor = item.detach().cpu().contiguous()
+            digest.update(str((tensor.dtype, tuple(tensor.shape))).encode())
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+        elif isinstance(item, dict):
+            digest.update(b"{")
+            for key in sorted(item):
+                digest.update(json.dumps(key).encode())
+                update(item[key])
+            digest.update(b"}")
+        else:
+            digest.update(json.dumps(item, sort_keys=True).encode())
+
+    update(value)
+    return digest.hexdigest()
+
+
 def runtime_identity():
     """Include new/untracked source too: `git diff` alone would miss it."""
     checkout = Path(__file__).resolve().parents[2]

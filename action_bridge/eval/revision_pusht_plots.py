@@ -8,9 +8,8 @@ import numpy as np
 import torch
 
 from action_bridge.eval.visualization import _draw_tee, _import_pyplot
-from action_bridge.plan_revision.cache import reference_for
-from action_bridge.plan_revision.completion import complete_plan
 from action_bridge.plan_revision.contracts import ActionCodec, take
+from action_bridge.plan_revision.data import build_self_sources, immutable_snapshot
 from action_bridge.plan_revision.training import restore_completion
 
 
@@ -24,6 +23,18 @@ def _example_indices(records, count):
     count = min(count, len(indices))
     return torch.tensor([indices[int((i + .5) * len(indices) / count)] for i in range(count)],
                         dtype=torch.long)
+
+
+def _preview_replays(records, count, replans=3):
+    """A few short episode prefixes, including startup, keep logging cheap."""
+    episodes = records["episode_id"].unique(sorted=True).tolist()[:count]
+    indices, selected = [], []
+    for episode in episodes:
+        candidates = (records["episode_id"] == episode).nonzero().flatten()
+        candidates = candidates[records["time_index"][candidates].argsort()][:replans]
+        indices.extend(candidates.tolist())
+        selected.append(len(indices) - 1)
+    return take(records, torch.tensor(indices, dtype=torch.long)), torch.tensor(selected, dtype=torch.long)
 
 
 def _reference_rollout(model, batch):
@@ -73,10 +84,15 @@ def make_action_chunk_plotter(records, config, metadata, output, device, *,
     """
     if count < 0:
         raise ValueError("Action chunk image count cannot be negative")
-    indices = _example_indices(records, count)
+    reviser = not reference and config["method"] != "ddim"
+    if reviser and count:
+        replay_windows, indices = _preview_replays(records, count)
+        batch = take(replay_windows, indices, device)
+    else:
+        indices = _example_indices(records, count)
+        batch = take(records, indices, device)
     if not len(indices):
         return lambda model, step: []
-    batch = take(records, indices, device)
     codec = ActionCodec(**metadata["codec"])
     stats = metadata["normalization"]
     state = batch["obs_hist"][:, -1]
@@ -84,12 +100,11 @@ def make_action_chunk_plotter(records, config, metadata, output, device, *,
     states = state.detach().cpu().numpy()
     expert = codec.decode(batch["future_actions"]).detach().cpu().numpy()
     completion = None
-    if not reference and "old_actions" in batch and config.get("completion_id", 2) == 2:
+    if reviser:
         # Loading frozen weights initializes a temporary CPU module first. Keep
         # that initialization from consuming the trainer's random stream.
         with torch.random.fork_rng(devices=[]):
             completion = restore_completion(dependencies, device)
-    gaussian = reference_for(batch, config) if not reference and config["method"].startswith("sb_") else None
     output = Path(output)
 
     @torch.no_grad()
@@ -102,16 +117,25 @@ def make_action_chunk_plotter(records, config, metadata, output, device, *,
             source = None
             if reference:
                 prediction = _reference_rollout(model, batch)
+            elif reviser:
+                # Replay recorded contexts with this model's own previous
+                # predictions. Labels are drawn only for the blue GT curve.
+                replay, _ = build_self_sources(
+                    replay_windows, immutable_snapshot(model), completion,
+                    torch.as_tensor(dependencies["innovation_variance"], device=device),
+                    config, device, block=0, seed=int(config["seed"]) + 7301,
+                    p_self=1., modes=(config.get("completion_id", 2),))
+                positions = []
+                for episode, timestamp in zip(batch["episode_id"].tolist(), batch["time_index"].tolist()):
+                    match = ((replay["episode_id"] == episode) & (replay["time_index"] == timestamp)).nonzero().flatten()
+                    if len(match) != 1:
+                        raise ValueError("Preview replay did not preserve its selected history key")
+                    positions.append(int(match[0]))
+                selected = take(replay, torch.tensor(positions), device)
+                source, prediction = selected["source_actions"], selected["generated_actions"]
             else:
-                if "old_actions" in batch:
-                    source = complete_plan(batch["old_actions"], config["execute"], batch["obs_hist"],
-                                           batch["act_hist"], config.get("completion_id", 2), completion,
-                                           robot_dt=config.get("robot_dt", 1.))
-                    noise = torch.randn(source.shape, device=source.device, dtype=source.dtype,
-                                        generator=generator)
-                    source = source + config["source_std"] * noise
                 prediction, _ = model.sample(batch["obs_hist"], batch["act_hist"], config.get("completion_id", 2),
-                                             source_actions=source, reference=gaussian, generator=generator)
+                                             source_actions=None, reference=None, generator=generator)
             predicted = codec.decode(prediction).detach().cpu().numpy()
             source_pixels = None if source is None else codec.decode(source).detach().cpu().numpy()
             paths = []

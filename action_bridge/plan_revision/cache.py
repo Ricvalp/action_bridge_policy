@@ -1,4 +1,4 @@
-"""Fixed proposal pairs and finite, detached DSBM coupling caches."""
+"""Fixed robot-time source records and separate revision-time coupling caches."""
 from __future__ import annotations
 
 import time
@@ -19,17 +19,28 @@ def reference_for(batch, config):
 
 def draw_records(records, count, device, *, completion=None, executed=None,
                  source_std=0.01, endpoint_std=0.001):
-    """Uniform records, independent uniform completion IDs, explicit smoothing."""
+    """Sample the prescribed source population; only targets receive new noise.
+
+    Sequence replay already selected the mode, completed the old plan and
+    perturbed the source. Redrawing any of these changes the prescribed law.
+    """
     indices = torch.randint(len(records["future_actions"]), (count,))
     batch = take(records, indices, device)
     batch["record_id"] = indices.to(device)
-    batch["completion_id"] = torch.randint(3, (count,), device=device)
-    if "old_actions" in batch:
+    if "source_actions" in batch:
+        if "completion_id" not in batch or "has_previous_plan" not in batch:
+            raise ValueError("cached sources require completion_id and has_previous_plan")
+    elif "old_actions" in batch:
+        # Generic, manually provided old-plan batches remain useful outside the
+        # versioned self_source_v1 trainer. Its caches always take the branch above.
+        batch["completion_id"] = torch.randint(3, (count,), device=device)
         with torch.no_grad():
             source = complete_plan(batch["old_actions"], executed, batch["obs_hist"],
                                    batch["act_hist"], batch["completion_id"], completion,
                                    robot_dt=completion.robot_dt if completion is not None else 1.)
         batch["source_actions"] = source + source_std * torch.randn_like(source)
+    else:
+        batch.setdefault("completion_id", torch.zeros(count, dtype=torch.long, device=device))
     batch["future_actions"] = (batch["future_actions"] +
                                endpoint_std * torch.randn_like(batch["future_actions"]))
     return batch
@@ -56,7 +67,9 @@ def refresh_coupling(records, count, device, config, completion, snapshot, direc
             generated, _ = snapshot.rollout(x1 if reverse else x0, batch["obs_hist"],
                                             batch["act_hist"], batch["completion_id"],
                                             reference, reverse=reverse,
-                                            steps=config["coupling_steps"])
+                                            steps=config["coupling_steps"],
+                                            **({"has_previous_plan": batch["has_previous_plan"]}
+                                               if "has_previous_plan" in batch else {}))
             if reverse:
                 x0 = generated
             else:

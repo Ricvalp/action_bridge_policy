@@ -168,6 +168,16 @@ def test_reverse_phase_sb_checkpoint_is_not_an_evaluation_policy(evaluation, met
     run.evaluate.assert_not_called()
 
 
+@pytest.mark.parametrize("method", METHODS[1:])
+def test_legacy_revisers_rejected_by_active_cli(evaluation, method):
+    run = evaluation(method)
+    run.payload["config"].pop("protocol", None)
+    with pytest.raises(SystemExit):
+        cli.main(method, ["--checkpoint", str(run.checkpoint)])
+    run.restore.assert_not_called()
+    run.evaluate.assert_not_called()
+
+
 def test_existing_evaluation_directory_is_not_overwritten(evaluation):
     run = evaluation()
     run.output.mkdir()

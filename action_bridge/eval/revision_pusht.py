@@ -19,7 +19,6 @@ from action_bridge.eval.pusht_sim import (
 from action_bridge.plan_revision.cache import reference_for
 from action_bridge.plan_revision.completion import COMPLETION_NAMES, complete_plan
 from action_bridge.plan_revision.contracts import ActionCodec, PlanCache
-from action_bridge.plan_revision.models import build_policy
 from action_bridge.plan_revision.training import restore_completion
 
 
@@ -82,7 +81,8 @@ def _save_video(frames, path):
 
     # Stream frames instead of creating another full copy of the rollout.
     with imageio.get_writer(path, format="FFMPEG", fps=10, codec="libx264",
-                            pixelformat="yuv420p", macro_block_size=2) as writer:
+                            pixelformat="yuv420p", macro_block_size=2,
+                            ffmpeg_params=["-threads", "1"]) as writer:
         for frame in frames:
             writer.append_data(np.asarray(frame, dtype=np.uint8))
 
@@ -96,7 +96,8 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
     Uses the legacy benchmark success definition (termination, explicit success,
     or reward >= .95). ``env_success_rate`` also reports the stricter native
     environment flag, while coverage metrics use actual ``info['coverage']``.
-    The first plan is the identical seeded frozen proposal for every method.
+    Revisers generate their first chunk from an observed anchor, without any
+    external policy or future labels. Later sources use their own old plans.
     ``render=False`` disables all frame collection, regardless of media flags.
     GIFs are optional; media stays in ``output`` and is not uploaded to W&B.
     """
@@ -122,16 +123,6 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
     stats = metadata["normalization"]
     reviser = config["method"] != "ddim"
     completion = restore_completion(dependencies, device) if reviser else None
-    if "proposal_state" in dependencies:
-        proposal = build_policy(dependencies["proposal_config"]).to(device)
-        proposal.load_state_dict(dependencies["proposal_state"])
-        proposal.eval().requires_grad_(False)
-    elif reviser:
-        raise ValueError("Revision evaluation requires the frozen DDIM bootstrap dependency")
-    else:
-        proposal = policy
-    if reviser and dependencies["proposal_config"].get("method") != "ddim":
-        raise ValueError("The bootstrap dependency must be a DDIM policy")
     policy.eval()
     env = _make_pusht_env(render_mode="rgb_array", obs_type="state")
     cache = PlanCache()
@@ -150,7 +141,7 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
             boundaries, revisions, timings, energies, coefficient_rows = [], [], [], [], []
             tail_speeds, tail_accelerations = [], []
             traces, frames, nfes = [], [], []
-            bootstrap_nfe, bootstraps, clipped_count = 0, 0, 0
+            startup_nfe, startups, clipped_count = 0, 0, 0
             terminated = truncated = False
             info = {}
             collect_frames = (render and (save_videos or save_gifs)
@@ -159,52 +150,60 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                 obs_tensor = torch.as_tensor(normalize_observations_np(obs_hist, stats)[None],
                                              device=device, dtype=torch.float32)
                 act_tensor = codec.encode(torch.as_tensor(act_hist[None], device=device, dtype=torch.float32))
-                bootstrap = cache.plan is None or (reviser and cache.needs_bootstrap)
+                has_previous_plan = cache.plan is not None and cache.executed < horizon
+                startup = reviser and not has_previous_plan
                 aligned = completed = source = reference = None
                 aligned_raw = completed_raw = None
                 prior = None
                 _synchronize(device)
                 start = time.perf_counter()
-                if bootstrap:
-                    generated, diagnostics = proposal.sample(obs_tensor, act_tensor, generator=generator)
-                    bootstraps += 1
-                    bootstrap_nfe += int(diagnostics.get("nfe", 0))
-                else:
-                    # Preserve the exact overlap for diagnostics before replacing
-                    # the cache. DDIM is also measured against its previous plan.
-                    if cache.executed < horizon:
-                        aligned = cache.plan[:, cache.executed:].clone()
-                        aligned_raw = _array(codec.decode(aligned)[0])
-                    if reviser:
+                # Preserve the exact overlap before replacing the cache. DDIM
+                # is also measured against its previous independently drawn plan.
+                if has_previous_plan:
+                    aligned = cache.plan[:, cache.executed:].clone()
+                    aligned_raw = _array(codec.decode(aligned)[0])
+                if reviser:
+                    if startup:
+                        # This is the absolute-target action adapter's startup
+                        # rule. Before the first command act_hist is initialized
+                        # to the observed pusher; later it contains real commands.
+                        completed = act_tensor[:, -1:].expand(-1, horizon, -1).clone()
+                    else:
                         completed = complete_plan(cache.plan, cache.executed, obs_tensor, act_tensor,
                                                   completion_id, completion, robot_dt=config["robot_dt"])
-                        completed_raw = _array(codec.decode(completed)[0])
                         # Include the last two old targets so tail acceleration
                         # measures the boundary as well as later continuation.
                         tail_commands = np.concatenate([_array(codec.decode(cache.plan)[0, -2:]),
-                                                        completed_raw[horizon - cache.executed:]])
+                                                        _array(codec.decode(completed)[0, horizon - cache.executed:])])
                         velocity = np.diff(tail_commands, axis=0) / config["robot_dt"]
                         tail_speeds.append(float(np.sqrt(np.mean(np.sum(velocity[1:]**2, axis=-1)))))
                         acceleration = np.diff(velocity, axis=0) / config["robot_dt"]
                         tail_accelerations.append(float(np.sqrt(np.mean(np.sum(acceleration**2, axis=-1)))))
-                        source = completed + config["source_std"] * torch.randn(
-                            completed.shape, device=device, dtype=completed.dtype, generator=generator)
-                        if config["method"].startswith("sb_"):
-                            prior = completion.prior(obs_tensor, act_tensor,
-                                torch.as_tensor(dependencies["innovation_variance"], device=device),
-                                ridge=config["prior_ridge"], max_rate=config["max_rate"],
-                                mobility_smoothing=config["mobility_smoothing"])
-                            reference_batch = {"precision": prior["precision"], "prior_mean": prior["mean"]}
-                            if config["mobility_smoothing"]:
-                                reference_batch["mobility"] = prior["mobility"]
-                            reference = reference_for(reference_batch, config)
-                            _, stiffness, damping = completion.coefficients(obs_tensor, act_tensor)
-                            coefficient_rows.append({"stiffness": float(stiffness.mean()),
-                                "damping": float(damping.mean()), "rate_min": float(prior["rate_min"].mean()),
-                                "rate_max": float(prior["rate_max"].mean()),
-                                "stabilized_fraction": float(prior["stabilized_fraction"].mean())})
+                    completed_raw = _array(codec.decode(completed)[0])
+                    source = completed + config["source_std"] * torch.randn(
+                        completed.shape, device=device, dtype=completed.dtype, generator=generator)
+                    if config["method"].startswith("sb_"):
+                        prior = completion.prior(obs_tensor, act_tensor,
+                            torch.as_tensor(dependencies["innovation_variance"], device=device),
+                            ridge=config["prior_ridge"], max_rate=config["max_rate"],
+                            mobility_smoothing=config["mobility_smoothing"])
+                        reference_batch = {"precision": prior["precision"], "prior_mean": prior["mean"]}
+                        if config["mobility_smoothing"]:
+                            reference_batch["mobility"] = prior["mobility"]
+                        reference = reference_for(reference_batch, config)
+                        _, stiffness, damping = completion.coefficients(obs_tensor, act_tensor)
+                        coefficient_rows.append({"stiffness": float(stiffness.mean()),
+                            "damping": float(damping.mean()), "rate_min": float(prior["rate_min"].mean()),
+                            "rate_max": float(prior["rate_max"].mean()),
+                            "stabilized_fraction": float(prior["stabilized_fraction"].mean())})
                     generated, diagnostics = policy.sample(obs_tensor, act_tensor, completion_id,
-                        source_actions=source, reference=reference, generator=generator)
+                        source_actions=source, reference=reference, generator=generator,
+                        has_previous_plan=torch.tensor([has_previous_plan], device=device))
+                    if startup:
+                        startups += 1
+                        startup_nfe += int(diagnostics.get("nfe", 0))
+                else:
+                    generated, diagnostics = policy.sample(obs_tensor, act_tensor, generator=generator)
                 _synchronize(device)
                 timings.append(time.perf_counter() - start)
                 if generated.shape != (1, horizon, 2) or not bool(generated.isfinite().all()):
@@ -217,7 +216,8 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                 if "control_energy" in diagnostics:
                     energies.append(float(torch.as_tensor(diagnostics["control_energy"]).mean()))
                 if len(traces) < 3:
-                    trace = {"step": len(actions), "bootstrap": bootstrap, "completion_id": completion_id,
+                    trace = {"step": len(actions), "startup": startup,
+                             "has_previous_plan": has_previous_plan, "completion_id": completion_id,
                              "aligned_old_raw": aligned_raw, "completed_raw": completed_raw,
                              "perturbed_source_raw": None if source is None else _array(codec.decode(source)[0]),
                              "final_raw": raw, "nfe": nfes[-1]}
@@ -265,7 +265,7 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                 "command_jerk": _mean(np.linalg.norm(jerk, axis=-1)),
                 "clipping_rate": clipped_count / max(1, len(actions)),
                 "inference_seconds_per_replan": _mean(timings), "nfe_per_replan": _mean(nfes),
-                "bootstrap_nfe": bootstrap_nfe, "bootstraps": bootstraps, "replans": len(nfes),
+                "startup_nfe": startup_nfe, "startups": startups, "replans": len(nfes),
                 "control_energy": _mean(energies), "reference_coefficients": coefficient_rows,
                 "completed_tail_speed": _mean(tail_speeds),
                 "completed_tail_acceleration": _mean(tail_accelerations),
@@ -294,13 +294,14 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
         env.close()
     scalar_keys = ("max_coverage", "final_coverage", "episode_length", "revision_rms", "boundary_jump",
                    "command_acceleration", "command_jerk", "clipping_rate", "inference_seconds_per_replan",
-                   "nfe_per_replan", "bootstrap_nfe", "bootstraps", "control_energy",
+                   "nfe_per_replan", "startup_nfe", "startups", "control_energy",
                    "completed_tail_speed", "completed_tail_acceleration")
     metrics = {key: _mean([episode[key] for episode in episodes]) for key in scalar_keys}
     metrics.update(success_rate=_mean([episode["success"] for episode in episodes]),
                    sim_success_rate=_mean([episode["success"] for episode in episodes]),
                    env_success_rate=_mean([episode["env_success"] for episode in episodes]),
-                   episodes=len(episodes), completion_id=int(completion_id),
+                   episodes=len(episodes), protocol=config.get("protocol", "ordinary_ddim"),
+                   external_bootstrap=False, completion_id=int(completion_id),
                    completion=COMPLETION_NAMES[completion_id], method=config["method"], seeds=seeds,
                    horizon=horizon, execute=executed, command_units=codec.units, robot_dt=config["robot_dt"],
                    success_definition="legacy wrapper: terminated OR info success OR max reward >= 0.95")

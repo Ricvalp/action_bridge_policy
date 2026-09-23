@@ -1,6 +1,6 @@
 # Latent Path-KL Action Bridge Policy
 
-For the separate whole-plan Push-T DDIM/FM/Schrödinger-bridge experiment, see
+For the separate `self_source_v1` whole-plan Push-T DDIM/FM/Schrödinger-bridge experiment, see
 [docs/SB_PUSHT.md](docs/SB_PUSHT.md). Its matching objectives are distinct from
 the original Action Bridge formulation described below.
 

@@ -61,6 +61,8 @@ def main(method, argv=None):
     config = dict(state["config"])
     if config["method"] != method:
         parser.error(f"Expected {method}, but checkpoint contains {config['method']}")
+    if method != "ddim" and config.get("protocol") != "self_source_v1":
+        parser.error("This command evaluates self_source_v1 revisers only; fixed-DDIM-source checkpoints are retired")
     if "ema" not in state:
         parser.error("Checkpoint has no EMA policy weights; a reference checkpoint is not a policy")
     if method.startswith("sb_") and state.get("direction") != "forward":

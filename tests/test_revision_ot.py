@@ -102,13 +102,14 @@ def test_nonconverged_uniform_marginals_fail_clearly():
 
 def test_pusht_pairer_batches_blocks_and_keeps_uniform_anchor_labels(monkeypatch):
     from action_bridge.data.revision_pusht import make_local_pairer
-    from action_bridge.plan_revision.completion import complete_plan
     from action_bridge.plan_revision.contracts import take
     import action_bridge.plan_revision.ot as ot
 
     n, horizon, dim = 6, 4, 2
-    records = {"old_actions": torch.arange(n * horizon * dim).float().reshape(n, horizon, dim),
+    records = {"source_actions": torch.arange(n * horizon * dim).float().reshape(n, horizon, dim),
                "future_actions": torch.randn(n, horizon, dim),
+               "completion_id": torch.tensor([0, 1, 2, 2, 0, 1]),
+               "has_previous_plan": torch.tensor([False, False, True, True, False, True]),
                "obs_hist": torch.randn(n, 2, 5), "act_hist": torch.randn(n, 2, dim)}
     # Several contexts tie and topk-like candidates omit the actual anchor.
     neighborhood = {"neighbors": torch.tensor([[1, 2, 3], [0, 2, 3], [0, 1, 3],
@@ -118,7 +119,7 @@ def test_pusht_pairer_batches_blocks_and_keeps_uniform_anchor_labels(monkeypatch
                ot_entropy=.1, ot_context_weight=1.)
     anchor_ids = torch.tensor([4, 1, 5])
     batch = take(records, anchor_ids)
-    batch.update(record_id=anchor_ids, completion_id=torch.tensor([0, 1, 0]))
+    batch.update(record_id=anchor_ids)
     batch["future_actions"] += .123  # The exact already-dequantized endpoint draw.
     histories, labels = batch["obs_hist"].clone(), batch["future_actions"].clone()
     calls = []
@@ -127,6 +128,8 @@ def test_pusht_pairer_batches_blocks_and_keeps_uniform_anchor_labels(monkeypatch
         calls.append((source.clone(), target.clone(), kwargs["completion_ids"].clone()))
         torch.testing.assert_close(target[:, 0], labels)
         assert kwargs["target_indices"] == [0]
+        availability = records["has_previous_plan"][torch.tensor([[4, 0, 1], [1, 0, 2], [5, 0, 1]])]
+        assert torch.equal(compatible, availability[:, :, None] == availability[:, None, :])
         ids = torch.zeros(len(source), 1, dtype=torch.long)
         return ids, ids, {"context_displacement": torch.zeros(len(source))}
 
@@ -135,9 +138,8 @@ def test_pusht_pairer_batches_blocks_and_keeps_uniform_anchor_labels(monkeypatch
     result, metrics = pairer(batch, None, "cpu")
     assert len(calls) == 1
     assert calls[0][0].shape == (3, 3, horizon, dim)
-    assert torch.equal(calls[0][2], batch["completion_id"][:, None].expand(-1, 3))
-    expected = complete_plan(records["old_actions"][anchor_ids], 2, histories,
-                             batch["act_hist"], batch["completion_id"])
+    assert torch.equal(calls[0][2][:, 0], batch["completion_id"])
+    expected = records["source_actions"][anchor_ids]
     torch.testing.assert_close(result["source_actions"], expected)
     torch.testing.assert_close(result["future_actions"], labels)
     torch.testing.assert_close(result["obs_hist"], histories)

@@ -84,15 +84,21 @@ class FieldNet(nn.Module):
         self.mode_embedding = nn.Embedding(3, mode_dim)
         self.unet = ConditionalUnet1D(
             self.action_dim * (2 if kinetic else 1), channels,
-            history_dim + time_dim + mode_dim, output_dim=self.action_dim,
+            history_dim + time_dim + mode_dim + 1, output_dim=self.action_dim,
         )
 
-    def conditioning(self, obs_hist, act_hist, mode):
+    def conditioning(self, obs_hist, act_hist, mode, has_previous_plan=None):
         history = self.history_encoder(obs_hist, act_hist)
         mode = torch.as_tensor(mode, device=history.device, dtype=torch.long).expand(history.shape[0])
         if bool(((mode < 0) | (mode > 2)).any()):
             raise ValueError("completion_id must be repeat=0, fixed_damped=1 or learned_dissipative=2")
-        return torch.cat((history, self.mode_embedding(mode)), dim=-1)
+        available = torch.as_tensor(
+            True if has_previous_plan is None else has_previous_plan,
+            device=history.device, dtype=history.dtype,
+        ).expand(history.shape[0])
+        if not bool(((available == 0) | (available == 1)).all()):
+            raise ValueError("has_previous_plan must be a boolean scalar or [batch]")
+        return torch.cat((history, self.mode_embedding(mode), available[:, None]), dim=-1)
 
     def conditioned(self, state, tau, conditioning):
         if state.ndim != 2 or state.shape[-1] != self.state_dim:
@@ -108,8 +114,8 @@ class FieldNet(nn.Module):
         condition = torch.cat((conditioning, self.time_embedding(100 * tau)), dim=-1)
         return self.unet(chunk, condition).reshape(-1, self.n)
 
-    def forward(self, state, tau, obs_hist, act_hist, mode):
-        return self.conditioned(state, tau, self.conditioning(obs_hist, act_hist, mode))
+    def forward(self, state, tau, obs_hist, act_hist, mode, has_previous_plan=None):
+        return self.conditioned(state, tau, self.conditioning(obs_hist, act_hist, mode, has_previous_plan))
 
 
 class DDIMChunkPolicy(nn.Module):
@@ -152,8 +158,9 @@ class DDIMChunkPolicy(nn.Module):
         return {"loss": loss, "noise_mse": loss.detach()}
 
     @torch.no_grad()
-    def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None, generator=None):
-        del mode, source_actions, reference
+    def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None,
+               generator=None, has_previous_plan=None):
+        del mode, source_actions, reference, has_previous_plan
         actions = self.policy.generate(obs_hist, act_hist, generator=generator)
         return actions, {"nfe": self.policy.num_inference_steps}
 
@@ -176,16 +183,18 @@ class FlowMatchingPolicy(nn.Module):
             raise ValueError("source_actions must match future_actions shape")
         tau = torch.rand(len(target), device=target.device, dtype=target.dtype, generator=generator)
         state = torch.lerp(source, target, tau[:, None, None])
-        prediction = self.field(state.flatten(1), tau, batch["obs_hist"], batch["act_hist"], get_completion_ids(batch))
+        prediction = self.field(state.flatten(1), tau, batch["obs_hist"], batch["act_hist"],
+                                get_completion_ids(batch), batch.get("has_previous_plan"))
         loss = F.mse_loss(prediction, (target - source).flatten(1))
         return {"loss": loss, "velocity_mse": loss.detach()}
 
     @torch.no_grad()
-    def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None, generator=None):
+    def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None,
+               generator=None, has_previous_plan=None):
         del reference, generator
         if source_actions is None or source_actions.shape[1:] != (self.horizon, self.action_dim):
             raise ValueError("FM requires an aligned/completed source_actions chunk")
-        conditioning = self.field.conditioning(obs_hist, act_hist, mode)
+        conditioning = self.field.conditioning(obs_hist, act_hist, mode, has_previous_plan)
         state = source_actions.flatten(1)
         steps = self.num_inference_steps // 2
         dt = 1.0 / steps
@@ -243,20 +252,22 @@ class BridgePolicy(nn.Module):
             distance = 1 - tau if direction == "forward" else tau
             weights = distance.pow(3 if self.kinetic else 1)
         field = self.forward_field if direction == "forward" else self.reverse_field
-        prediction = field(state, tau, batch["obs_hist"], batch["act_hist"], get_completion_ids(batch))
+        prediction = field(state, tau, batch["obs_hist"], batch["act_hist"],
+                           get_completion_ids(batch), batch.get("has_previous_plan"))
         error = (prediction - regression_target).square().mean(-1)
         loss = (weights * error).mean()
         return {"loss": loss, "control_mse": error.mean().detach(),
                 "weighted_control_mse": loss.detach()}
 
     @torch.no_grad()
-    def rollout(self, state, obs_hist, act_hist, mode, reference, *, reverse=False, generator=None, steps=None):
+    def rollout(self, state, obs_hist, act_hist, mode, reference, *, reverse=False,
+                generator=None, steps=None, has_previous_plan=None):
         """Reverse time is increasing clock s; the field still receives tau=1-s."""
         count = self.num_inference_steps if steps is None else int(steps)
         if count < 1:
             raise ValueError("rollout steps must be positive")
         field = self.reverse_field if reverse else self.forward_field
-        conditioning = field.conditioning(obs_hist, act_hist, mode)
+        conditioning = field.conditioning(obs_hist, act_hist, mode, has_previous_plan)
         grid = .5 - .5 * torch.cos(torch.linspace(0, math.pi, count + 1, device=state.device, dtype=state.dtype))
         energy = torch.zeros(len(state), device=state.device, dtype=state.dtype)
         # Save a few candidate plans, not physical trajectories.
@@ -275,13 +286,15 @@ class BridgePolicy(nn.Module):
                        "revision_states": torch.stack(snapshots, dim=1)}
 
     @torch.no_grad()
-    def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None, generator=None):
+    def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None,
+               generator=None, has_previous_plan=None):
         if source_actions is None or source_actions.shape[1:] != (self.horizon, self.action_dim):
             raise ValueError("SB requires an aligned/completed source_actions chunk")
         if reference is None:
             raise ValueError("SB requires frozen context-dependent Gaussian reference coefficients")
         state = reference.augment(source_actions.flatten(1), generator=generator)
-        state, metrics = self.rollout(state, obs_hist, act_hist, mode, reference, generator=generator)
+        state, metrics = self.rollout(state, obs_hist, act_hist, mode, reference,
+                                      generator=generator, has_previous_plan=has_previous_plan)
         return reference.positions(state).reshape_as(source_actions), metrics
 
 
