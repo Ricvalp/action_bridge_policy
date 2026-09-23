@@ -38,7 +38,7 @@ class AsyncEvaluation:
     """
 
     def __init__(self, output, config, on_result, *, device="cpu", threads=2,
-                 save_videos=True):
+                 save_videos=True, episodes=None):
         self.output = Path(output) / "sim_eval"
         self.method = config["method"]
         if self.method not in METHODS:
@@ -46,6 +46,12 @@ class AsyncEvaluation:
         self.seeds = list(config["validation_seeds"])
         if not self.seeds or any(not isinstance(seed, int) or seed < 0 for seed in self.seeds):
             raise ValueError("validation_seeds must be a nonempty list of nonnegative integers")
+        if episodes is not None:
+            if not isinstance(episodes, int) or episodes < 1:
+                raise ValueError("Evaluation episodes must be a positive integer")
+            # Evaluation-only override: leave training/source-cache identities
+            # intact when resuming with a larger validation panel.
+            self.seeds = list(range(self.seeds[0], self.seeds[0] + episodes))
         if threads < 1:
             raise ValueError("Evaluation threads must be positive")
         self.on_result = on_result

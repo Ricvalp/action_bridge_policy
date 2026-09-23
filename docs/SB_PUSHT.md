@@ -121,8 +121,12 @@ action-chunk/T-pose images. Every 10k updates the trainer starts an asynchronous
 CPU evaluator **on the same allocated node**, using two threads from the job's
 eight CPUs. The worker hides CUDA, so training retains the GPU. MP4 encoding
 uses one thread. No extra Slurm allocation or nested `sbatch` is needed.
-The same five validation seeds, busy-worker skipping, final drain and local
-video defaults described below apply. Videos are not uploaded to W&B.
+These five training jobs pass `--eval-episodes 20`: each evaluation uses the
+same 20 validation seeds. The local default remains five episodes, and the
+final held-out comparison remains 50 seeds. The 10k-update cadence,
+busy-worker skipping, final drain and local video defaults are unchanged.
+Videos are not uploaded to W&B. Already running jobs keep their submitted
+settings; the 20-episode setting takes effect only after resubmission.
 
 Slurm stdout/stderr are in `hpc/logs/`; metrics, checkpoints, figures and videos
 are below `$SB_PUSHT_RUN_ROOT/<method>/`. The smoke must pass before starting
@@ -259,6 +263,11 @@ claim of fixed-boundary convergence.
 All five policy trainers evaluate every **10k updates** in a separate process
 (default CPU, two threads). Training continues while it runs. Change this with
 `--eval-every 5000 --eval-device cpu --eval-threads 2`.
+Use `--eval-episodes 20` for 20 consecutive seeds starting at 500000 (the HPC
+training jobs already set this). This evaluation-only option can change when
+resuming without rebuilding training caches. Changing the seed panel restarts
+`best.pt` selection at the first trained-policy result on the new panel;
+previous checkpoints are not automatically re-evaluated.
 One worker runs per trainer; busy intervals are skipped, not queued. At training
 end, pending evaluation finishes and final weights are evaluated if necessary.
 Use `--no-sim-eval` to disable it.

@@ -26,6 +26,9 @@ def test_sbatch_h200_resources_and_shell_syntax(stage):
     if stage in METHODS:
         assert "#SBATCH --time=10:00:00\n" in text
         assert '"H200" not in name.upper()' in text
+        assert "--eval-episodes 20" in text
+    else:
+        assert "--eval-episodes" not in text
 
 
 @pytest.mark.parametrize("stage", STAGES)
@@ -65,6 +68,7 @@ with open(os.environ['LAUNCH_LOG'], 'a') as stream:
         assert "--sim-eval" in call["args"] and "--eval-videos" in call["args"]
         assert call["args"][call["args"].index("--eval-device") + 1] == "cpu"
         assert call["args"][call["args"].index("--eval-every") + 1] == "10000"
+        assert call["args"][call["args"].index("--eval-episodes") + 1] == "20"
         assert call["args"][call["args"].index("--eval-threads") + 1] == "2"
     if stage in (*METHODS, "reference"):
         assert "--wandb" in call["args"]

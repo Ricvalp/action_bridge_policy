@@ -220,6 +220,72 @@ def test_evaluation_cadence_can_change_on_resume_but_learning_rate_cannot(tmp_pa
     assert len(managers) == 1
 
 
+@pytest.mark.parametrize("method", METHODS)
+def test_runtime_seed_panel_change_resets_best_without_changing_training(tmp_path, method):
+    config, records, dependencies, metadata, pairer = training_case(method)
+    config["validation_every"] = 1
+    original_inputs = copy.deepcopy((config, records, dependencies, metadata))
+    baseline = train(records, config, tmp_path / "plain", metadata, dependencies, "cpu", pairer=pairer)
+    baseline_rng = checkpoints.rng_state()
+    output = tmp_path / "resumed"
+    panel = list(range(5))
+    managers = []
+
+    def factory(on_result):
+        seeds = list(panel)
+
+        def with_panel(step, metrics, checkpoint):
+            score = 1. if len(seeds) == 5 else {5: .6, 6: .7}.get(step, .5)
+            on_result(step, {**metrics, "success_rate": score,
+                             "seeds": seeds, "episodes": len(seeds)}, checkpoint)
+
+        manager = DelayedEvaluation(output, with_panel)
+        managers.append(manager)
+        return manager
+
+    def resume(**kwargs):
+        return train(records, config, output, metadata, dependencies, "cpu", pairer=pairer,
+                     evaluation_factory=factory, **kwargs)
+
+    first = resume(stop_after=4)
+    initial_report = json.loads((output / "best_eval.json").read_text())
+    assert first["best_validation"] == initial_report["success_rate"] == 1.
+    assert initial_report["step"] == (3 if method.startswith("sb_") else 1)
+    assert initial_report["seeds"] == panel and initial_report["episodes"] == 5
+
+    # The panel belongs to the runtime evaluator, not the training config.
+    panel = list(range(20))
+    changed = resume(stop_after=5)
+    changed_report = json.loads((output / "best_eval.json").read_text())
+    assert changed["best_validation"] == changed_report["success_rate"] == .6
+    assert changed_report["step"] == checkpoints.load(output / "best.pt")["step"] == 5
+    assert changed_report["seeds"] == panel and changed_report["episodes"] == 20
+
+    # An interrupted write can leave the old panel's higher score in latest.pt.
+    # The published report must remain authoritative on the following resume.
+    changed["best_validation"] = 1.
+    checkpoints.save(output / "latest.pt", changed)
+    improved = resume(stop_after=6)
+    assert improved["best_validation"] == .7
+    report = json.loads((output / "best_eval.json").read_text())
+    assert report["step"] == 6 and report["success_rate"] == .7
+    best_digest = checkpoints.digest(output / "best.pt")
+
+    resumed = resume()
+    assert resumed["complete"] and resumed["best_validation"] == .7
+    assert json.loads((output / "best_eval.json").read_text()) == report
+    assert checkpoints.digest(output / "best.pt") == best_digest
+    assert best_digest == checkpoints.digest(managers[2].submitted[0][1])
+    rows = [json.loads(line) for line in (output / "validation.jsonl").read_text().splitlines()]
+    assert [(row["step"], row["success_rate"]) for row in rows if row.get("seeds") == panel] == [
+        (5, .6), (6, .7), (7, .5), (8, .5)]
+    for key in ("model", "ema", "optimizers", "coupling_cache", "opposite_snapshot", "rng",
+                "config", "metadata", "dependencies", "source_block", "source_provenance"):
+        assert_tree_equal(baseline[key], resumed[key])
+    assert_tree_equal(baseline_rng, checkpoints.rng_state())
+    assert_tree_equal(original_inputs, (config, records, dependencies, metadata))
+
+
 def test_training_failure_closes_its_evaluation_manager(tmp_path):
     config, records, dependencies, metadata, _ = training_case("ddim")
     managers = []

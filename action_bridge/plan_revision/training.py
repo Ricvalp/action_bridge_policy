@@ -298,8 +298,11 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
         dependencies = state["dependencies"]
         resume_rng = state["rng"]
     best_report = output / "best_eval.json"
+    best_seeds = None
     if (output / "best.pt").exists() and best_report.exists():
-        best = max(best, json.loads(best_report.read_text())["success_rate"])
+        report = json.loads(best_report.read_text())
+        # The promoted checkpoint/report may be newer than latest.pt.
+        best, best_seeds = report["success_rate"], report.get("seeds")
     completion = restore_completion(dependencies, device, encoder=completion_encoder) if "completion_state" in dependencies else None
     if resume_rng is not None:
         # Constructing modules consumes random numbers, even when their weights
@@ -352,7 +355,7 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
         return candidate
 
     def evaluation_finished(eval_step, metrics, checkpoint):
-        nonlocal best
+        nonlocal best, best_seeds
         row = {"step": eval_step, **metrics, "forward_updates": forward_updates(eval_step),
                "checkpoint_sha256": checkpoints.digest(checkpoint)}
         log(output / "validation.jsonl", row)
@@ -362,6 +365,10 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
         score = float(metrics["success_rate"])
         tqdm.write(f"Closed-loop step {eval_step}: success={score:.1%}")
         # A random, not-yet-trained SB forward field is diagnostic only.
+        # Scores from different seed panels are not comparable. Restart best
+        # selection on the first trained result from the new panel.
+        if forward_updates(eval_step) > 0 and metrics.get("seeds") != best_seeds:
+            best, best_seeds = float("-inf"), metrics.get("seeds")
         if forward_updates(eval_step) > 0 and score > best:
             best = score
             temporary = output / "best.pt.tmp"

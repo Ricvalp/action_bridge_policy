@@ -310,6 +310,9 @@ def main(argv=None):
                         help="Asynchronous closed-loop interval; overrides validation_every (default 10000)")
     parser.add_argument("--eval-device", default="cpu", help="Separate evaluator's policy device")
     parser.add_argument("--eval-threads", type=int, default=2)
+    parser.add_argument("--eval-episodes", type=int,
+                        help="Training-time evaluation episodes, using consecutive seeds from the first "
+                             "validation seed; default: the configured validation_seeds")
     parser.add_argument("--sim-eval", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eval-videos", action=argparse.BooleanOptionalAction, default=True,
                         help="Save selected evaluation MP4s locally, never upload them to W&B")
@@ -325,8 +328,12 @@ def main(argv=None):
         parser.error("--wandb-images-every must be positive and --wandb-image-count nonnegative")
     if args.eval_threads < 1 or (args.eval_every is not None and args.eval_every < 1):
         parser.error("--eval-threads and --eval-every must be positive")
+    if args.eval_episodes is not None and args.eval_episodes < 1:
+        parser.error("--eval-episodes must be positive")
     evaluation = dict(device=args.eval_device, threads=args.eval_threads,
                       save_videos=args.eval_videos) if args.sim_eval else False
+    if args.sim_eval and args.eval_episodes is not None:
+        evaluation["episodes"] = args.eval_episodes
     tracking = TrackingOptions(enabled=args.wandb, project=args.wandb_project, entity=args.wandb_entity,
                                mode=args.wandb_mode, images_every=args.wandb_images_every,
                                image_count=args.wandb_image_count)

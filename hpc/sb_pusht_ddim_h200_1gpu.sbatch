@@ -49,6 +49,7 @@ exec .venv-sb-pusht/bin/python -m action_bridge.scripts.sb_pusht ddim \
   --wandb-mode "${WANDB_MODE:-online}" \
   --sim-eval \
   --eval-every 10000 \
+  --eval-episodes 20 \
   --eval-device cpu \
   --eval-threads 2 \
   --eval-videos

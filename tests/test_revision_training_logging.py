@@ -194,10 +194,11 @@ def test_cli_can_configure_or_disable_background_evaluation(tmp_path, monkeypatc
     calls = []
     monkeypatch.setattr(sb_pusht, "run_stage", lambda *args, **kwargs: calls.append((args, kwargs)))
     sb_pusht.main(["ddim", "--run-root", str(tmp_path), "--device", "cpu", "--eval-every", "5000",
-                   "--eval-threads", "3", "--no-eval-videos"])
+                   "--eval-threads", "3", "--eval-episodes", "20", "--no-eval-videos"])
     args, kwargs = calls[-1]
     assert args[3]["validation_every"] == 5000
-    assert kwargs["evaluation"] == {"device": "cpu", "threads": 3, "save_videos": False}
+    assert kwargs["evaluation"] == {"device": "cpu", "threads": 3, "save_videos": False, "episodes": 20}
+    assert args[3]["validation_seeds"] == list(range(500000, 500005))
     sb_pusht.main(["ddim", "--run-root", str(tmp_path), "--device", "cpu", "--no-sim-eval"])
     assert calls[-1][1]["evaluation"] is False
 
@@ -213,7 +214,8 @@ def test_cli_tracking_defaults_off_and_allows_disabling_images(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("arguments", [["--wandb-images-every", "0"], ["--wandb-image-count", "-1"],
-                                      ["--wandb-mode", "typo"]])
+                                      ["--wandb-mode", "typo"], ["--eval-episodes", "0"],
+                                      ["--eval-episodes", "-1"]])
 def test_cli_rejects_invalid_tracking_options_before_starting(tmp_path, monkeypatch, arguments):
     def unexpected_stage(*args, **kwargs):
         pytest.fail("Invalid tracking options must not start a stage")

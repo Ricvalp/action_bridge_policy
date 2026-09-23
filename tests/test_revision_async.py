@@ -125,6 +125,24 @@ def test_gpu_override_keeps_visible_devices_and_can_disable_media(setup, monkeyp
     assert calls[0][1]["env"]["CUDA_VISIBLE_DEVICES"] == "3"
 
 
+def test_episode_override_changes_worker_seeds_without_changing_training_config(setup, tmp_path):
+    _, payload, callback, processes, calls = setup
+    config = get_config("ddim")
+    original_seeds = list(config["validation_seeds"])
+    manager = asynchronous.AsyncEvaluation(tmp_path, config, callback, episodes=20)
+    manager.submit(payload | {"config": config})
+    command = calls[0][0]
+    assert command[command.index("--seeds") + 1:] == list(map(str, range(500000, 500020)))
+    assert config["validation_seeds"] == original_seeds
+    assert checkpoints.load(manager._job.checkpoint)["config"] == config
+
+
+@pytest.mark.parametrize("episodes", [0, -1, 1.5])
+def test_invalid_episode_count_fails_before_a_worker_is_created(tmp_path, episodes):
+    with pytest.raises(ValueError, match="episodes must be a positive integer"):
+        asynchronous.AsyncEvaluation(tmp_path, get_config(), Mock(), episodes=episodes)
+
+
 @pytest.mark.parametrize("metrics,code", [
     ({"success_rate": .9}, 1), (None, 0), ({"other": .9}, 0),
     ({"success_rate": float("nan")}, 0), ({"success_rate": 2}, 0),
