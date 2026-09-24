@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from action_bridge.data.pusht_adapter import normalize_observations_np
 from action_bridge.eval.pusht_sim import (
@@ -90,7 +91,8 @@ def _save_video(frames, path):
 @torch.no_grad()
 def evaluate(policy, config, metadata, dependencies, device, output=None,
              completion_id=2, seeds=None, render=False, save_videos=True,
-             save_gifs=False):
+             save_gifs=False, progress=True, write_metrics=True,
+             trace_generation=False):
     """Evaluate one sample per seed; save first two successes/failures as MP4s.
 
     Uses the legacy benchmark success definition (termination, explicit success,
@@ -100,12 +102,18 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
     external policy or future labels. Later sources use their own old plans.
     ``render=False`` disables all frame collection, regardless of media flags.
     GIFs are optional; media stays in ``output`` and is not uploaded to W&B.
+    ``progress=False`` disables the episode progress bar on stderr.
+    Parallel workers set ``write_metrics=False`` and leave aggregation to the parent.
+    ``trace_generation=True`` records every FM/SB decision and solver state for
+    phase visualizations, without changing generated commands or stepping physics.
     """
     device = torch.device(device)
     if (config["obs_dim"], config["action_dim"]) != (5, 2):
         raise ValueError("This evaluator is the Push-T 5-state/2-target adapter")
     if completion_id not in range(3):
         raise ValueError("completion_id must be 0, 1 or 2")
+    if trace_generation and config["method"] not in ("fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic"):
+        raise ValueError("Generation tracing requires an FM or SB reviser")
     horizon, executed = int(config["horizon"]), int(config["execute"])
     if not 1 <= executed <= horizon:
         raise ValueError("execute must satisfy 1 <= K <= H")
@@ -127,6 +135,8 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
     env = _make_pusht_env(render_mode="rgb_array", obs_type="state")
     cache = PlanCache()
     episodes, saved = [], {"success": 0, "failure": 0}
+    progress_bar = tqdm(total=len(seeds), desc=f"Evaluating {config['method']}",
+                        unit="episode", disable=not progress)
     try:
         low, high = _action_bounds(env)
         if not (np.allclose(low, codec.low) and np.allclose(high, codec.high)):
@@ -198,7 +208,8 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                             "stabilized_fraction": float(prior["stabilized_fraction"].mean())})
                     generated, diagnostics = policy.sample(obs_tensor, act_tensor, completion_id,
                         source_actions=source, reference=reference, generator=generator,
-                        has_previous_plan=torch.tensor([has_previous_plan], device=device))
+                        has_previous_plan=torch.tensor([has_previous_plan], device=device),
+                        **({"trace": True} if trace_generation else {}))
                     if startup:
                         startups += 1
                         startup_nfe += int(diagnostics.get("nfe", 0))
@@ -215,7 +226,7 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                 nfes.append(int(diagnostics.get("nfe", 0)))
                 if "control_energy" in diagnostics:
                     energies.append(float(torch.as_tensor(diagnostics["control_energy"]).mean()))
-                if len(traces) < 3:
+                if trace_generation or len(traces) < 3:
                     trace = {"step": len(actions), "startup": startup,
                              "has_previous_plan": has_previous_plan, "completion_id": completion_id,
                              "aligned_old_raw": aligned_raw, "completed_raw": completed_raw,
@@ -224,6 +235,14 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                     if "revision_states" in diagnostics:
                         candidates = torch.as_tensor(diagnostics["revision_states"], device=device).reshape(-1, horizon, 2)
                         trace["revision_candidate_plans_raw"] = _array(codec.decode(candidates))
+                    if trace_generation:
+                        if "revision_states" not in diagnostics or "revision_times" not in diagnostics:
+                            raise ValueError("Sampler did not return the requested full generation trace")
+                        trace.update(replan=len(nfes) - 1, state_raw=state.copy(),
+                                     old_plan_raw=None if cache.plan is None else _array(codec.decode(cache.plan)[0]),
+                                     old_executed=int(cache.executed),
+                                     startup_anchor_raw=_array(codec.decode(act_tensor)[0, -1]),
+                                     revision_times=_array(diagnostics["revision_times"]))
                     traces.append(trace)
                 cache.store(generated)
                 execute_now = min(executed, config["max_episode_steps"] - len(actions))
@@ -289,9 +308,23 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                 with (output / f"episode-seed{seed}.json").open("w") as stream:
                     json.dump(_jsonable(episode), stream)
             episodes.append(episode)
+            progress_bar.update(1)
     finally:
+        progress_bar.close()
         cache.reset()
         env.close()
+    metrics = summarize_episodes(episodes, config, metadata, completion_id, seeds)
+    if output is not None and write_metrics:
+        with (output / "metrics.json").open("w") as stream:
+            json.dump(metrics, stream, indent=2)
+    return metrics
+
+
+def summarize_episodes(episodes, config, metadata, completion_id=2, seeds=None):
+    """Use the same episode-weighted metrics for serial and parallel evaluation."""
+    if not episodes:
+        raise ValueError("At least one completed episode is required")
+    seeds = [episode["seed"] for episode in episodes] if seeds is None else list(seeds)
     scalar_keys = ("max_coverage", "final_coverage", "episode_length", "revision_rms", "boundary_jump",
                    "command_acceleration", "command_jerk", "clipping_rate", "inference_seconds_per_replan",
                    "nfe_per_replan", "startup_nfe", "startups", "control_energy",
@@ -303,13 +336,11 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                    episodes=len(episodes), protocol=config.get("protocol", "ordinary_ddim"),
                    external_bootstrap=False, completion_id=int(completion_id),
                    completion=COMPLETION_NAMES[completion_id], method=config["method"], seeds=seeds,
-                   horizon=horizon, execute=executed, command_units=codec.units, robot_dt=config["robot_dt"],
+                   horizon=int(config["horizon"]), execute=int(config["execute"]),
+                   command_units=metadata["codec"]["units"], robot_dt=config["robot_dt"],
                    success_definition="legacy wrapper: terminated OR info success OR max reward >= 0.95")
     coefficient_rows = [row for episode in episodes for row in episode["reference_coefficients"]]
     if coefficient_rows:
         metrics.update({f"reference_{key}": _mean([row[key] for row in coefficient_rows])
                         for key in coefficient_rows[0]})
-    if output is not None:
-        with (output / "metrics.json").open("w") as stream:
-            json.dump(metrics, stream, indent=2)
     return metrics

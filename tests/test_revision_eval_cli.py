@@ -48,13 +48,16 @@ def evaluation(tmp_path, monkeypatch):
         load = Mock(return_value=payload)
         restore = Mock(return_value=policy)
         evaluate = Mock(return_value={"success_rate": 0.5})
+        evaluate_parallel = Mock(return_value={"success_rate": 0.5})
         monkeypatch.setattr(cli.checkpoints, "load", load)
         monkeypatch.setattr(cli.checkpoints, "restore_policy", restore)
         monkeypatch.setattr(cli, "evaluate", evaluate)
+        monkeypatch.setattr(cli, "evaluate_parallel", evaluate_parallel)
         return SimpleNamespace(
             checkpoint=checkpoint, payload=payload, policy=policy,
             output=tmp_path / "evaluation", load=load, restore=restore,
-            evaluate=evaluate, signature=signature, runtime=runtime,
+            evaluate=evaluate, evaluate_parallel=evaluate_parallel,
+            signature=signature, runtime=runtime,
         )
 
     return setup
@@ -66,7 +69,13 @@ def evaluated_arguments(run):
 
 
 @pytest.mark.parametrize("method", METHODS)
-def test_method_scripts_evaluate_checkpoint_without_original_training_files(evaluation, method):
+@pytest.mark.parametrize("progress_arguments,progress", [
+    pytest.param([], True, id="default-progress"),
+    pytest.param(["--no-progress"], False, id="disabled-progress"),
+    pytest.param(["--progress"], True, id="explicit-progress"),
+])
+def test_method_scripts_evaluate_checkpoint_without_original_training_files(
+        evaluation, method, progress_arguments, progress):
     run = evaluation(method)
     original = copy.deepcopy(run.payload)
     script = importlib.import_module(f"action_bridge.scripts.eval_pusht_{method}")
@@ -75,10 +84,12 @@ def test_method_scripts_evaluate_checkpoint_without_original_training_files(eval
         "--checkpoint", str(run.checkpoint), "--device", "cpu",
         "--output-dir", str(run.output), "--episodes", "3", "--seed", "123",
         "--execute", "4", "--max-steps", "20", "--no-save-videos",
+        *progress_arguments,
     ]) == 0
 
     run.load.assert_called_once()
     run.restore.assert_called_once_with(run.payload, "cpu")
+    run.evaluate_parallel.assert_not_called()
     values = evaluated_arguments(run)
     assert values["policy"] is run.policy
     assert values["config"] == original["config"] | {
@@ -91,6 +102,7 @@ def test_method_scripts_evaluate_checkpoint_without_original_training_files(eval
     assert values["render"] is False
     assert values["save_videos"] is False
     assert values["save_gifs"] is False
+    assert values["progress"] is progress
     assert Path(values["output"]) == run.output
     assert run.payload == original
     assert not Path(run.payload["metadata"]["dataset_path"]).exists()
@@ -108,6 +120,9 @@ def test_method_scripts_evaluate_checkpoint_without_original_training_files(eval
     assert report["seeds"] == [123, 124, 125]
     assert report["save_gifs"] is False
     assert report["save_videos"] is False
+    assert report["progress"] is progress
+    assert report["workers"] == 1
+    assert report["threads"] == 4
 
 
 def test_defaults_preserve_trained_horizon_and_create_unique_workspace_outputs(evaluation):
@@ -125,17 +140,137 @@ def test_defaults_preserve_trained_horizon_and_create_unique_workspace_outputs(e
         assert values["render"] is True
         assert values["save_videos"] is True
         assert values["save_gifs"] is False
+        assert values["progress"] is True
         output = Path(values["output"])
         assert output.parent == cli.CHECKOUT / "workspace/sb_pusht/evaluation"
         assert output.name.startswith("ddim-")
         assert (output / "evaluation.json").is_file()
+        report = json.loads((output / "evaluation.json").read_text())
+        assert report["workers"] == 1
+        assert report["threads"] == 4
         outputs.append(output)
     assert outputs[0] != outputs[1]
     cli.torch.set_num_threads.assert_called_with(4)
+    run.evaluate_parallel.assert_not_called()
+
+
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("progress_arguments,progress", [
+    pytest.param([], True, id="default-progress"),
+    pytest.param(["--no-progress"], False, id="disabled-progress"),
+])
+def test_parallel_cpu_evaluation_dispatches_checkpoint_without_parent_policy(
+        evaluation, method, progress_arguments, progress):
+    run = evaluation(method)
+    original = copy.deepcopy(run.payload)
+    script = importlib.import_module(f"action_bridge.scripts.eval_pusht_{method}")
+
+    assert script.main([
+        "--checkpoint", str(run.checkpoint), "--device", "cpu",
+        "--output-dir", str(run.output), "--workers", "2",
+        "--seeds", "5", "17", "99", "--execute", "4", "--max-steps", "20",
+        "--no-save-videos", "--save-gifs", *progress_arguments,
+    ]) == 0
+
+    run.load.assert_called_once()
+    run.restore.assert_not_called()
+    run.evaluate.assert_not_called()
+    config = original["config"] | {
+        "execute": 4, "max_episode_steps": 20, "evaluation_seeds": [5, 17, 99],
+    }
+    run.evaluate_parallel.assert_called_once_with(
+        run.payload, config, "cpu", output=run.output,
+        completion_id=config["completion_id"], seeds=[5, 17, 99],
+        workers=2, threads=1, save_videos=False, save_gifs=True,
+        progress=progress,
+    )
+    assert run.evaluate_parallel.call_args.args[0] is run.payload
+    assert run.payload == original
+    cli.torch.set_num_threads.assert_called_once_with(1)
+    report = json.loads((run.output / "evaluation.json").read_text())
+    assert report["workers"] == 2
+    assert report["threads"] == 1
+    assert report["seeds"] == [5, 17, 99]
+    assert report["config"] == config
+    assert report["save_videos"] is False
+    assert report["save_gifs"] is True
+    assert report["progress"] is progress
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_explicit_thread_count_overrides_serial_and_parallel_defaults(evaluation, workers):
+    run = evaluation()
+    assert cli.main("ddim", [
+        "--checkpoint", str(run.checkpoint), "--output-dir", str(run.output),
+        "--device", "cpu", "--workers", str(workers), "--threads", "3",
+    ]) == 0
+
+    cli.torch.set_num_threads.assert_called_once_with(3)
+    report = json.loads((run.output / "evaluation.json").read_text())
+    assert report["workers"] == workers
+    assert report["threads"] == 3
+    if workers == 1:
+        run.restore.assert_called_once_with(run.payload, "cpu")
+        run.evaluate.assert_called_once()
+        run.evaluate_parallel.assert_not_called()
+    else:
+        run.restore.assert_not_called()
+        run.evaluate.assert_not_called()
+        assert run.evaluate_parallel.call_args.kwargs["threads"] == 3
+
+
+def test_worker_count_is_capped_by_explicit_seed_count(evaluation):
+    run = evaluation()
+    assert cli.main("ddim", [
+        "--checkpoint", str(run.checkpoint), "--output-dir", str(run.output),
+        "--device", "cpu", "--workers", "8", "--seeds", "5", "17",
+    ]) == 0
+
+    run.restore.assert_not_called()
+    run.evaluate.assert_not_called()
+    assert run.evaluate_parallel.call_args.kwargs["workers"] == 2
+    assert run.evaluate_parallel.call_args.kwargs["seeds"] == [5, 17]
+    assert run.evaluate_parallel.call_args.kwargs["save_videos"] is True
+    assert run.evaluate_parallel.call_args.kwargs["save_gifs"] is False
+    report = json.loads((run.output / "evaluation.json").read_text())
+    assert report["workers"] == 2
+    assert report["threads"] == 1
+
+
+@pytest.mark.parametrize("device", ["cuda", "cuda:0", "mps"])
+@pytest.mark.parametrize("seeds", [["5"], ["5", "17"]])
+def test_parallel_non_cpu_device_is_rejected_before_output_or_restore(evaluation, device, seeds):
+    run = evaluation()
+    with pytest.raises(SystemExit):
+        cli.main("ddim", [
+            "--checkpoint", str(run.checkpoint), "--output-dir", str(run.output),
+            "--device", device, "--workers", "2", "--seeds", *seeds,
+        ])
+
+    run.restore.assert_not_called()
+    run.evaluate.assert_not_called()
+    run.evaluate_parallel.assert_not_called()
+    assert not run.output.exists()
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_duplicate_explicit_seeds_are_rejected_before_output_or_restore(evaluation, workers):
+    run = evaluation()
+    with pytest.raises(SystemExit):
+        cli.main("ddim", [
+            "--checkpoint", str(run.checkpoint), "--output-dir", str(run.output),
+            "--workers", str(workers), "--seeds", "5", "17", "5",
+        ])
+
+    run.restore.assert_not_called()
+    run.evaluate.assert_not_called()
+    run.evaluate_parallel.assert_not_called()
+    assert not run.output.exists()
 
 
 @pytest.mark.parametrize("option,value", [
     ("--episodes", "0"), ("--episodes", "-1"), ("--threads", "0"),
+    ("--threads", "-1"), ("--workers", "0"), ("--workers", "-1"),
     ("--max-steps", "0"), ("--execute", "0"), ("--execute", "17"),
 ])
 def test_invalid_arguments_fail_before_restoring_or_running_policy(evaluation, option, value):
@@ -145,6 +280,7 @@ def test_invalid_arguments_fail_before_restoring_or_running_policy(evaluation, o
                           "--output-dir", str(run.output), option, value])
     run.restore.assert_not_called()
     run.evaluate.assert_not_called()
+    run.evaluate_parallel.assert_not_called()
     assert not run.output.exists()
 
 
@@ -191,11 +327,15 @@ def test_existing_evaluation_directory_is_not_overwritten(evaluation):
 
 
 @pytest.mark.parametrize("method", METHODS[1:])
-def test_revision_completion_choice_reaches_evaluator(evaluation, method):
+@pytest.mark.parametrize("workers", [1, 2])
+def test_revision_completion_choice_reaches_evaluator(evaluation, method, workers):
     run = evaluation(method)
     assert cli.main(method, ["--checkpoint", str(run.checkpoint),
-                            "--output-dir", str(run.output), "--completion", "repeat"]) == 0
-    assert evaluated_arguments(run)["completion_id"] == 0
+                            "--output-dir", str(run.output), "--completion", "repeat",
+                            "--workers", str(workers)]) == 0
+    values = (evaluated_arguments(run) if workers == 1
+              else run.evaluate_parallel.call_args.kwargs)
+    assert values["completion_id"] == 0
     assert run.payload["config"]["completion_id"] == 2
 
 

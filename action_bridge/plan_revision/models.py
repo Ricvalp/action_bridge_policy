@@ -190,7 +190,14 @@ class FlowMatchingPolicy(nn.Module):
 
     @torch.no_grad()
     def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None,
-               generator=None, has_previous_plan=None):
+               generator=None, has_previous_plan=None, trace=False):
+        """Integrate the plan field with two NFEs per accepted midpoint step.
+
+        With ``trace=True``, diagnostics include the initial source and every
+        accepted solver state as ``revision_states [B, NFE/2+1, H*D]`` and their
+        increasing ``revision_times`` in [0, 1]. These are actual integration
+        states, not interpolations or the internal half-step evaluations.
+        """
         del reference, generator
         if source_actions is None or source_actions.shape[1:] != (self.horizon, self.action_dim):
             raise ValueError("FM requires an aligned/completed source_actions chunk")
@@ -198,11 +205,20 @@ class FlowMatchingPolicy(nn.Module):
         state = source_actions.flatten(1)
         steps = self.num_inference_steps // 2
         dt = 1.0 / steps
+        snapshots = [state.detach().clone()] if trace else None
         for index in range(steps):
             tau = index * dt
             midpoint = state + (dt / 2) * self.field.conditioned(state, tau, conditioning)
             state = state + dt * self.field.conditioned(midpoint, tau + dt / 2, conditioning)
-        return state.reshape_as(source_actions), {"nfe": 2 * steps}
+            if trace:
+                snapshots.append(state.detach().clone())
+        metrics = {"nfe": 2 * steps}
+        if trace:
+            metrics.update(
+                revision_states=torch.stack(snapshots, dim=1),
+                revision_times=torch.linspace(0, 1, steps + 1, device=state.device, dtype=state.dtype),
+            )
+        return state.reshape_as(source_actions), metrics
 
 
 class BridgePolicy(nn.Module):
@@ -261,8 +277,16 @@ class BridgePolicy(nn.Module):
 
     @torch.no_grad()
     def rollout(self, state, obs_hist, act_hist, mode, reference, *, reverse=False,
-                generator=None, steps=None, has_previous_plan=None):
-        """Reverse time is increasing clock s; the field still receives tau=1-s."""
+                generator=None, steps=None, has_previous_plan=None, trace=False):
+        """Reverse time is increasing clock s; the field still receives tau=1-s.
+
+        ``trace=True`` records the initial positions and the positions after
+        every exact-reference step, plus their cosine-grid ``revision_times``.
+        Times are the increasing rollout clock (also for reverse rollouts),
+        not the endpoint-clamped field-evaluation times. Kinetic traces contain
+        only plan positions, never auxiliary revision velocities. The default
+        retains the existing sparse ``revision_states`` diagnostics.
+        """
         count = self.num_inference_steps if steps is None else int(steps)
         if count < 1:
             raise ValueError("rollout steps must be positive")
@@ -270,7 +294,7 @@ class BridgePolicy(nn.Module):
         conditioning = field.conditioning(obs_hist, act_hist, mode, has_previous_plan)
         grid = .5 - .5 * torch.cos(torch.linspace(0, math.pi, count + 1, device=state.device, dtype=state.dtype))
         energy = torch.zeros(len(state), device=state.device, dtype=state.dtype)
-        # Save a few candidate plans, not physical trajectories.
+        # Candidate plans in revision time, not physical trajectories.
         snapshots = [reference.positions(state).detach().clone()]
         for index in range(count):
             dt = grid[index + 1] - grid[index]
@@ -280,21 +304,26 @@ class BridgePolicy(nn.Module):
             control = field.conditioned(state, tau, conditioning)
             energy += .5 * dt * control.square().sum(-1)
             state = reference.step(state, control, dt, reverse=reverse, generator=generator)
-            if index in (count // 3, 2 * count // 3, count - 1):
+            if trace or index in (count // 3, 2 * count // 3, count - 1):
                 snapshots.append(reference.positions(state).detach().clone())
-        return state, {"nfe": count, "control_energy": energy,
-                       "revision_states": torch.stack(snapshots, dim=1)}
+        metrics = {"nfe": count, "control_energy": energy,
+                   "revision_states": torch.stack(snapshots, dim=1)}
+        if trace:
+            metrics["revision_times"] = grid
+        return state, metrics
 
     @torch.no_grad()
     def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None,
-               generator=None, has_previous_plan=None):
+               generator=None, has_previous_plan=None, trace=False):
+        """Sample a revised plan, optionally tracing every rollout position."""
         if source_actions is None or source_actions.shape[1:] != (self.horizon, self.action_dim):
             raise ValueError("SB requires an aligned/completed source_actions chunk")
         if reference is None:
             raise ValueError("SB requires frozen context-dependent Gaussian reference coefficients")
         state = reference.augment(source_actions.flatten(1), generator=generator)
         state, metrics = self.rollout(state, obs_hist, act_hist, mode, reference,
-                                      generator=generator, has_previous_plan=has_previous_plan)
+                                      generator=generator, has_previous_plan=has_previous_plan,
+                                      trace=trace)
         return reference.positions(state).reshape_as(source_actions), metrics
 
 

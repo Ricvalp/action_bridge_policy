@@ -101,6 +101,9 @@ def test_worker_uses_common_cli_exact_seeds_and_cpu_isolation(setup, monkeypatch
     manager.submit(payload)
     command, arguments = calls[0]
     assert command[:3] == [asynchronous.sys.executable, "-m", "action_bridge.scripts.eval_pusht_ddim"]
+    assert command.count("--no-progress") == 1
+    assert command.index("--no-progress") < command.index("--seeds")
+    assert "--progress" not in command
     assert command[command.index("--seeds") + 1:] == ["12", "56", "90"]
     assert command[command.index("--device") + 1] == "cpu"
     assert command[command.index("--threads") + 1] == "2"
@@ -122,6 +125,8 @@ def test_gpu_override_keeps_visible_devices_and_can_disable_media(setup, monkeyp
                                           device="cuda", threads=1, save_videos=False)
     manager.submit(payload)
     assert "--no-save-videos" in calls[0][0]
+    assert calls[0][0].count("--no-progress") == 1
+    assert calls[0][0].index("--no-progress") < calls[0][0].index("--seeds")
     assert calls[0][1]["env"]["CUDA_VISIBLE_DEVICES"] == "3"
 
 

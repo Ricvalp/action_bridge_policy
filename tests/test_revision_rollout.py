@@ -2,6 +2,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -190,3 +191,60 @@ def test_nonfinite_startup_is_surfaced_without_fallback(monkeypatch):
     with pytest.raises(ValueError, match="nonfinite"):
         evaluator.evaluate(Revision(constant=float("nan")), config, metadata, dependencies, "cpu", seeds=[1])
     assert env.closed and env.episodes[0] == []
+
+
+@pytest.mark.parametrize("progress", [True, False])
+def test_episode_progress_uses_requested_seed_count_and_closes(monkeypatch, progress):
+    env, config, metadata, dependencies, _ = setup(monkeypatch, method="ddim")
+    bar = Mock()
+    factory = Mock(return_value=bar)
+    monkeypatch.setattr(evaluator, "tqdm", factory)
+    result = evaluator.evaluate(Proposal(), config, metadata, dependencies, "cpu",
+                                seeds=[10, 20, 30], progress=progress)
+    factory.assert_called_once_with(total=3, desc="Evaluating ddim", unit="episode",
+                                    disable=not progress)
+    assert result["episodes"] == bar.update.call_count == 3
+    assert all(call.args == (1,) for call in bar.update.call_args_list)
+    bar.close.assert_called_once()
+    assert env.closed
+
+
+def test_episode_progress_closes_without_counting_failed_rollout(monkeypatch):
+    env, config, metadata, dependencies, _ = setup(monkeypatch)
+    bar = Mock()
+    monkeypatch.setattr(evaluator, "tqdm", Mock(return_value=bar))
+    with pytest.raises(ValueError, match="nonfinite"):
+        evaluator.evaluate(Revision(constant=float("nan")), config, metadata, dependencies,
+                           "cpu", seeds=[1])
+    bar.update.assert_not_called()
+    bar.close.assert_called_once()
+    assert env.closed
+
+
+@pytest.mark.parametrize("progress", [True, False])
+def test_episode_progress_writes_only_to_stderr(monkeypatch, capsys, progress):
+    _, config, metadata, dependencies, _ = setup(monkeypatch, method="ddim")
+    evaluator.evaluate(Proposal(), config, metadata, dependencies, "cpu",
+                       seeds=[1, 2], progress=progress)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    if progress:
+        assert "Evaluating ddim" in captured.err and "2/2" in captured.err
+    else:
+        assert captured.err == ""
+
+
+def test_worker_can_write_episode_without_overwriting_aggregate_metrics(monkeypatch, tmp_path):
+    _, config, metadata, dependencies, _ = setup(monkeypatch, method="ddim")
+    aggregate = tmp_path / "metrics.json"
+    aggregate.write_text('{"parent_owned": true}\n')
+    result = evaluator.evaluate(Proposal(), config, metadata, dependencies, "cpu",
+                                seeds=[7], output=tmp_path, progress=False, write_metrics=False)
+    assert result["episodes"] == 1
+    assert (tmp_path / "episode-seed7.json").is_file()
+    assert aggregate.read_text() == '{"parent_owned": true}\n'
+
+
+def test_summary_rejects_empty_results():
+    with pytest.raises(ValueError, match="completed episode"):
+        evaluator.summarize_episodes([], {}, {})

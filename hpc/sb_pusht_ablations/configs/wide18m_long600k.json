@@ -1,0 +1,5 @@
+{
+  "channels": [160, 320, 640],
+  "updates": 600000,
+  "phase_updates": 75000
+}

@@ -15,6 +15,10 @@ partition `aiq`, and refuses to run if CUDA reports a non-H200 GPU.
 Each main policy job requests one H200, eight CPUs, 32 GB RAM and ten hours.
 The default scientific settings remain 300k updates, H=16, K=8 and 32 NFE.
 
+For the horizon, capacity, training-budget, and reference-parameter campaign,
+see [hpc/sb_pusht_ablations/README.md](../hpc/sb_pusht_ablations/README.md).
+Those jobs use the separate W&B project `sb-pusht-ablations`.
+
 ### 1. Update code and transfer the replay dataset
 
 Commit/push the changes here, then pull them in the policy clone on Peano.
@@ -142,6 +146,19 @@ training jobs are active, or run two writers for the same method. If a
 prerequisite job failed, dependent jobs still refer to that old job ID: cancel
 and resubmit the affected dependent jobs with the new ID, or submit them after
 their prerequisites have finished.
+
+To copy checkpoints through your laptop, run this **on the laptop**, connected
+to the VPN (pull the repository there, or copy just this script):
+
+```bash
+bash hpc/rsync_sb_pusht_checkpoints.sh YOUR_RUN_DIRECTORY YOUR_WORKSTATION_SSH_ALIAS
+```
+
+The first argument is the existing run's directory name, not its full path.
+The script uses the laptop's `peano` SSH alias and the workstation alias you
+supply. It copies `best.pt`, `latest.pt`, and their summary files, retaining
+method directories. The laptop copy stays in `~/Downloads/sb-pusht/<run>/`;
+the workstation copy goes under `workspace/sb_pusht/from-hpc/<run>/`.
 
 ## Local sequential run
 
@@ -314,8 +331,29 @@ Options include `--execute 4`, `--seed 1000000`, `--max-steps 300`,
 `--completion repeat`, and `--no-save-videos`. Raw SB `latest.pt` must be
 from a forward phase; asynchronous snapshots explicitly select the forward field.
 
+Evaluation is serial by default (`--workers 1`, four Torch threads). To run
+episodes concurrently on CPU:
+
+```bash
+uv run --frozen --no-sync python -m action_bridge.scripts.eval_pusht_sb_ou \
+  --checkpoint "$run_root/sb_ou/best.pt" \
+  --device cpu --workers 8 --threads 1 --episodes 50 --seed 1000000
+```
+
+Multiple workers require `--device cpu`; each worker loads its own CPU policy
+and needs its own RAM. The worker count is capped by the episode count.
+With multiple workers, `--threads` defaults to one per worker; an explicit
+value overrides either default. Keep the same held-out seeds across methods;
+`--seeds 1000000 1000007 1000019` selects an explicit, unique seed list.
+Parallel evaluation uses one parent progress bar. Selected videos/GIFs are
+rendered in a second pass, with the usual limit of two successes and two
+failures across the whole evaluation, not per worker.
+
 Each invocation creates a timestamped directory below
 `workspace/sb_pusht/evaluation/`, or use `--output-dir` with a new path.
+An episode progress bar with elapsed time and ETA is enabled by default;
+use `--no-progress` to hide it. Background training evaluators disable the bar
+in their worker logs.
 Rollout overlays distinguish old/completed/revised targets from actual motion.
 `--save-gifs` additionally saves GIFs.
 
@@ -335,6 +373,45 @@ and tail errors plus revision magnitude; one logged expert is not the only
 valid behavior. Closed-loop success remains the primary result. With K=H,
 every decision restarts from its observed anchor; the old-plan diagnostic is
 marked not applicable because no overlap remains.
+
+## Visualize completion and revision
+
+Generate a short diagnostic MP4 and per-decision PNG storyboards from a trusted
+EMA checkpoint, without training or access to its original dataset:
+
+```bash
+uv run --frozen --no-sync python -m action_bridge.scripts.visualize_pusht_revision \
+  --checkpoint "$run_root/sb_kinetic/best.pt" --device cpu --threads 2 \
+  --seed 1000000 --start-replan 1 --replans 3 --execute 8
+```
+
+The method is inferred from the checkpoint: `fm_paired`, `fm_local_ot`, `sb_ou`,
+or `sb_kinetic`; SB requires forward weights. DDIM has no old-plan completion/
+revision process and is not supported here. Swap in an FM checkpoint and add
+`--completion repeat`, `--completion fixed_damped`, or
+`--completion learned_dissipative` to inspect the different tail rules. Omit
+`--completion` and `--execute` to inherit the checkpoint settings. Use
+`--start-replan 10` to inspect later decisions nearer contact (seed-dependent),
+or `--start-replan 0` for startup. Decisions are zero-indexed; warmup is simulated
+from the same seed. With K=H every decision uses the startup anchor because no
+old-plan overlap remains, so completion is explicitly marked not applicable.
+The startup anchor is the last executed command (initially the observed pusher
+position), not an unexecuted old target.
+
+The robot stays frozen while retained overlap, tail completion, one-time source
+noise, and actual sampler intermediates are shown; only the execution phase
+shows physical motion. Candidate targets are not the pusher trajectory.
+This is a diagnostic clip, **not a success-rate benchmark**; it may stop early
+on environment termination or at the checkpoint's episode limit.
+
+Outputs go to a fresh timestamped directory under
+`workspace/sb_pusht/visualizations/`, or a new `--output-dir`. The
+`visualization.json` manifest records checkpoint/runtime identities, settings,
+phase semantics and artifacts. `--save-gif` adds a GIF, `--fps 10` controls
+playback, and `--no-progress` hides rollout progress. CPU/two threads are the
+defaults. The command collects a fresh full trace: older evaluation JSON files
+contain only the first three coarse traces and cannot reconstruct full FM/SB
+generation histories.
 
 ## Another dataset
 

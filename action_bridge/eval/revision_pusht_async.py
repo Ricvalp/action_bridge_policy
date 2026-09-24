@@ -82,6 +82,7 @@ class AsyncEvaluation:
                    "--checkpoint", str(checkpoint.resolve()),
                    "--output-dir", str((directory / "results").resolve()),
                    "--device", self.device, "--threads", str(self.threads),
+                   "--no-progress",
                    "--seeds", *map(str, self.seeds)]
         if not self.save_videos:
             command.append("--no-save-videos")
