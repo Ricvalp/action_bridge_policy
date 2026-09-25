@@ -12,6 +12,7 @@ import torch
 
 from action_bridge.eval.revision_pusht import evaluate
 from action_bridge.eval.revision_pusht_parallel import evaluate_parallel
+from action_bridge.eval.revision_pusht_gaps import diagnose_offline_sources
 from action_bridge.plan_revision import checkpoints
 from action_bridge.plan_revision.completion import COMPLETION_NAMES
 
@@ -42,14 +43,23 @@ def main(method, argv=None):
                         help="Torch threads per worker (default: 4 serial, 1 parallel)")
     parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True,
                         help="Show episode progress, elapsed time and ETA (default: on)")
+    parser.add_argument("--source-gap-windows", type=Path,
+                        help="Optional prepared windows.pt: compare offline self/expert old-plan gaps with simulation")
+    parser.add_argument("--source-gap-episodes", type=int, default=8,
+                        help="Held-out demonstration episodes for the offline comparison (default: 8)")
+    parser.add_argument("--source-gap-replans", type=int, default=16,
+                        help="Maximum recorded replans per offline episode, including startup (minimum: 2; default: 16)")
     if method != "ddim":
         parser.add_argument("--completion", choices=COMPLETION_NAMES,
                             help="Old-plan tail completion; defaults to checkpoint setting")
     args = parser.parse_args(argv)
-    for name in ("episodes", "execute", "max_steps", "threads", "workers"):
+    for name in ("episodes", "execute", "max_steps", "threads", "workers",
+                 "source_gap_episodes", "source_gap_replans"):
         value = getattr(args, name)
         if value is not None and value < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.source_gap_replans < 2:
+        parser.error("--source-gap-replans must be at least 2, including startup")
     if args.seed < 0:
         parser.error("--seed must be nonnegative")
     if args.seeds is not None and any(seed < 0 for seed in args.seeds):
@@ -63,6 +73,12 @@ def main(method, argv=None):
     checkpoint = args.checkpoint.resolve()
     if not checkpoint.is_file():
         parser.error(f"Checkpoint does not exist: {checkpoint}")
+    if args.source_gap_windows is not None:
+        if method == "ddim":
+            parser.error("Offline source gaps require a reviser; DDIM does not use previous-plan sources")
+        args.source_gap_windows = args.source_gap_windows.resolve()
+        if not args.source_gap_windows.is_file():
+            parser.error(f"Prepared windows do not exist: {args.source_gap_windows}")
     torch.set_num_threads(args.threads)
     # Read and hash the same file even if training atomically replaces latest.pt.
     # Optimizer tensors stay on CPU; only the restored EMA model uses the device.
@@ -120,6 +136,28 @@ def main(method, argv=None):
           f"H={config['horizon']}, execute={config['execute']}, episodes={len(seeds)}, "
           f"workers={args.workers}, threads/worker={args.threads}", flush=True)
     print(f"Output: {output}", flush=True)
+    policy = None
+    diagnostic = None
+    if args.source_gap_windows is not None:
+        # This runs in the evaluation worker during training, never in the
+        # optimizer process. Reject incompatible windows before any simulation.
+        policy = checkpoints.restore_policy(state, args.device)
+        with args.source_gap_windows.open("rb") as stream:
+            windows = checkpoints.load(stream)
+            stream.seek(0)
+            windows_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+        diagnostic = diagnose_offline_sources(
+            policy, config, state["metadata"], state["dependencies"], windows, args.device,
+            episodes=args.source_gap_episodes, replans=args.source_gap_replans,
+            completion_id=completion_id,
+        )
+        (output / "source_gaps.json").write_text(json.dumps(diagnostic, indent=2) + "\n")
+        identity["source_gap_diagnostic"] = {
+            "windows": str(args.source_gap_windows), "windows_sha256": windows_hash,
+            "episodes": args.source_gap_episodes, "replans": args.source_gap_replans,
+            "selection": diagnostic["selection"],
+        }
+        (output / "evaluation.json").write_text(json.dumps(identity, indent=2) + "\n")
     if args.workers > 1:
         metrics = evaluate_parallel(state, config, args.device, output=output,
                                     completion_id=completion_id, seeds=seeds,
@@ -127,11 +165,15 @@ def main(method, argv=None):
                                     save_videos=args.save_videos, save_gifs=args.save_gifs,
                                     progress=args.progress)
     else:
-        policy = checkpoints.restore_policy(state, args.device)
+        if policy is None:
+            policy = checkpoints.restore_policy(state, args.device)
         metrics = evaluate(policy, config, state["metadata"], state["dependencies"], args.device,
                            output=output, completion_id=completion_id, seeds=seeds,
                            render=args.save_videos or args.save_gifs,
                            save_videos=args.save_videos, save_gifs=args.save_gifs,
                            progress=args.progress)
+    if diagnostic is not None:
+        metrics = {**metrics, **diagnostic["metrics"]}
+        (output / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     print(json.dumps(metrics, indent=2))
     return 0

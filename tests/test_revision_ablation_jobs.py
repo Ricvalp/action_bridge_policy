@@ -18,7 +18,7 @@ VARIANTS = {
     "baseline_seed0", "baseline_seed1", "baseline_seed2", "h16_k4", "h16_k16",
     "h32_k8", "h32_k16", "h64_k8", "h64_k32", "wide18m", "wide42m",
     "long600k", "wide18m_long600k", "deep18m", "temperature001", "temperature020",
-    "damping05", "damping8", "self_sources_all",
+    "damping05", "damping8", "self_sources_all", "expert_sources_only",
     "scarcity50", "scarcity25", "scarcity10", "direct_mlp", "brownian", "isotropic_ou",
 }
 

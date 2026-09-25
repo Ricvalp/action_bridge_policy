@@ -98,8 +98,8 @@ when resuming jobs, but never change a configuration inside an existing run.
 `submit.sh VARIANT [METHOD ...]` submits preparation, the reference when needed,
 and just the requested policies. With no methods it uses `ddim fm_paired sb_ou
 sb_kinetic`. `fm_local_ot` is also supported. The exceptions are `direct_mlp`,
-which defaults to its three revisers, and `brownian`/`isotropic_ou`, which default
-to `sb_ou` only.
+which defaults to its three revisers, and `brownian`/`isotropic_ou`/
+`expert_sources_only`, which default to `sb_ou` only.
 
 ```bash
 # Four core methods, one new variant.
@@ -140,6 +140,7 @@ comparison. The submission helper snapshots the overrides into each variant's
 | 14. SB temperature | `temperature001`, `baseline_seed0`, `temperature020` | OU-SB and kinetic-SB |
 | 15. Kinetic damping | `damping05`, `baseline_seed0`, `damping8` | Kinetic-SB |
 | 16. Self-generated sources from the start | `self_sources_all` versus `baseline_seed0` | FM and SB; DDIM is unchanged |
+| Expert previous-plan control | `expert_sources_only` versus `baseline_seed0` | OU-SB by default; other revisers also supported |
 | 17–19. Data scarcity | `scarcity50`, `scarcity25`, `scarcity10` | Four core methods |
 | 23. Direct learned completion | `direct_mlp` | FM and SB |
 | 24. Brownian reference | `brownian` | `sb_ou` trainer |
@@ -184,6 +185,40 @@ use the direct training command above for resuming. If a reference job fails,
 inspect its log before launching dependents. Failed prerequisites require
 resubmitting their affected dependent jobs after the prerequisite succeeds.
 If compute nodes cannot reach W&B, export `WANDB_MODE=offline` before submission.
+
+## Control: expert previous chunks instead of self-generated chunks
+
+`expert_sources_only` changes only `source_self_probabilities` to `[0, 0, 0, 0]`:
+every non-startup training source retains the previous **expert** chunk's suffix,
+then uses the same completion and source noise. The baseline instead progresses
+from 10% to 100% generated previous chunks. Both use H16/K8, seed 0, the same
+network, reference/completer settings, and 300k updates.
+
+For the cleanest comparison, reuse a **finished, matching `baseline_seed0`**
+run's windows and frozen reference, not its policy or source caches. On Peano,
+restore `PUSHT_DATASET` and `SB_PUSHT_CAMPAIGN_ROOT`, then:
+
+```bash
+baseline="$SB_PUSHT_CAMPAIGN_ROOT/baseline_seed0"
+control="$SB_PUSHT_CAMPAIGN_ROOT/expert_sources_only"
+mkdir "$control" && mkdir "$control/reference" && \
+cp "$baseline/windows.pt" "$control/" && \
+cp "$baseline/reference/latest.pt" "$control/reference/" && \
+cp hpc/sb_pusht_ablations/configs/expert_sources_only.json "$control/config.json" && \
+sbatch hpc/sb_pusht_ablations/train.sbatch expert_sources_only sb_ou
+```
+
+Use the same dataset path and code commit, and compare at equal training budgets
+on identical evaluation seeds. This keeps the reference artifact exactly the
+same. If starting from scratch, `bash hpc/sb_pusht_ablations/submit.sh
+expert_sources_only` submits its preparation, reference, and OU-SB training jobs.
+
+Evaluation still carries the policy's **own** generated previous plan; there is
+no expert at deployment. A smaller offline state–plan gap is expected by
+construction, so success in closed-loop—not that smaller gap alone—determines
+whether expert-only training helps. This is a single-seed diagnostic, not proof
+that the replay mismatch causes the performance difference. Other FM/SB methods
+can use this variant; DDIM is excluded because it has no previous-plan source.
 
 ## Completion comparison without retraining
 

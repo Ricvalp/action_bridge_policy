@@ -381,6 +381,69 @@ valid behavior. Closed-loop success remains the primary result. With K=H,
 every decision restarts from its observed anchor; the old-plan diagnostic is
 marked not applicable because no overlap remains.
 
+### Check the pusher / previous-plan mismatch
+
+Every closed-loop evaluation now records the following distances in **pixels**.
+Here `old[K]` is the first unexecuted target, and `last_command` is the command
+actually sent at the preceding robot step.
+
+| Metric | Euclidean distance between |
+| --- | --- |
+| `retained_pusher_gap_px` | `old[K]` and current pusher position |
+| `previous_command_mismatch_px` | `old[K-1]` and `last_command` |
+| `command_tracking_gap_px` | `last_command` and current pusher position |
+| `retained_plan_jump_px` | `old[K]` and `old[K-1]` |
+
+Summaries append `_mean`, `_median`, `_p95`, and `_max`. They pool replan events,
+not episode averages. Startup and K=H have no retained plan and are excluded;
+`gap_samples=0` means not applicable, not perfect agreement. Targets are the
+clean, **unclipped** old commands, before completion noise or SB/FM revision.
+Thus online command mismatch can reflect clipping, and pusher gap can reflect
+tracking lag or a jump within the old plan—not just offline replay mismatch.
+
+For a pretrained checkpoint, compare offline generated and expert previous
+plans on identical held-out states, without running simulation:
+
+```bash
+uv run --frozen --no-sync python -m action_bridge.scripts.diagnose_pusht_sources \
+  --checkpoint "$run_root/sb_ou/best.pt" \
+  --windows "$run_root/windows.pt" --device cpu --episodes 8 --replans 16
+```
+
+This writes a new timestamped `workspace/sb_pusht/source_gaps/` directory with
+`source_gaps.json`: per-replan measurements, summaries and checkpoint/data
+identities. `--replans` includes the excluded startup. The default panel is
+eight seeded validation episode prefixes, not all validation replans.
+Windows must match the checkpoint's split, normalization, H and K; copying
+them from another machine is fine. Training caches/checkpoints are not changed.
+
+For offline **and** closed-loop measurements of the same checkpoint:
+
+```bash
+uv run --frozen --no-sync python -m action_bridge.scripts.eval_pusht_sb_ou \
+  --checkpoint "$run_root/sb_ou/best.pt" --device cpu \
+  --episodes 20 --workers 4 --threads 1 --no-save-videos \
+  --source-gap-windows "$run_root/windows.pt"
+```
+
+The usual `metrics.json` now includes the online metrics and the same metrics
+prefixed `offline_self_` / `offline_expert_`. Offline details are in
+`source_gaps.json`; online details are in each episode's `plan_gaps` list.
+Use `--source-gap-episodes` and `--source-gap-replans` to enlarge the offline panel.
+The online panel uses simulator seeds, not the offline demonstration states.
+
+During training, revisers automatically compute these diagnostics in the
+**existing asynchronous evaluation worker**, using the run's `windows.pt`.
+When W&B is enabled, compare `sim_eval/retained_pusher_gap_px_mean` with
+`sim_eval/offline_self_retained_pusher_gap_px_mean` and
+`sim_eval/offline_expert_retained_pusher_gap_px_mean` (also check p95 and counts).
+The offline self panel always uses the evaluated forward EMA with `p_self=1`;
+it is not the mixed/frozen source cache originally used to train that checkpoint.
+
+Gaps diagnose a distribution mismatch, not its effect on success. For the
+controlled retraining comparison, use the
+[expert-previous-chunk control](../hpc/sb_pusht_ablations/README.md#control-expert-previous-chunks-instead-of-self-generated-chunks).
+
 ## Visualize completion and revision
 
 Generate a short diagnostic MP4 and per-decision PNG storyboards from a trusted

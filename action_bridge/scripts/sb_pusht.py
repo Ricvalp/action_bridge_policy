@@ -204,9 +204,15 @@ def stage_evaluation(output, config, options):
     if options is False:
         return None
     from action_bridge.eval.revision_pusht_async import AsyncEvaluation
+    options = dict(options or {})
+    windows = Path(output).parent / "windows.pt"
+    if config["method"] != "ddim" and windows.is_file():
+        # Small held-out offline replay accompanies the existing asynchronous
+        # simulation. It does not consume training RNG or change its config.
+        options.setdefault("source_gap_windows", windows)
 
     def factory(on_result):
-        return AsyncEvaluation(output, config, on_result, **(options or {}))
+        return AsyncEvaluation(output, config, on_result, **options)
     return factory
 
 

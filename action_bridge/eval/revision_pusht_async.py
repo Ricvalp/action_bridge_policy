@@ -38,7 +38,8 @@ class AsyncEvaluation:
     """
 
     def __init__(self, output, config, on_result, *, device="cpu", threads=2,
-                 save_videos=True, episodes=None):
+                 save_videos=True, episodes=None, source_gap_windows=None,
+                 source_gap_episodes=8, source_gap_replans=16):
         self.output = Path(output) / "sim_eval"
         self.method = config["method"]
         if self.method not in METHODS:
@@ -58,6 +59,13 @@ class AsyncEvaluation:
         self.device = str(device)
         self.threads = int(threads)
         self.save_videos = bool(save_videos)
+        self.source_gap_windows = (Path(source_gap_windows).resolve()
+                                   if source_gap_windows is not None else None)
+        if (not isinstance(source_gap_episodes, int) or source_gap_episodes < 1
+                or not isinstance(source_gap_replans, int) or source_gap_replans < 2):
+            raise ValueError("Source-gap episodes must be a positive integer and replans at least 2")
+        self.source_gap_episodes = source_gap_episodes
+        self.source_gap_replans = source_gap_replans
         self.last_submitted_step = None
         self._job = None
 
@@ -82,8 +90,14 @@ class AsyncEvaluation:
                    "--checkpoint", str(checkpoint.resolve()),
                    "--output-dir", str((directory / "results").resolve()),
                    "--device", self.device, "--threads", str(self.threads),
-                   "--no-progress",
-                   "--seeds", *map(str, self.seeds)]
+                   "--no-progress"]
+        if self.source_gap_windows is not None:
+            command.extend([
+                "--source-gap-windows", str(self.source_gap_windows),
+                "--source-gap-episodes", str(self.source_gap_episodes),
+                "--source-gap-replans", str(self.source_gap_replans),
+            ])
+        command.extend(["--seeds", *map(str, self.seeds)])
         if not self.save_videos:
             command.append("--no-save-videos")
         environment = dict(os.environ, OMP_NUM_THREADS=str(self.threads),

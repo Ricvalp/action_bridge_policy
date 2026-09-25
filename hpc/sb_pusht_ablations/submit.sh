@@ -17,7 +17,7 @@ test -f "$job_dir/configs/$variant.json"
 methods=("$@")
 if [[ ${#methods[@]} -eq 0 ]]; then
   case "$variant" in
-    brownian|isotropic_ou) methods=(sb_ou) ;;
+    brownian|isotropic_ou|expert_sources_only) methods=(sb_ou) ;;
     direct_mlp) methods=(fm_paired sb_ou sb_kinetic) ;;
     *) methods=(ddim fm_paired sb_ou sb_kinetic) ;;
   esac
@@ -31,6 +31,8 @@ for method in "${methods[@]}"; do
       echo "$variant is an sb_ou reference ablation; do not change the policy dynamics too." >&2; exit 1 ;;
     direct_mlp:ddim)
       echo "DDIM has no completion mechanism; use an FM/SB method for direct_mlp." >&2; exit 1 ;;
+    expert_sources_only:ddim)
+      echo "DDIM has no previous-plan source; use an FM/SB method for expert_sources_only." >&2; exit 1 ;;
   esac
   case "$method" in
     ddim) ;;

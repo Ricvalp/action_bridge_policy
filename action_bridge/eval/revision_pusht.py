@@ -17,6 +17,7 @@ from action_bridge.data.pusht_adapter import normalize_observations_np
 from action_bridge.eval.pusht_sim import (
     _action_bounds, _info_success, _make_pusht_env, _obs_to_state, _reset_env,
 )
+from action_bridge.eval.revision_pusht_gaps import gap_record, summarize_gaps
 from action_bridge.plan_revision.cache import reference_for, reference_kind_for
 from action_bridge.plan_revision.completion import COMPLETION_NAMES, complete_plan
 from action_bridge.plan_revision.contracts import ActionCodec, PlanCache
@@ -115,6 +116,8 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
     Parallel workers set ``write_metrics=False`` and leave aggregation to the parent.
     ``trace_generation=True`` records every FM/SB decision and solver state for
     phase visualizations, without changing generated commands or stepping physics.
+    Plan-gap diagnostics compare the clean previous plan with the actual pusher
+    and last executed command, excluding startup and fully executed chunks.
     """
     device = torch.device(device)
     if (config["obs_dim"], config["action_dim"]) != (5, 2):
@@ -166,6 +169,7 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
             boundaries, revisions, timings, energies, coefficient_rows = [], [], [], [], []
             tail_speeds, tail_accelerations = [], []
             traces, frames, nfes = [], [], []
+            plan_gaps = []
             startup_nfe, startups, clipped_count = 0, 0, 0
             terminated = truncated = False
             info = {}
@@ -180,6 +184,11 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                 aligned = completed = source = reference = None
                 aligned_raw = completed_raw = None
                 prior = None
+                if has_previous_plan and cache.executed > 0:
+                    plan_gaps.append({"robot_step": len(actions), **gap_record(
+                        state[:2], act_hist[-1], _array(codec.decode(cache.plan)[0]),
+                        cache.executed,
+                    )})
                 _synchronize(device)
                 start = time.perf_counter()
                 # Preserve the exact overlap before replacing the cache. DDIM
@@ -307,7 +316,7 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                 "completed_tail_acceleration": _mean(tail_accelerations),
                 "actions_raw": action_array, "actions_preclipped_raw": np.asarray(preclipped),
                 "states_raw": np.asarray(states), "rewards": rewards, "coverage": coverages,
-                "plan_traces": traces}
+                "plan_traces": traces, "plan_gaps": plan_gaps}
             if output is not None:
                 bucket = "success" if success else "failure"
                 if frames and saved[bucket] < 2:
@@ -338,7 +347,7 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
 
 
 def summarize_episodes(episodes, config, metadata, completion_id=2, seeds=None):
-    """Use the same episode-weighted metrics for serial and parallel evaluation."""
+    """Share serial/parallel summaries; pool plan gaps over individual replans."""
     if not episodes:
         raise ValueError("At least one completed episode is required")
     seeds = [episode["seed"] for episode in episodes] if seeds is None else list(seeds)
@@ -357,6 +366,7 @@ def summarize_episodes(episodes, config, metadata, completion_id=2, seeds=None):
                    horizon=int(config["horizon"]), execute=int(config["execute"]),
                    command_units=metadata["codec"]["units"], robot_dt=config["robot_dt"],
                    success_definition="legacy wrapper: terminated OR info success OR max reward >= 0.95")
+    metrics.update(summarize_gaps([row for episode in episodes for row in episode.get("plan_gaps", [])]))
     coefficient_rows = [row for episode in episodes for row in episode["reference_coefficients"]]
     if coefficient_rows:
         metrics.update({f"reference_{key}": _mean([row[key] for row in coefficient_rows])
