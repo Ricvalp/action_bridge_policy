@@ -1,13 +1,14 @@
 """Five jobs, one seed. No inheritance from the old Action Bridge configs."""
 METHODS = ("ddim", "fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic")
-COMPLETIONS = ("repeat", "fixed_damped", "learned_dissipative")
+COMPLETIONS = ("repeat", "fixed_damped", "learned_dissipative", "direct_mlp")
 PROTOCOL = "self_source_v1"
 
 
 def get_config(method="ddim"):
     if method not in METHODS:
         raise ValueError(f"method must be one of {METHODS}")
-    return dict(protocol=PROTOCOL, method=method, seed=0, obs_dim=5, action_dim=2, obs_history=2,
+    return dict(protocol=PROTOCOL, method=method, seed=0,
+                train_episode_fraction=1., subset_seed=0, obs_dim=5, action_dim=2, obs_history=2,
                 action_history=2, horizon=16, execute=8, channels=[80, 160, 320],
                 history_dim=256, hidden_dim=256, time_dim=64,
                 num_train_timesteps=100, num_inference_steps=32,
@@ -19,6 +20,8 @@ def get_config(method="ddim"):
                 grad_clip=1., checkpoint_every=5000, log_every=100,
                 validation_every=10_000, reference_updates=20_000,
                 reference_hidden_dim=64, innovation_floor=1e-3,
+                direct_tail_updates=20_000, direct_tail_hidden_dim=64,
+                training_completion_modes=[0, 1, 2], reference_kind="learned",
                 robot_dt=1., temperature=.05, revision_gamma=2.,
                 prior_ridge=.05, max_rate=4., mobility_smoothing=0.,
                 source_std=.01, endpoint_std=.001, time_cutoff=.01,

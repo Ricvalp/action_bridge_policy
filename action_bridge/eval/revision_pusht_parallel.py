@@ -120,8 +120,7 @@ def evaluate_parallel(state, config, device, *, output, completion_id=2, seeds,
         raise ValueError("Evaluation seeds must be nonnegative")
     if len(set(seeds)) != len(seeds):
         raise ValueError("Evaluation seeds must be unique")
-    if completion_id not in range(3):
-        raise ValueError("completion_id must be 0, 1 or 2")
+    serial.validate_evaluation_completion(config, completion_id)
     output = Path(output)
     targets = [output / "metrics.json", *(output / f"episode-seed{seed}.json" for seed in seeds)]
     if any(path.exists() for path in targets):

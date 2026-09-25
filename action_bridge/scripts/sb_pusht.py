@@ -14,8 +14,9 @@ import torch
 from action_bridge.configs.sb_pusht import COMPLETIONS, METHODS, PROTOCOL, get_config
 from action_bridge.data.revision_pusht import load_windows, make_local_pairer, neighbor_blocks
 from action_bridge.plan_revision import checkpoints
+from action_bridge.plan_revision.cache import reference_kind_for
 from action_bridge.plan_revision.tracking import Tracker, TrackingOptions
-from action_bridge.plan_revision.training import fit_completion, train
+from action_bridge.plan_revision.training import direct_tail_config, fit_completion, fit_direct_tail, train
 
 
 def write_json(path, value):
@@ -113,7 +114,28 @@ def window_spec(config):
     # Noise settings are metadata, rather than random changes to stored labels.
     # Include them so that cached pixel-scale annotations cannot become stale.
     keys = ("protocol", "horizon", "execute", "obs_history", "action_history", "source_std", "endpoint_std")
-    return {key: config[key] for key in keys}
+    spec = {key: config[key] for key in keys}
+    if config.get("train_episode_fraction", 1.) != 1.:
+        spec.update(train_episode_fraction=config["train_episode_fraction"],
+                    subset_seed=config.get("subset_seed", 0))
+    return spec
+
+
+def experiment_methods(config):
+    # These change the first-order SB reference, not the DDIM/FM/kinetic models.
+    kind = reference_kind_for(config | {"method": "sb_ou"})
+    return METHODS if kind == "learned" else ("sb_ou",)
+
+
+def completion_modes(config):
+    modes = config.get("training_completion_modes", [0, 1, 2])
+    if not modes or len(set(modes)) != len(modes) or any(mode not in range(len(COMPLETIONS)) for mode in modes):
+        raise ValueError("training_completion_modes must contain distinct supported completion IDs")
+    if config.get("completion_id", 2) not in modes:
+        raise ValueError("completion_id must be included in training_completion_modes")
+    if 3 in modes and not 0 < config["execute"] < config["horizon"]:
+        raise ValueError("direct_mlp requires 0 < execute < horizon")
+    return modes
 
 
 def validate_reference(reference_state, metadata, config):
@@ -128,14 +150,19 @@ def validate_reference(reference_state, metadata, config):
 
 
 def experiment_manifest(config):
-    """The sole active comparison; no external proposal job or factorial sweep."""
+    """Describe this variant without introducing an external proposal policy."""
+    methods, modes = experiment_methods(config), completion_modes(config)
+    auxiliary = {"reference": "shared frozen supervised fit"}
+    if 3 in modes:
+        auxiliary["direct_tail"] = "frozen supervised MLP tail predictor; fitted by the reference stage"
     return {"protocol": PROTOCOL, "config": config,
-            "jobs": {method: "pending" for method in METHODS},
-            "auxiliary": {"reference": "shared frozen supervised fit"},
-            "dependencies": {method: ([] if method == "ddim" else ["reference"]) for method in METHODS},
+            "jobs": {method: "pending" for method in methods},
+            "auxiliary": auxiliary,
+            "dependencies": {method: ([] if method == "ddim" else list(auxiliary)) for method in methods},
             "source_curriculum": config["source_self_probabilities"],
-            "completion_evaluations": ["sb_kinetic/repeat", "sb_kinetic/fixed_damped"],
-            "main_completion": "learned_dissipative", "artifact_reuse": []}
+            "completion_evaluations": [f"sb_kinetic/{COMPLETIONS[mode]}" for mode in modes
+                                       if mode != config["completion_id"] and "sb_kinetic" in methods],
+            "main_completion": COMPLETIONS[config["completion_id"]], "artifact_reuse": []}
 
 
 def validate_evaluation(state, metadata, config):
@@ -145,6 +172,10 @@ def validate_evaluation(state, metadata, config):
         raise ValueError("Evaluation checkpoint belongs to another dataset or normalizer")
     if state["config"]["updates"] != config["updates"]:
         raise ValueError("Comparison checkpoints must have the configured optimizer budget")
+    for key, default in (("reference_kind", "learned"), ("training_completion_modes", [0, 1, 2]),
+                         ("completion_id", 2)):
+        if state["config"].get(key, default) != config.get(key, default):
+            raise ValueError(f"Evaluation checkpoint uses another {key}")
     if "proposal_state" in state["dependencies"]:
         raise ValueError("External proposal checkpoints are forbidden in self_source_v1")
     if state["config"]["method"].startswith("sb_") and state["direction"] != "forward":
@@ -158,10 +189,14 @@ def stage_tracking(stage, root, records, config, metadata, device, options, depe
                       group=root.name, name=f"{root.name}-{stage}")
     visualize = None
     if options.enabled and options.image_count:
-        from action_bridge.eval.revision_pusht_plots import make_action_chunk_plotter
-        visualize = make_action_chunk_plotter(records, config, metadata, root / stage, device,
-                                              dependencies=dependencies, count=options.image_count,
-                                              reference=stage == "reference")
+        from action_bridge.eval.revision_pusht_plots import make_action_chunk_plotter, make_direct_tail_plotter
+        if stage == "direct_tail":
+            visualize = make_direct_tail_plotter(records, config, metadata, root / stage, device,
+                                                 count=options.image_count)
+        else:
+            visualize = make_action_chunk_plotter(records, config, metadata, root / stage, device,
+                                                  dependencies=dependencies, count=options.image_count,
+                                                  reference=stage == "reference")
     return tracker, visualize
 
 
@@ -180,6 +215,11 @@ def run_stage(stage, root, dataset, config, device, *, tracking=None, evaluation
         raise ValueError("Only self_source_v1 is active; legacy runs remain untouched")
     if stage == "sources":
         raise ValueError("The shared sources stage is retired; each reviser builds its own block sources")
+    methods, modes = experiment_methods(config), completion_modes(config)
+    if stage in METHODS:
+        reference_kind_for(config)
+        if stage not in methods:
+            raise ValueError(f"This reference ablation supports only {methods}")
     root.mkdir(parents=True, exist_ok=True)
     if stage == "audit":
         return audit(root, dataset)
@@ -191,7 +231,7 @@ def run_stage(stage, root, dataset, config, device, *, tracking=None, evaluation
         from action_bridge.plan_revision.reporting import common_source_probe
         data = checkpoints.load(root / "windows.pt")
         policies, configs, reference_hash = {}, {}, None
-        for method in METHODS:
+        for method in methods:
             latest = checkpoints.load(root / method / "latest.pt")
             if not latest.get("complete"):
                 raise ValueError(f"Finish {method} training before the primary closed-loop comparison")
@@ -208,7 +248,10 @@ def run_stage(stage, root, dataset, config, device, *, tracking=None, evaluation
                 reference_hash = shared_hash
                 dependencies = state["dependencies"]
                 policies[method], configs[method] = policy, state["config"]
-            for mode in ([2, 1, 0] if method == "sb_kinetic" else [2]):
+            main_mode = state["config"].get("completion_id", 2)
+            eval_modes = [main_mode] + ([mode for mode in modes if mode != main_mode]
+                                        if method == "sb_kinetic" else [])
+            for mode in eval_modes:
                 output = root / "evaluation" / f"{method}-{COMPLETIONS[mode]}"
                 result_path = output / "result.json"
                 identity = {"protocol": PROTOCOL, "checkpoint_sha256": checkpoint_hash,
@@ -229,9 +272,10 @@ def run_stage(stage, root, dataset, config, device, *, tracking=None, evaluation
                                              training_seconds=latest["training_seconds"],
                                              source_cache_seconds=latest.get("source_cache_seconds", 0.),
                                              cache_seconds=latest["cache_seconds"], parameters=state["parameters"]))
-        common_source_probe(policies, {"validation": data["records"]["val"], "test": data["records"]["test"]},
-                            configs, dependencies, device, root / "evaluation" / "common_source_probe",
-                            count=config["probe_records_per_model"])
+        if len(policies) == 4:
+            common_source_probe(policies, {"validation": data["records"]["val"], "test": data["records"]["test"]},
+                                configs, dependencies, device, root / "evaluation" / "common_source_probe",
+                                count=config["probe_records_per_model"])
         return run_stage("report", root, dataset, config, device)
     if dataset is None or not dataset.exists():
         raise FileNotFoundError("Supply --dataset with the real local Push-T replay dataset; the driver never substitutes toy data")
@@ -264,8 +308,14 @@ def run_stage(stage, root, dataset, config, device, *, tracking=None, evaluation
     if stage == "reference":
         tracker, visualize = stage_tracking(stage, root, windows["val"], config, metadata, device, tracking)
         with tracker:
-            return fit_completion(windows["train"], windows["val"], config,
-                                  root / "reference", metadata, device, tracker=tracker, visualize=visualize)
+            reference = fit_completion(windows["train"], windows["val"], config,
+                                       root / "reference", metadata, device, tracker=tracker, visualize=visualize)
+        if 3 in modes:
+            tracker, visualize = stage_tracking("direct_tail", root, windows["val"], config, metadata, device, tracking)
+            with tracker:
+                fit_direct_tail(windows["train"], windows["val"], config, root / "direct_tail",
+                                metadata, device, tracker=tracker, visualize=visualize)
+        return reference
     if stage == "ddim":
         tracker, visualize = stage_tracking(stage, root, windows["val"], config, metadata, device, tracking)
         with tracker:
@@ -282,6 +332,18 @@ def run_stage(stage, root, dataset, config, device, *, tracking=None, evaluation
     dependencies.update(reference_sha256=checkpoints.digest(reference_path),
                         reference_training_seconds=reference_state.get("training_seconds", 0.),
                         completion_encoder_spec=reference_state.get("completion_encoder_spec", {"kind": "HistoryEncoder"}))
+    if 3 in modes:
+        path = root / "direct_tail" / "latest.pt"
+        if not path.exists():
+            raise ValueError("Run the reference stage to fit the direct-tail predictor first")
+        tail = checkpoints.load(path)
+        if not tail.get("complete"):
+            raise ValueError("Finish direct-tail pretraining before freezing it")
+        if tail["metadata"] != metadata or tail["direct_tail_config"] != direct_tail_config(config):
+            raise ValueError("Direct-tail checkpoint belongs to another dataset, normalizer or shape configuration")
+        dependencies.update(direct_tail_config=tail["direct_tail_config"], direct_tail_state=tail["direct_tail_state"],
+                            direct_tail_sha256=checkpoints.digest(path),
+                            direct_tail_training_seconds=tail.get("training_seconds", 0.))
     if stage not in METHODS:
         raise ValueError(f"Unknown stage: {stage}")
     def pairer_factory(records):
@@ -344,7 +406,8 @@ def main(argv=None):
     if args.dry_run:
         print(json.dumps(experiment_manifest(get_config() | overrides), indent=2))
         return 0
-    stages = ("prepare", "reference", *METHODS, "evaluate", "report") if args.stage == "all" else (args.stage,)
+    methods = experiment_methods(get_config() | overrides)
+    stages = ("prepare", "reference", *methods, "evaluate", "report") if args.stage == "all" else (args.stage,)
     for stage in stages:
         config = get_config(stage if stage in METHODS else "ddim") | overrides
         config["method"] = stage if stage in METHODS else "ddim"

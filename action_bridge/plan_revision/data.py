@@ -7,7 +7,7 @@ import time
 import torch
 
 from action_bridge.plan_revision.cache import reference_for
-from action_bridge.plan_revision.completion import complete_plan
+from action_bridge.plan_revision.completion import COMPLETION_NAMES, complete_plan
 from action_bridge.plan_revision.contracts import take, tree_map
 
 
@@ -52,8 +52,10 @@ def build_self_sources(windows, snapshot, completion, innovation_variance, confi
         p_self = config.get("source_self_probabilities", (.1, .5, 1., 1.))[block]
     if not 0 <= p_self <= 1:
         raise ValueError("p_self must lie in [0,1]")
-    if not modes or len(set(modes)) != len(modes) or any(mode not in (0, 1, 2) for mode in modes):
-        raise ValueError("modes must be distinct completion IDs from [0,1,2]")
+    if not modes or len(set(modes)) != len(modes) or any(mode not in range(len(COMPLETION_NAMES)) for mode in modes):
+        raise ValueError("modes must be distinct supported completion IDs")
+    if 3 in modes and getattr(completion, "direct_tail", None) is None:
+        raise ValueError("direct_mlp replay requires the frozen direct-tail predictor")
     required = {"episode_id", "time_index", "obs_hist", "act_hist", "future_actions",
                 "valid_mask", "startup_actions"}
     if required - windows.keys():

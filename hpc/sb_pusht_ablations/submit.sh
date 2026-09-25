@@ -16,11 +16,22 @@ job_dir="hpc/sb_pusht_ablations"
 test -f "$job_dir/configs/$variant.json"
 methods=("$@")
 if [[ ${#methods[@]} -eq 0 ]]; then
-  methods=(ddim fm_paired sb_ou sb_kinetic)
+  case "$variant" in
+    brownian|isotropic_ou) methods=(sb_ou) ;;
+    direct_mlp) methods=(fm_paired sb_ou sb_kinetic) ;;
+    *) methods=(ddim fm_paired sb_ou sb_kinetic) ;;
+  esac
 fi
 needs_reference=false
 declare -A seen=()
 for method in "${methods[@]}"; do
+  case "$variant:$method" in
+    brownian:sb_ou|isotropic_ou:sb_ou) ;;
+    brownian:*|isotropic_ou:*)
+      echo "$variant is an sb_ou reference ablation; do not change the policy dynamics too." >&2; exit 1 ;;
+    direct_mlp:ddim)
+      echo "DDIM has no completion mechanism; use an FM/SB method for direct_mlp." >&2; exit 1 ;;
+  esac
   case "$method" in
     ddim) ;;
     fm_paired|fm_local_ot|sb_ou|sb_kinetic) needs_reference=true ;;

@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 from action_bridge.models.diffusion_policy import ConditionalUnet1D, DiffusionPolicy
 from action_bridge.models.encoders import HistoryEncoder, SinusoidalTimeEmbedding
+from action_bridge.plan_revision.completion import COMPLETION_NAMES
 
 
 def validate_full_horizon(batch, horizon: int, action_dim: int) -> torch.Tensor:
@@ -38,7 +39,7 @@ def get_completion_ids(batch) -> torch.Tensor:
         context = batch.get("context", {})
         mode = context.get("completion_id") if isinstance(context, Mapping) else None
     if mode is None:
-        raise ValueError("revision batches require completion_id in [0,2]")
+        raise ValueError("revision batches require completion_id")
     return mode
 
 
@@ -81,7 +82,14 @@ class FieldNet(nn.Module):
             SinusoidalTimeEmbedding(time_dim), nn.Linear(time_dim, 4 * time_dim),
             nn.SiLU(), nn.Linear(4 * time_dim, time_dim),
         )
-        self.mode_embedding = nn.Embedding(3, mode_dim)
+        modes = config.get("training_completion_modes", (0, 1, 2))
+        if not modes or len(set(modes)) != len(modes) or any(mode not in range(len(COMPLETION_NAMES)) for mode in modes):
+            raise ValueError("training_completion_modes must contain distinct supported completion IDs")
+        if config.get("completion_id", 2) not in modes:
+            raise ValueError("completion_id must be included in training_completion_modes")
+        # Keep the original three-mode architecture unless the direct predictor
+        # is actually used. Its ID is additional; it does not rename mode 2.
+        self.mode_embedding = nn.Embedding(max(3, max(modes) + 1), mode_dim)
         self.unet = ConditionalUnet1D(
             self.action_dim * (2 if kinetic else 1), channels,
             history_dim + time_dim + mode_dim + 1, output_dim=self.action_dim,
@@ -90,8 +98,8 @@ class FieldNet(nn.Module):
     def conditioning(self, obs_hist, act_hist, mode, has_previous_plan=None):
         history = self.history_encoder(obs_hist, act_hist)
         mode = torch.as_tensor(mode, device=history.device, dtype=torch.long).expand(history.shape[0])
-        if bool(((mode < 0) | (mode > 2)).any()):
-            raise ValueError("completion_id must be repeat=0, fixed_damped=1 or learned_dissipative=2")
+        if bool(((mode < 0) | (mode >= self.mode_embedding.num_embeddings)).any()):
+            raise ValueError("completion_id is not supported by this policy's mode embedding")
         available = torch.as_tensor(
             True if has_previous_plan is None else has_previous_plan,
             device=history.device, dtype=history.dtype,
@@ -329,6 +337,8 @@ class BridgePolicy(nn.Module):
 
 def build_policy(config: Mapping, *, encoder: nn.Module | None = None) -> nn.Module:
     """Rebuild a generator from its saved shape/config, without data or simulation."""
+    from action_bridge.plan_revision.cache import reference_kind_for
+    reference_kind_for(config)
     encoder_spec = config.get("encoder_spec", {"kind": "HistoryEncoder", "observations": "flat_tensor"})
     if encoder is None and (
         not isinstance(encoder_spec, Mapping)

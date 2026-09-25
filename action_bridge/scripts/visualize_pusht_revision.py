@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 
-from action_bridge.eval.revision_pusht import evaluate
+from action_bridge.eval.revision_pusht import evaluate, validate_evaluation_completion
 from action_bridge.eval.revision_pusht_visualization import render_revision_process
 from action_bridge.plan_revision import checkpoints
 from action_bridge.plan_revision.completion import COMPLETION_NAMES
@@ -88,7 +88,13 @@ def main(argv=None):
     completion_id = (COMPLETION_NAMES.index(args.completion) if args.completion is not None
                      else config.get("completion_id", 2))
     if completion_id not in range(len(COMPLETION_NAMES)):
-        parser.error("Checkpoint completion_id must be 0, 1 or 2")
+        parser.error(f"Checkpoint completion_id must be in [0, {len(COMPLETION_NAMES) - 1}]")
+    try:
+        validate_evaluation_completion(config, completion_id)
+    except ValueError as error:
+        parser.error(str(error))
+    if completion_id == 3 and config["execute"] != state["config"]["execute"]:
+        parser.error("direct_mlp --execute must match the K used to train its tail predictor")
     config["completion_id"] = completion_id
     config["evaluation_seeds"] = [args.seed]
     config["max_episode_steps"] = min(

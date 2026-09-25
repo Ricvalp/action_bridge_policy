@@ -22,6 +22,13 @@ case "$method" in
   ddim|fm_paired|fm_local_ot|sb_ou|sb_kinetic) ;;
   *) echo "Unknown method: $method" >&2; exit 2 ;;
 esac
+case "$1:$method" in
+  brownian:sb_ou|isotropic_ou:sb_ou) ;;
+  brownian:*|isotropic_ou:*)
+    echo "$1 is an sb_ou reference ablation." >&2; exit 2 ;;
+  direct_mlp:ddim)
+    echo "DDIM has no completion mechanism; use an FM/SB method for direct_mlp." >&2; exit 2 ;;
+esac
 cd "${SLURM_SUBMIT_DIR:?Submit from the action_bridge_policy directory.}"
 source hpc/sb_pusht_ablations/common.sh "$1"
 test -f "$run_root/windows.pt"

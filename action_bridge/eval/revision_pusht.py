@@ -17,7 +17,7 @@ from action_bridge.data.pusht_adapter import normalize_observations_np
 from action_bridge.eval.pusht_sim import (
     _action_bounds, _info_success, _make_pusht_env, _obs_to_state, _reset_env,
 )
-from action_bridge.plan_revision.cache import reference_for
+from action_bridge.plan_revision.cache import reference_for, reference_kind_for
 from action_bridge.plan_revision.completion import COMPLETION_NAMES, complete_plan
 from action_bridge.plan_revision.contracts import ActionCodec, PlanCache
 from action_bridge.plan_revision.training import restore_completion
@@ -88,6 +88,15 @@ def _save_video(frames, path):
             writer.append_data(np.asarray(frame, dtype=np.uint8))
 
 
+def validate_evaluation_completion(config, completion_id):
+    """Do not condition a reviser on a completion mode absent from training."""
+    if completion_id not in range(len(COMPLETION_NAMES)):
+        raise ValueError(f"completion_id must be in [0, {len(COMPLETION_NAMES) - 1}]")
+    trained = config.get("training_completion_modes", (0, 1, 2))
+    if config["method"] != "ddim" and completion_id not in trained:
+        raise ValueError(f"completion {COMPLETION_NAMES[completion_id]} was not a trained completion mode")
+
+
 @torch.no_grad()
 def evaluate(policy, config, metadata, dependencies, device, output=None,
              completion_id=2, seeds=None, render=False, save_videos=True,
@@ -110,8 +119,8 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
     device = torch.device(device)
     if (config["obs_dim"], config["action_dim"]) != (5, 2):
         raise ValueError("This evaluator is the Push-T 5-state/2-target adapter")
-    if completion_id not in range(3):
-        raise ValueError("completion_id must be 0, 1 or 2")
+    validate_evaluation_completion(config, completion_id)
+    reference_variant = reference_kind_for(config)
     if trace_generation and config["method"] not in ("fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic"):
         raise ValueError("Generation tracing requires an FM or SB reviser")
     horizon, executed = int(config["horizon"]), int(config["execute"])
@@ -131,6 +140,12 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
     stats = metadata["normalization"]
     reviser = config["method"] != "ddim"
     completion = restore_completion(dependencies, device) if reviser else None
+    if reviser and completion_id == 3:
+        direct = getattr(completion, "direct_tail", None)
+        if direct is None:
+            raise ValueError("direct_mlp evaluation requires a fitted DirectTailPredictor")
+        if direct.execute != executed:
+            raise ValueError("direct_mlp execute must match the K used to train its tail predictor")
     policy.eval()
     env = _make_pusht_env(render_mode="rgb_array", obs_type="state")
     cache = PlanCache()
@@ -202,10 +217,12 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                             reference_batch["mobility"] = prior["mobility"]
                         reference = reference_for(reference_batch, config)
                         _, stiffness, damping = completion.coefficients(obs_tensor, act_tensor)
+                        rates = torch.linalg.eigvalsh(reference.precision)
                         coefficient_rows.append({"stiffness": float(stiffness.mean()),
-                            "damping": float(damping.mean()), "rate_min": float(prior["rate_min"].mean()),
-                            "rate_max": float(prior["rate_max"].mean()),
-                            "stabilized_fraction": float(prior["stabilized_fraction"].mean())})
+                            "damping": float(damping.mean()), "rate_min": float(rates.amin(-1).mean()),
+                            "rate_max": float(rates.amax(-1).mean()),
+                            "stabilized_fraction": (0. if reference_variant == "brownian" else
+                                                    float(prior["stabilized_fraction"].mean()))})
                     generated, diagnostics = policy.sample(obs_tensor, act_tensor, completion_id,
                         source_actions=source, reference=reference, generator=generator,
                         has_previous_plan=torch.tensor([has_previous_plan], device=device),
@@ -336,6 +353,7 @@ def summarize_episodes(episodes, config, metadata, completion_id=2, seeds=None):
                    episodes=len(episodes), protocol=config.get("protocol", "ordinary_ddim"),
                    external_bootstrap=False, completion_id=int(completion_id),
                    completion=COMPLETION_NAMES[completion_id], method=config["method"], seeds=seeds,
+                   reference_kind=config.get("reference_kind", "learned"),
                    horizon=int(config["horizon"]), execute=int(config["execute"]),
                    command_units=metadata["codec"]["units"], robot_dt=config["robot_dt"],
                    success_definition="legacy wrapper: terminated OR info success OR max reward >= 0.95")

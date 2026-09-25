@@ -1,0 +1,5 @@
+{
+  "training_completion_modes": [0, 1, 3],
+  "completion_id": 3,
+  "direct_tail_updates": 20000
+}

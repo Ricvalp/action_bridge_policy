@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 
 from action_bridge.plan_revision import checkpoints
 from action_bridge.plan_revision.cache import draw_records, reference_for, refresh_coupling
-from action_bridge.plan_revision.completion import LearnedCompletion
+from action_bridge.plan_revision.completion import DirectTailPredictor, LearnedCompletion, direct_tail_records
 from action_bridge.plan_revision.contracts import take
 from action_bridge.plan_revision.models import build_policy
 from action_bridge.plan_revision.tracking import preserve_rng
@@ -61,11 +61,20 @@ def completion_config(config):
         "hidden_dim": config["reference_hidden_dim"]}
 
 
+def direct_tail_config(config):
+    return {key: config[key] for key in ("obs_dim", "action_dim", "obs_history", "action_history",
+                                        "horizon", "execute")} | {
+        "hidden_dim": config.get("direct_tail_hidden_dim", 64)}
+
+
 def restore_completion(dependencies, device, *, encoder=None):
     if dependencies.get("completion_encoder_spec", {}).get("kind", "HistoryEncoder") != "HistoryEncoder" and encoder is None:
         raise ValueError("Supply the custom reference encoder specified by this checkpoint")
     model = LearnedCompletion(**dependencies["completion_config"], encoder=encoder).to(device)
     model.load_state_dict(dependencies["completion_state"])
+    if "direct_tail_state" in dependencies:
+        model.direct_tail = DirectTailPredictor(**dependencies["direct_tail_config"]).to(device)
+        model.direct_tail.load_state_dict(dependencies["direct_tail_state"])
     return model.eval().requires_grad_(False)
 
 
@@ -91,6 +100,8 @@ def _block_sources(windows, ema, completion, dependencies, config, metadata,
         "config_sha256": checkpoints.content_digest({key: value for key, value in config.items()
                                            if key != "validation_every"}),
     }
+    if "direct_tail_state" in dependencies:
+        identity["direct_tail_sha256"] = checkpoints.content_digest(dependencies["direct_tail_state"])
     folder = Path(output) / "sources" / f"block_{block:03d}"
     folder.mkdir(parents=True, exist_ok=True)
     snapshot_path, cache_path = folder / "snapshot.pt", folder / "sources.pt"
@@ -137,7 +148,8 @@ def _block_sources(windows, ema, completion, dependencies, config, metadata,
             try:
                 records, diagnostics = build_self_sources(
                     windows, producer, completion, dependencies["innovation_variance"],
-                    config, device, block=block, seed=seed, p_self=probability)
+                    config, device, block=block, seed=seed, p_self=probability,
+                    modes=config.get("training_completion_modes", (0, 1, 2)))
             except SourceReplayError as error:
                 log(Path(output) / "source_replay.jsonl", {**provenance, **error.diagnostics,
                     "status": "failed", "error": str(error)})
@@ -221,6 +233,75 @@ def fit_completion(records, validation, config, output, metadata, device, *, enc
                    innovation_variance=variance.cpu(), diagnostics=diagnostics,
                    training_seconds=time.perf_counter() - start)
     checkpoints.save(latest, payload)
+    return checkpoints.load(latest)
+
+
+def fit_direct_tail(records, validation, config, output, metadata, device, *,
+                    tracker=None, visualize=None, stop_after=None):
+    """Fit a separate frozen tail predictor; never modify the shared reference.
+
+    Both arguments are ordinary replan windows. Adjacent expert windows provide
+    old plans; only the new final K targets are supervised. Held-out windows are
+    used for diagnostics, never optimizer updates or input statistics.
+    """
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    records = direct_tail_records(records, config["execute"])
+    validation = direct_tail_records(validation, config["execute"])
+    updates = config.get("direct_tail_updates", 20_000)
+    if updates < 1:
+        raise ValueError("direct_tail_updates must be positive")
+    seed_all(config["seed"])
+    model = DirectTailPredictor(**direct_tail_config(config)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"],
+                                  weight_decay=config.get("weight_decay", 0.01))
+    latest, first = output / "latest.pt", 0
+    if latest.exists():
+        state = checkpoints.load(latest, device)
+        if not checkpoints.same_training_config(state["config"], config) or state["metadata"] != metadata:
+            raise ValueError("Direct-tail checkpoint/config/dataset mismatch; use another run root")
+        if state.get("complete"):
+            return state
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        first = state["step"]
+        checkpoints.restore_rng(state["rng"])
+    started = time.perf_counter()
+    val = take(validation, torch.arange(min(1024, len(validation["future_actions"]))), device)
+    for step in tqdm(range(first, updates), desc="direct tail", initial=first, total=updates):
+        # draw_records constructs revision sources when old_actions exists;
+        # this auxiliary fit needs only its causal inputs and untouched labels.
+        batch = take(records, torch.randint(len(records["future_actions"]), (config["batch_size"],)), device)
+        loss = model.loss(batch)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])
+        optimizer.step()
+        final = step + 1 == updates
+        if (step + 1) % config["log_every"] == 0 or final:
+            row = {"step": step + 1, "tail_mse": float(loss.detach()),
+                   "grad_norm": float(grad_norm), "lr": optimizer.param_groups[0]["lr"]}
+            log(output / "train.jsonl", row)
+            track_metrics(tracker, step + 1, row, "train")
+            with preserve_rng(), torch.no_grad():
+                model.eval()
+                diagnostics = {"tail_mse": float(model.loss(val))}
+                model.train()
+            log(output / "validation.jsonl", {"step": step + 1, **diagnostics})
+            track_metrics(tracker, step + 1, diagnostics, "val")
+        track_images(tracker, visualize, model, step + 1, final=final)
+        stopping = stop_after is not None and step + 1 >= stop_after
+        if (step + 1) % config["checkpoint_every"] == 0 or final or stopping:
+            payload = dict(config=config, metadata=metadata, model=model.state_dict(),
+                           optimizer=optimizer.state_dict(), step=step + 1, complete=final,
+                           direct_tail_config=direct_tail_config(config), direct_tail_state=model.state_dict(),
+                           train_records=len(records["future_actions"]),
+                           validation_records=len(validation["future_actions"]),
+                           training_seconds=time.perf_counter() - started)
+            checkpoints.save(latest, payload)
+        if stopping:
+            break
+    model.eval().requires_grad_(False)
     return checkpoints.load(latest)
 
 

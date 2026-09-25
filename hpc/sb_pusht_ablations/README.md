@@ -38,11 +38,68 @@ and ten hours. Larger/longer runs may need resubmission; ten hours is not a meas
 completion guarantee. Seed 0's existing results remain the initial baseline;
 submit `baseline_seed0` below if you want a fresh copy in this campaign.
 
+## Start the second batch: scarcity, direct completion, and SB references
+
+Pull the updated code on Peano and use a **fresh campaign root**:
+
+```bash
+export PUSHT_DATASET="$PWD/workspace/datasets/pusht/pusht_cchi_v7_replay.zarr"
+export SB_PUSHT_CAMPAIGN_ROOT="$PWD/workspace/sb_pusht/ablations-second-$(date -u +%Y%m%dT%H%M%S%NZ)"
+printf 'Keep this campaign path: %s\n' "$SB_PUSHT_CAMPAIGN_ROOT"
+bash hpc/sb_pusht_ablations/submit_second_batch.sh
+```
+
+This queues **29 jobs: 17 policies, 6 preparations, and 6 reference fits**, with
+the same dependencies, H200 allocation, W&B project, and asynchronous evaluation
+as the first batch. No additional environment setup is needed.
+
+| Variant | Change | Policies |
+| --- | --- | --- |
+| `scarcity50` | 82 training demonstrations (50%) | DDIM, paired FM, OU-SB, kinetic-SB |
+| `scarcity25` | 41 demonstrations (25%) | Same four |
+| `scarcity10` | 16 demonstrations (10%, rounded down) | Same four |
+| `direct_mlp` | Direct learned prediction of the missing K targets | Paired FM, OU-SB, kinetic-SB |
+| `brownian` | Brownian reference: noise without attraction | `sb_ou` policy with the reference replaced |
+| `isotropic_ou` | Isotropic rather than structured OU attraction | `sb_ou` policy with the reference replaced |
+
+All six use H16/K8, seed 0, the baseline model size, and 300k policy updates.
+Compare them with `baseline_seed0` or your existing full-data seed-0 baseline;
+the second batch does not rerun that baseline. These are initial single-seed
+comparisons, not yet evidence of a statistically reliable improvement.
+
+Scarcity subsets are **nested whole episodes** from the original training split,
+chosen with `subset_seed=0`, independently of the policy training seed. Validation
+and test episode IDs do not change. Normalization, reference/completer fitting,
+innovation statistics, and source caches use only the selected training episodes.
+Do not copy full-data `windows.pt`, references, or source caches into these runs.
+The prepared metadata records the original split and selected episode IDs.
+
+The direct-tail MLP learns from adjacent **expert** chunks: it sees the retained
+old suffix, current observations, and executed-action history, and predicts only
+the missing targets. It is fitted for 20k updates during the reference stage and
+then frozen; the original dissipative reference is fitted and kept unchanged.
+Reviser training mixes repeat, fixed damping, and direct-MLP completion
+(`training_completion_modes: [0, 1, 3]`), replacing learned dissipative completion
+in that mixture. Evaluation uses direct completion by default. This tests
+completion, not a simultaneous change to the SB reference.
+
+Conversely, the two reference variants retain the baseline completion. Brownian
+removes deterministic attraction; isotropic OU keeps the learned center but uses
+the mean precision eigenvalue in every direction (same precision trace). They use
+the existing `sb_ou` trainer/architecture; `reference_kind` selects the process.
+The launchers reject other methods for these two named variants.
+
+To launch only one comparison, use `submit.sh scarcity25`, `submit.sh direct_mlp`,
+`submit.sh brownian`, or `submit.sh isotropic_ou`. Restore the campaign variable
+when resuming jobs, but never change a configuration inside an existing run.
+
 ## Choose comparisons individually
 
 `submit.sh VARIANT [METHOD ...]` submits preparation, the reference when needed,
 and just the requested policies. With no methods it uses `ddim fm_paired sb_ou
-sb_kinetic`. `fm_local_ot` is also supported.
+sb_kinetic`. `fm_local_ot` is also supported. The exceptions are `direct_mlp`,
+which defaults to its three revisers, and `brownian`/`isotropic_ou`, which default
+to `sb_ou` only.
 
 ```bash
 # Four core methods, one new variant.
@@ -83,6 +140,10 @@ comparison. The submission helper snapshots the overrides into each variant's
 | 14. SB temperature | `temperature001`, `baseline_seed0`, `temperature020` | OU-SB and kinetic-SB |
 | 15. Kinetic damping | `damping05`, `baseline_seed0`, `damping8` | Kinetic-SB |
 | 16. Self-generated sources from the start | `self_sources_all` versus `baseline_seed0` | FM and SB; DDIM is unchanged |
+| 17–19. Data scarcity | `scarcity50`, `scarcity25`, `scarcity10` | Four core methods |
+| 23. Direct learned completion | `direct_mlp` | FM and SB |
+| 24. Brownian reference | `brownian` | `sb_ou` trainer |
+| 25. Isotropic OU reference | `isotropic_ou` | `sb_ou` trainer |
 
 For temperature, the baseline is `0.05`; for damping, it is `2.0`. The 600k
 configs keep four training/source blocks and four SB rounds, with 75k updates
@@ -126,7 +187,7 @@ If compute nodes cannot reach W&B, export `WANDB_MODE=offline` before submission
 
 ## Completion comparison without retraining
 
-After reviser training has finished, evaluate all three completion modes on the
+After reviser training has finished, evaluate its trained completion modes on the
 same 200 held-out seeds. Keep the checkpoint unchanged throughout the comparison:
 
 ```bash
@@ -142,7 +203,9 @@ The first argument is the **variant/run root containing method directories**,
 not a checkpoint file. An older run root with the same layout also works.
 For SB, use `best.pt` or a completed forward `latest.pt`, not a checkpoint saved
 partway through a reverse phase.
-The job runs repeat, fixed damping, and learned dissipative completion, each with
+The job reads the completion-mode list from the checkpoint. Baselines run repeat,
+fixed damping, and learned dissipative completion; `direct_mlp` runs repeat,
+fixed damping, and direct-MLP completion instead. Each uses
 four CPU workers and identical seeds starting at 1000000. Results and selected
 MP4s go in a fresh timestamped `completion_eval/` directory below that run root.
 This standalone evaluation writes local metrics, not W&B runs. Completion modes

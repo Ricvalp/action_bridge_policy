@@ -15,7 +15,7 @@ import numpy as np
 from action_bridge.eval.visualization import _draw_tee, _import_pyplot
 
 
-_COMPLETIONS = {0: "repeat", 1: "fixed damped", 2: "learned dissipative"}
+_COMPLETIONS = {0: "repeat", 1: "fixed damped", 2: "learned dissipative", 3: "direct MLP"}
 _GOAL = np.array([256., 256., math.pi / 4])
 
 

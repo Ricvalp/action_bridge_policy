@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 import pytest
+import torch
 
 from action_bridge.configs.sb_pusht import METHODS, get_config
 
@@ -18,6 +19,7 @@ VARIANTS = {
     "h32_k8", "h32_k16", "h64_k8", "h64_k32", "wide18m", "wide42m",
     "long600k", "wide18m_long600k", "deep18m", "temperature001", "temperature020",
     "damping05", "damping8", "self_sources_all",
+    "scarcity50", "scarcity25", "scarcity10", "direct_mlp", "brownian", "isotropic_ou",
 }
 
 
@@ -54,6 +56,10 @@ if kind == 'sbatch':
     if str(count) == os.environ.get('ABLATION_TEST_SBATCH_FAIL_AT'):
         raise SystemExit(1)
     print(1000 + count)
+elif kind == 'python' and len(sys.argv) == 3 and sys.argv[1] == '-':
+    names = ['repeat', 'fixed_damped', 'learned_dissipative', 'direct_mlp']
+    modes = os.environ.get('ABLATION_TEST_COMPLETION_MODES', '0,1,2').split(',')
+    print('\\n'.join(names[int(mode)] for mode in modes))
 """
     for target in (executable_dir / "sbatch", checkout / ".venv-sb-pusht/bin/python"):
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -133,6 +139,12 @@ def test_configurations_cover_ready_experiments_and_valid_training_budgets():
     assert configs["damping05"]["revision_gamma"] == .5
     assert configs["damping8"]["revision_gamma"] == 8
     assert configs["self_sources_all"]["source_self_probabilities"] == [1, 1, 1, 1]
+    for variant, fraction in [("scarcity50", .5), ("scarcity25", .25), ("scarcity10", .1)]:
+        assert configs[variant] == {"train_episode_fraction": fraction, "subset_seed": 0}
+    assert configs["direct_mlp"] == {
+        "training_completion_modes": [0, 1, 3], "completion_id": 3, "direct_tail_updates": 20000}
+    assert configs["brownian"] == {"reference_kind": "brownian"}
+    assert configs["isotropic_ou"] == {"reference_kind": "isotropic_ou"}
 
 
 @pytest.mark.parametrize("method", METHODS)
@@ -247,11 +259,59 @@ def test_first_batch_checks_all_existing_roots_before_submitting_anything(launch
     assert not launch.rows("sbatch")
 
 
+def test_second_batch_submits_seventeen_policies_in_six_comparisons(launch):
+    result = launch.run("submit_second_batch.sh")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = launch.rows("sbatch")
+    train = [row for row in calls if any(arg.endswith("train.sbatch") for arg in row["args"])]
+    assert len(train) == 17
+    assert Counter(row["args"][-1] for row in train) == {
+        "ddim": 3, "fm_paired": 4, "sb_kinetic": 4, "sb_ou": 6}
+    assert Counter(row["args"][-2] for row in train) == {
+        "scarcity50": 4, "scarcity25": 4, "scarcity10": 4,
+        "direct_mlp": 3, "brownian": 1, "isotropic_ou": 1}
+    assert len(calls) == 29
+    for variant in ("scarcity50", "scarcity25", "scarcity10", "direct_mlp", "brownian", "isotropic_ou"):
+        preparation = next((index, row) for index, row in enumerate(calls)
+                           if row["args"][-2:] == ["hpc/sb_pusht_ablations/prepare.sbatch", variant])
+        reference = next((index, row) for index, row in enumerate(calls)
+                         if row["args"][-2:] == ["hpc/sb_pusht_ablations/reference.sbatch", variant])
+        assert option(reference[1]["args"], "--dependency") == f"afterok:{1001 + preparation[0]}"
+        for row in train:
+            if row["args"][-2] == variant:
+                required = preparation[0] if row["args"][-1] == "ddim" else reference[0]
+                assert option(row["args"], "--dependency") == f"afterok:{1001 + required}"
+
+
+def test_second_batch_checks_all_roots_before_submission(launch):
+    (launch.campaign / "isotropic_ou").mkdir(parents=True)
+    result = launch.run("submit_second_batch.sh")
+    assert result.returncode != 0
+    assert not launch.rows("sbatch")
+
+
+@pytest.mark.parametrize("variant,methods", [
+    ("brownian", {"sb_ou"}), ("isotropic_ou", {"sb_ou"}),
+    ("direct_mlp", {"fm_paired", "sb_ou", "sb_kinetic"}),
+])
+def test_new_mechanism_variants_choose_only_relevant_default_methods(launch, variant, methods):
+    result = launch.run("submit.sh", variant)
+    assert result.returncode == 0, result.stdout + result.stderr
+    train = [row for row in launch.rows("sbatch") if any(arg.endswith("train.sbatch") for arg in row["args"])]
+    assert {row["args"][-1] for row in train} == methods
+
+
 @pytest.mark.parametrize("script,arguments", [
     ("train.sbatch", ("../outside", "ddim")),
     ("train.sbatch", ("baseline_seed0", "invalid_method")),
     ("submit.sh", ("not_a_variant",)),
     ("submit.sh", ("baseline_seed0", "ddim", "ddim")),
+    ("submit.sh", ("brownian", "sb_kinetic")),
+    ("submit.sh", ("isotropic_ou", "fm_paired")),
+    ("submit.sh", ("direct_mlp", "ddim")),
+    ("train.sbatch", ("brownian", "fm_paired")),
+    ("train.sbatch", ("isotropic_ou", "sb_kinetic")),
+    ("train.sbatch", ("direct_mlp", "ddim")),
 ])
 def test_bad_variant_and_method_fail_before_any_job_or_python_invocation(launch, script, arguments):
     result = launch.run(script, *arguments)
@@ -294,3 +354,41 @@ def test_completion_evaluation_accepts_latest_and_custom_common_seed_panel(launc
         assert option(command, "--checkpoint") == str(checkpoint)
         assert option(command, "--episodes") == "30"
         assert option(command, "--seed") == "2000000"
+
+
+def test_direct_mlp_completion_comparison_uses_only_checkpoint_trained_modes(launch):
+    root = launch.prepared("direct_mlp")
+    (root / "sb_kinetic").mkdir()
+    (root / "sb_kinetic/best.pt").touch()
+    launch.env["ABLATION_TEST_COMPLETION_MODES"] = "0,1,3"
+    result = launch.run("completion_eval.sbatch", str(root), "sb_kinetic")
+    assert result.returncode == 0, result.stdout + result.stderr
+    commands = [row["args"] for row in launch.rows("python") if "--checkpoint" in row["args"]]
+    assert {option(command, "--completion") for command in commands} == {
+        "repeat", "fixed_damped", "direct_mlp"}
+
+
+@pytest.mark.parametrize("modes,expected", [
+    ([0, 1, 2], ["repeat", "fixed_damped", "learned_dissipative"]),
+    ([0, 1, 3], ["repeat", "fixed_damped", "direct_mlp"]),
+    ([3], ["direct_mlp"]),
+])
+def test_checkpoint_mode_reader_loads_actual_trusted_checkpoint(tmp_path, modes, expected):
+    script = (JOBS / "completion_eval.sbatch").read_text().split("<<'PY_MODES'\n", 1)[1].split("\nPY_MODES", 1)[0]
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save({"config": {"training_completion_modes": modes}}, checkpoint)
+    result = subprocess.run([sys.executable, "-", str(checkpoint)], input=script,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == expected
+
+
+@pytest.mark.parametrize("modes", [[], [0, 0], [False], [4]])
+def test_checkpoint_mode_reader_rejects_invalid_modes(tmp_path, modes):
+    script = (JOBS / "completion_eval.sbatch").read_text().split("<<'PY_MODES'\n", 1)[1].split("\nPY_MODES", 1)[0]
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save({"config": {"training_completion_modes": modes}}, checkpoint)
+    result = subprocess.run([sys.executable, "-", str(checkpoint)], input=script,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0
+    assert "invalid training_completion_modes" in result.stderr

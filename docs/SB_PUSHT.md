@@ -15,9 +15,13 @@ partition `aiq`, and refuses to run if CUDA reports a non-H200 GPU.
 Each main policy job requests one H200, eight CPUs, 32 GB RAM and ten hours.
 The default scientific settings remain 300k updates, H=16, K=8 and 32 NFE.
 
-For the horizon, capacity, training-budget, and reference-parameter campaign,
+For the horizon, capacity, training-budget, data-scarcity, completion, and reference campaigns,
 see [hpc/sb_pusht_ablations/README.md](../hpc/sb_pusht_ablations/README.md).
 Those jobs use the separate W&B project `sb-pusht-ablations`.
+The second batch adds nested 50%/25%/10% training subsets, a direct MLP tail
+predictor, and Brownian/isotropic-OU references. Use fresh run directories:
+each scarcity subset fits its own normalizer and learned dependencies; held-out
+episodes stay fixed. Existing environments need no additional packages.
 
 ### 1. Update code and transfer the replay dataset
 
@@ -295,6 +299,9 @@ OT statistics where applicable, and validation success/coverage/smoothness.
 Action-chunk images show predictions, expert targets and the T pose every 5k
 updates by default. Use `--wandb-images-every`, `--wandb-image-count`, or
 `--wandb-mode offline` as needed. Diagnostic sampling preserves training RNG.
+Reviser images distinguish unexecuted previous targets (black), appended
+completion (purple), and the actual noisy source (gray). The retained targets
+and appended tail together form the clean completed old plan.
 
 MP4s stay **local**, never on W&B: up to two successes and two failures per
 evaluation. They are enabled by default, including standalone checkpoint

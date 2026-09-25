@@ -120,6 +120,8 @@ def test_default_outputs_are_fresh_timestamped_workspace_directories(visualizati
 def test_overrides_completion_execution_range_and_media(visualization, completion_id, mode):
     run = visualization("fm_paired")
     run.payload["config"]["max_episode_steps"] = 25
+    if mode == "direct_mlp":
+        run.payload["config"].update(training_completion_modes=[0, 1, 3], execute=4)
     assert cli.main([
         "--checkpoint", str(run.checkpoint), "--output-dir", str(run.output),
         "--device", "cpu", "--threads", "3", "--seed", "7", "--execute", "4",
@@ -177,7 +179,7 @@ def test_invalid_arguments_do_not_restore_or_write(visualization, arguments, mes
     ({"protocol": "retired_protocol"}, "self_source_v1"),
     ({"obs_dim": 6}, "5-state/2-target"),
     ({"action_dim": 3}, "5-state/2-target"),
-    ({"completion_id": 3}, "completion_id must be"),
+    ({"completion_id": len(cli.COMPLETION_NAMES)}, "completion_id must be"),
     ({"max_episode_steps": 0}, "max_episode_steps must be positive"),
 ])
 def test_incompatible_checkpoint_config_is_rejected(visualization, change, message, capsys):
@@ -185,6 +187,22 @@ def test_incompatible_checkpoint_config_is_rejected(visualization, change, messa
     run.payload["config"].update(change)
     with pytest.raises(SystemExit, match="2"):
         cli.main(["--checkpoint", str(run.checkpoint), "--output-dir", str(run.output)])
+    assert message in capsys.readouterr().err
+    run.restore.assert_not_called()
+    assert not run.output.exists()
+
+
+@pytest.mark.parametrize("trained,execute,message", [
+    ([0, 1, 2], 8, "not a trained completion mode"),
+    ([0, 1, 3], 4, "must match the K"),
+])
+def test_direct_tail_requires_trained_mode_and_checkpoint_execution_length(
+        visualization, trained, execute, message, capsys):
+    run = visualization("fm_paired")
+    run.payload["config"].update(training_completion_modes=trained, completion_id=3, execute=8)
+    with pytest.raises(SystemExit, match="2"):
+        cli.main(["--checkpoint", str(run.checkpoint), "--output-dir", str(run.output),
+                  "--execute", str(execute)])
     assert message in capsys.readouterr().err
     run.restore.assert_not_called()
     assert not run.output.exists()

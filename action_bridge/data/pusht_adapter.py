@@ -7,6 +7,8 @@ schema used by the toy benchmarks.
 
 from __future__ import annotations
 
+import math
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -200,6 +202,22 @@ def _split_episode_ids(num_episodes: int, split: str, train_fraction: float, val
     raise ValueError(f"Unknown split {split!r}; expected train, val, test, or all.")
 
 
+def _training_subset(episode_ids: Sequence[int], fraction: float, seed: int) -> List[int]:
+    """Nested whole-episode subsets, independent of the policy's training RNG."""
+    if (isinstance(fraction, bool) or not isinstance(fraction, Real)
+            or not math.isfinite(fraction) or not 0 < fraction <= 1):
+        raise ValueError("train_episode_fraction must be a finite number in (0, 1]")
+    if isinstance(seed, bool) or not isinstance(seed, Integral) or seed < 0:
+        raise ValueError("subset_seed must be a nonnegative integer")
+    if fraction == 1 or not episode_ids:
+        return list(episode_ids)
+    count = max(1, int(len(episode_ids) * fraction))
+    shuffled = np.random.default_rng(int(seed)).permutation(episode_ids)
+    # The same permutation prefix gives nested subsets; sort only afterwards so
+    # windows and source replays still follow the original episode order.
+    return sorted(int(episode) for episode in shuffled[:count])
+
+
 def _stats_from_episodes(
     observations: Sequence[torch.Tensor],
     actions: Sequence[torch.Tensor],
@@ -323,6 +341,8 @@ class PushTLowDimDataset(Dataset):
         normalization_stats: Optional[Dict[str, Any]] = None,
         normalization_eps: float = 1e-6,
         pad_episode_starts: bool = False,
+        train_episode_fraction: float = 1.0,
+        subset_seed: int = 0,
     ):
         if dataset_path is None:
             raise _setup_error()
@@ -350,12 +370,20 @@ class PushTLowDimDataset(Dataset):
         self.action_history = int(action_history)
         self.chunk_horizon = int(chunk_horizon)
         self.pad_episode_starts = bool(pad_episode_starts)
-        self.episode_ids = _split_episode_ids(len(obs_eps), split, float(train_fraction), float(val_fraction))
+        self.original_split_ids = {
+            name: _split_episode_ids(len(obs_eps), name, float(train_fraction), float(val_fraction))
+            for name in ("train", "val", "test")}
+        self.selected_train_episode_ids = _training_subset(
+            self.original_split_ids["train"], train_episode_fraction, subset_seed)
+        self.train_episode_fraction = float(train_episode_fraction)
+        self.subset_seed = int(subset_seed)
+        self.episode_ids = (self.selected_train_episode_ids if split == "train" else
+                            _split_episode_ids(len(obs_eps), split, float(train_fraction), float(val_fraction)))
         self.normalize = bool(normalize)
         self.normalization_stats = None
         if self.normalize:
-            train_ids = _split_episode_ids(len(obs_eps), "train", float(train_fraction), float(val_fraction))
-            stats = normalization_stats or _stats_from_episodes(obs_eps, action_eps, train_ids, eps=float(normalization_eps))
+            stats = normalization_stats or _stats_from_episodes(
+                obs_eps, action_eps, self.selected_train_episode_ids, eps=float(normalization_eps))
             self.normalization_stats = stats
             tensors = _stats_tensors(stats)
             obs_eps = [(obs.float() - tensors["obs_mean"]) / tensors["obs_std"] for obs in obs_eps]

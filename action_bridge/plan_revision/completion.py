@@ -13,9 +13,10 @@ import torch
 from torch import nn
 
 from action_bridge.models.encoders import HistoryEncoder
+from action_bridge.plan_revision.contracts import take
 
 
-COMPLETION_NAMES = ("repeat", "fixed_damped", "learned_dissipative")
+COMPLETION_NAMES = ("repeat", "fixed_damped", "learned_dissipative", "direct_mlp")
 
 
 def _absolute_targets(semantics: str) -> None:
@@ -39,7 +40,8 @@ def complete_plan(
 ) -> torch.Tensor:
     """Align ``old[executed:]`` exactly and append the chosen causal tail.
 
-    Mode IDs are 0=repeat, 1=fixed damping (0.8), 2=learned damping.
+    Mode IDs are 0=repeat, 1=fixed damping (0.8), 2=learned damping,
+    3=direct learned tail. The direct predictor is fitted for a fixed K.
     A fully executed plan requires an external bootstrap: there is no retained
     tail to initialize here. Mixed mode IDs are supported in one batch.
     """
@@ -57,11 +59,19 @@ def complete_plan(
     modes = modes.long()
     if modes.ndim == 0:
         modes = modes.expand(batch)
-    if modes.shape != (batch,) or bool(((modes < 0) | (modes > 2)).any()):
-        raise ValueError("completion mode must be an integer ID in [0, 2], scalar or [batch]")
+    if modes.shape != (batch,) or bool(((modes < 0) | (modes >= len(COMPLETION_NAMES))).any()):
+        raise ValueError("completion mode must be an integer ID in [0, 3], scalar or [batch]")
     if executed == 0:
         return old.clone()
     use_learned = bool((modes == 2).any())
+    use_direct = bool((modes == 3).any())
+    if use_direct:
+        direct = getattr(learned, "direct_tail", None)
+        if direct is None:
+            raise ValueError("direct_mlp completion requires a fitted DirectTailPredictor")
+        if direct.execute != executed:
+            raise ValueError("direct_mlp execute must match the K used to train its tail predictor")
+        direct_tail = direct(old, obs_hist, act_hist)
     if use_learned:
         if learned is None:
             raise ValueError("learned_dissipative completion requires a fitted LearnedCompletion")
@@ -86,7 +96,87 @@ def complete_plan(
         q = q + robot_dt * next_p
         p = next_p
         tail.append(q)
-    return torch.cat([old[:, executed:], torch.stack(tail, dim=1)], dim=1)
+    appended = torch.stack(tail, dim=1)
+    if use_direct:
+        appended = torch.where((modes == 3)[:, None, None], direct_tail, appended)
+    return torch.cat([old[:, executed:], appended], dim=1)
+
+
+def direct_tail_records(windows, execute: int):
+    """Pair a recorded replan with its immediately preceding expert plan.
+
+    Only rows from the same episode at time ``t-K`` can supply an old plan.
+    Startup/missing-predecessor rows are excluded, never padded with labels from
+    the current prediction. Inputs contain the old plan and current histories;
+    the new future targets are labels only.
+    """
+    required = {"episode_id", "time_index", "obs_hist", "act_hist", "future_actions", "valid_mask"}
+    if required - windows.keys():
+        raise ValueError(f"direct-tail fitting needs fields {sorted(required - windows.keys())}")
+    targets = windows["future_actions"]
+    if targets.ndim != 3 or not 0 < execute < targets.shape[1]:
+        raise ValueError("direct-tail fitting requires 0 < execute < horizon")
+    if windows["valid_mask"].shape != targets.shape[:2] or not bool((windows["valid_mask"] == 1).all()):
+        raise ValueError("direct-tail fitting requires complete valid horizons")
+    pairs = list(zip(windows["episode_id"].tolist(), windows["time_index"].tolist()))
+    indices = {key: index for index, key in enumerate(pairs)}
+    if len(indices) != len(pairs):
+        raise ValueError("direct-tail windows contain duplicate episode/time rows")
+    current, previous = [], []
+    for index, (episode, time) in enumerate(pairs):
+        predecessor = indices.get((episode, time - execute))
+        if time >= execute and predecessor is not None:
+            current.append(index)
+            previous.append(predecessor)
+    if not current:
+        raise ValueError("direct-tail fitting needs at least one adjacent pair of replan windows")
+    records = take(windows, torch.tensor(current, device=targets.device))
+    records["old_actions"] = targets[torch.tensor(previous, device=targets.device)].clone()
+    return records
+
+
+class DirectTailPredictor(nn.Module):
+    """Small unconstrained MLP predicting only K missing command targets.
+
+    This auxiliary supervised model is independent of the dissipative reference.
+    It receives observations, actual executed-action history and the retained
+    old suffix. It never reads current future labels or executed old targets.
+    """
+
+    def __init__(self, horizon: int, execute: int, obs_dim: int, action_dim: int,
+                 obs_history: int, action_history: int, hidden_dim: int = 64):
+        super().__init__()
+        if min(obs_dim, action_dim, obs_history, hidden_dim) < 1 or action_history < 2:
+            raise ValueError("positive dimensions and two executed commands are required")
+        if not 0 < execute < horizon:
+            raise ValueError("direct tail requires 0 < execute < horizon")
+        self.horizon, self.execute = horizon, execute
+        self.action_dim, self.action_history = action_dim, action_history
+        self.encoder = HistoryEncoder(obs_history, action_history, obs_dim, action_dim,
+                                      h_emb_dim=hidden_dim, hidden_dim=hidden_dim, depth=2)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim + (horizon - execute) * action_dim, hidden_dim),
+            nn.SiLU(), nn.Linear(hidden_dim, execute * action_dim),
+        )
+
+    def forward(self, old, obs_hist, act_hist):
+        if old.ndim != 3 or old.shape[1:] != (self.horizon, self.action_dim):
+            raise ValueError("old_actions does not match the direct-tail horizon/action dimensions")
+        if act_hist.ndim != 3 or act_hist.shape[1:] != (self.action_history, self.action_dim):
+            raise ValueError("executed history does not match direct-tail history/action dimensions")
+        history = self.encoder(obs_hist, act_hist)
+        features = torch.cat([history, old[:, self.execute:].flatten(1)], dim=-1)
+        return self.head(features).reshape(-1, self.execute, self.action_dim)
+
+    def loss(self, batch):
+        targets = batch["future_actions"]
+        if targets.ndim != 3 or targets.shape[1:] != (self.horizon, self.action_dim):
+            raise ValueError("future_actions does not match the direct-tail horizon/action dimensions")
+        mask = batch.get("valid_mask")
+        if mask is None or mask.shape != targets.shape[:2] or not bool((mask == 1).all()):
+            raise ValueError("direct-tail supervision requires a fully valid horizon mask")
+        predicted = self(batch["old_actions"], batch["obs_hist"], batch["act_hist"])
+        return (predicted - targets[:, -self.execute:]).square().mean()
 
 
 class LearnedCompletion(nn.Module):

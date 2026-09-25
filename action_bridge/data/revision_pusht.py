@@ -17,7 +17,8 @@ def load_windows(path, config):
             str(path), split=split, obs_key="data/state" if str(path).endswith(".zarr") else None,
             obs_history=config["obs_history"], action_history=config["action_history"],
             chunk_horizon=config["horizon"], normalize=True, normalization_stats=stats,
-            pad_episode_starts=True)
+            pad_episode_starts=True, train_episode_fraction=config.get("train_episode_fraction", 1.0),
+            subset_seed=config.get("subset_seed", 0))
         if dataset.obs_dim != 5 or dataset.action_dim != 2:
             raise ValueError("Push-T requires state=[pusher xy, block xy, block angle] and absolute xy actions")
         stats = dataset.normalization_stats
@@ -53,6 +54,11 @@ def load_windows(path, config):
                 "endpoint_noise_pixels": [x * config["endpoint_std"] for x in stats["action_std"]],
                 "padding": "initial observation repeats; missing executed commands use initial pusher xy",
                 "windows": {key: len(value["future_actions"]) for key, value in result.items()}}
+    if dataset.train_episode_fraction < 1:
+        metadata["train_subset"] = {
+            "fraction": dataset.train_episode_fraction, "seed": dataset.subset_seed,
+            "original_splits": dataset.original_split_ids,
+            "selected_train_episode_ids": dataset.selected_train_episode_ids}
     return result, metadata
 
 

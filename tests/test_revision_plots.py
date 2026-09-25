@@ -109,6 +109,7 @@ def test_scene_and_actions_decode_once_without_future_conditioning(tmp_path, mon
     np.testing.assert_allclose(seen[0]["expert"], [[100., 200.]] * 4)
     np.testing.assert_allclose(seen[0]["predicted"], [[120., 240.]] * 4)
     assert policy.calls[0][3] is None and policy.calls[0][4] is None
+    assert seen[0].get("retained") is None and seen[0].get("completed") is None
 
     different_gt = {**records, "future_actions": torch.full_like(records["future_actions"], 900.)}
     second = plots.make_action_chunk_plotter(different_gt, config, metadata, tmp_path, "cpu", count=2)
@@ -153,6 +154,7 @@ def test_reference_uses_autonomous_history_dynamics(tmp_path, monkeypatch):
     # Last command is [1,2], velocity [1,2]; no future label enters the rollout.
     expected = [[120., 280.], [130., 320.], [140., 360.], [150., 400.]]
     np.testing.assert_allclose(seen[0]["predicted"], expected)
+    assert seen[0].get("retained") is None and seen[0].get("completed") is None
     assert policy.training
 
 
@@ -247,3 +249,119 @@ def test_failed_plot_restores_model_state(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="plot failure"):
         plot(policy, 1)
     assert policy.training and not policy.child.training
+
+
+class RampPolicy(FakePolicy):
+    """Distinct old targets make retained actions and appended targets separable."""
+
+    def sample(self, *args, **kwargs):
+        prediction, diagnostics = super().sample(*args, **kwargs)
+        ramp = prediction.new_tensor([[0., .1], [.2, .3], [.4, .5], [.6, .7]])
+        return ramp.expand_as(prediction) + .1 * len(self.calls), diagnostics
+
+
+@pytest.mark.parametrize("method", ["fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic"])
+@pytest.mark.parametrize("mode", [0, 1, 2])
+def test_preview_separates_retained_completion_and_actual_noisy_source(
+    tmp_path, monkeypatch, method, mode,
+):
+    config, records, metadata = replay_examples()
+    config.update(method=method, completion_id=mode, source_std=.25)
+    completion = FakeReference().eval()
+    monkeypatch.setattr(plots, "restore_completion", lambda *args: completion)
+    monkeypatch.setattr(plots, "immutable_snapshot", lambda model: model)
+    seen = capture_plots(monkeypatch)
+    plot = plots.make_action_chunk_plotter(
+        records, config, metadata, tmp_path, "cpu",
+        dependencies={"innovation_variance": torch.ones(2)}, count=1,
+    )
+    policy = RampPolicy()
+    random_state = torch.get_rng_state().clone()
+    plot(policy, 10)
+    assert torch.equal(random_state, torch.get_rng_state())
+    assert len(policy.calls) == 3  # Plotting does not sample extra predictions.
+    old = np.array([[0., .1], [.2, .3], [.4, .5], [.6, .7]]) + .2
+    retained = old[2:]
+    tail = {
+        0: [[.8, .9], [.8, .9]],
+        1: [[.96, 1.06], [1.088, 1.188]],
+        2: [[1., 1.1], [1.2, 1.3]],
+    }[mode]
+
+    def decode(values):
+        return np.asarray(values) * [10., 20.] + [100., 200.]
+
+    np.testing.assert_allclose(seen[0]["retained"], decode(retained))
+    np.testing.assert_allclose(seen[0]["completed"], decode(np.concatenate([retained, tail])))
+    np.testing.assert_array_equal(seen[0]["completed"][:2], seen[0]["retained"])
+    np.testing.assert_allclose(seen[0]["source"], decode(policy.calls[-1][3][0].numpy()))
+    assert not np.allclose(seen[0]["source"], seen[0]["completed"])
+    np.testing.assert_allclose(seen[0]["predicted"], decode(old + .1))
+
+
+@pytest.mark.parametrize("execute", [2, 4])
+@pytest.mark.parametrize("mode", [0, 1, 2])
+def test_startup_and_exhausted_plan_show_clean_anchor_without_retained_targets(
+    tmp_path, monkeypatch, execute, mode,
+):
+    config, records, metadata = replay_examples()
+    config.update(method="fm_paired", execute=execute, completion_id=mode, source_std=.25)
+    if execute == 2:
+        records = {key: value[:1] for key, value in records.items()}
+    else:
+        records["time_index"] *= 2
+    completion = FakeReference().eval()
+    monkeypatch.setattr(plots, "restore_completion", lambda *args: completion)
+    monkeypatch.setattr(plots, "immutable_snapshot", lambda model: model)
+    seen = capture_plots(monkeypatch)
+    plot = plots.make_action_chunk_plotter(
+        records, config, metadata, tmp_path, "cpu",
+        dependencies={"innovation_variance": torch.ones(2)}, count=1,
+    )
+    policy = RampPolicy()
+    plot(policy, 1)
+    assert seen[0]["retained"] is None
+    np.testing.assert_allclose(seen[0]["completed"], [[110., 240.]] * 4)
+    assert not np.allclose(seen[0]["source"], seen[0]["completed"])
+    # The anchor is the last recorded command, not the physical pusher position.
+    assert not np.allclose(seen[0]["completed"][0], seen[0]["state"][:2])
+
+
+@pytest.mark.parametrize("startup", [False, True])
+def test_chunk_plot_labels_and_completion_junction(tmp_path, monkeypatch, startup):
+    pytest.importorskip("matplotlib")
+    from matplotlib.axes import Axes
+
+    lines = {}
+    original_plot = Axes.plot
+
+    def capture(self, *args, **kwargs):
+        if "label" in kwargs:
+            lines[kwargs["label"]] = (np.asarray(args[0]), np.asarray(args[1]), kwargs)
+        return original_plot(self, *args, **kwargs)
+
+    monkeypatch.setattr(Axes, "plot", capture)
+    completed = np.array([[100., 100.], [110., 120.], [130., 140.], [150., 160.]])
+    if startup:
+        completed[:] = completed[0]
+    retained = None if startup else completed[:2]
+    source = completed + 5.
+    plots._plot_chunk(
+        tmp_path / "separated.png", np.array([200., 210., 240., 250., .5]),
+        completed + 10., completed + 20., source=source,
+        retained=retained, completed=completed,
+    )
+    source_x, source_y, _ = lines["Source after noise"]
+    np.testing.assert_array_equal(np.column_stack([source_x, source_y]), source)
+    if startup:
+        assert "Startup anchor (no previous chunk)" in lines
+        assert "Unexecuted previous chunk" not in lines
+        assert "Appended completion tail" not in lines
+    else:
+        x, y, style = lines["Unexecuted previous chunk"]
+        np.testing.assert_array_equal(np.column_stack([x, y]), retained)
+        assert style.get("markerfacecolor") == "none"
+        x, y, _ = lines["Appended completion tail"]
+        # Include the last retained target so the old/new junction is visible.
+        np.testing.assert_array_equal(np.column_stack([x, y]), completed[1:])
+    assert "GT commands" in lines and "Generated commands" in lines

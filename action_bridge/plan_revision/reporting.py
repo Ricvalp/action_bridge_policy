@@ -64,7 +64,8 @@ def _build_probe_pools(policies, windows_by_split, configs, dependencies, comple
             records, info = build_self_sources(
                 windows, immutable_snapshot(policies[method]), completion,
                 torch.as_tensor(dependencies["innovation_variance"], device=device),
-                configs[method], device, block=3, seed=seed + origin, p_self=1., modes=(2,))
+                configs[method], device, block=3, seed=seed + origin, p_self=1.,
+                modes=(configs[method].get("completion_id", 2),))
             indices = records["has_previous_plan"].nonzero().flatten()[:count]
             if len(indices) != count:
                 raise ValueError("Insufficient non-startup proposals for an equal common-source pool")
@@ -95,6 +96,8 @@ def common_source_probe(policies, windows_by_split, configs, dependencies, devic
     for config in configs.values():
         if config.get("protocol") != "self_source_v1":
             raise ValueError("Legacy source laws cannot enter the replacement probe")
+    if len({config.get("completion_id", 2) for config in configs.values()}) != 1:
+        raise ValueError("A common-source probe requires the same completion mode across revisers")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if any(config["execute"] == config["horizon"] for config in configs.values()):
@@ -152,6 +155,9 @@ def common_source_probe(policies, windows_by_split, configs, dependencies, devic
 
 def report(root):
     root = Path(root)
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    main_mode = manifest.get("config", {}).get("completion_id", 2)
     rows = []
     for path in sorted((root / "evaluation").glob("*/result.json")):
         if path.parent.name == "common_source_probe":
@@ -187,7 +193,7 @@ def report(root):
         figure.savefig(root / "success.png")
         plt.close(figure)
     lines = ["# Whole-plan Push-T experiment — self_source_v1", "",
-             f"Completed evaluation rows: {len(rows)} / 7.", "",
+             f"Completed evaluation rows: {len(rows)}.", "",
              "One training seed; these results do not establish seed robustness or exact SB optimality.",
              "Each reviser learns from its own frozen EMA replay with early expert-old-plan mixing; "
              "the final half uses self-only plans on logged states, not on-policy state training.",
@@ -207,13 +213,13 @@ def report(root):
                              f"{row.get('max_coverage', float('nan')):.3f} | {row.get('final_coverage', float('nan')):.3f} |")
             lines.append("")
         table("Main comparison", [row for row in rows if not row["name"].startswith("sb_kinetic")
-                                 or row.get("completion_id") == 2])
+                                 or row.get("completion_id") == main_mode])
         table("Same kinetic checkpoint, three completion modes", [row for row in rows
                                                                  if row["name"].startswith("sb_kinetic")])
         lines += ["Full diagnostics are in `results.csv`; rollout overlays are saved with each evaluation.",
                   "The shared low/high-error revision diagnostic is in `evaluation/common_source_probe/result.json`. "
                   "Its frozen proposal pool is identical across revisers; logged MSE is not a unique test of valid behavior."]
-    for stage in ("reference", "ddim", "fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic"):
+    for stage in ("reference", "direct_tail", "ddim", "fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic"):
         path = root / stage / "latest.pt"
         if path.exists():
             from action_bridge.plan_revision.checkpoints import load

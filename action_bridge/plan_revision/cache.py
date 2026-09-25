@@ -10,11 +10,55 @@ from action_bridge.plan_revision.completion import complete_plan
 from action_bridge.plan_revision.gaussian import GaussianReference
 
 
+def reference_kind_for(config):
+    """Validate the reference ablation independently of chunk completion.
+
+    ``learned`` keeps the existing OU/kinetic process. The two first-order
+    ablations share the OU policy architecture and use identity mobility so
+    that changing the potential does not also change the noise geometry.
+    """
+    kind = config.get("reference_kind", "learned")
+    if kind not in {"learned", "brownian", "isotropic_ou"}:
+        raise ValueError("reference_kind must be learned, brownian or isotropic_ou")
+    if kind != "learned":
+        if config["method"] != "sb_ou":
+            raise ValueError(f"reference_kind={kind} requires method=sb_ou")
+        if config.get("mobility_smoothing", 0.) != 0:
+            raise ValueError(f"reference_kind={kind} requires mobility_smoothing=0")
+    return kind
+
+
 def reference_for(batch, config):
-    return GaussianReference(batch["precision"], batch["prior_mean"],
-                             kind="kinetic" if config["method"] == "sb_kinetic" else "ou",
+    """Construct the same reference for training, coupling, replay and inference.
+
+    The input precision is already stabilized by the learned completer.
+    Isotropic OU retains its contextual center and mean eigenvalue; Brownian
+    removes its attraction. Neither variant changes the completed source.
+    """
+    variant = reference_kind_for(config)
+    precision, mean = batch["precision"], batch["prior_mean"]
+    mobility = batch.get("mobility")
+    kind = "kinetic" if config["method"] == "sb_kinetic" else "ou"
+    if variant != "learned":
+        n = mean.shape[-1]
+        eye = torch.eye(n, device=mean.device, dtype=precision.dtype)
+        if mobility is not None:
+            if mobility.shape not in {(n, n), precision.shape} or not torch.equal(
+                mobility, eye.to(mobility).expand_as(mobility)
+            ):
+                raise ValueError(f"reference_kind={variant} requires identity mobility")
+        mobility = None
+        if variant == "brownian":
+            kind = "brownian"
+            precision = torch.zeros_like(precision)
+        else:
+            # trace(P)/n matches mean attraction strength, removing only the
+            # anisotropy/correlations of the frozen learned potential.
+            rate = precision.to(torch.float64).diagonal(dim1=-2, dim2=-1).mean(-1)
+            precision = rate[:, None, None] * eye.to(torch.float64)
+    return GaussianReference(precision, mean, kind=kind,
                              temperature=config["temperature"], gamma=config["revision_gamma"],
-                             mobility=batch.get("mobility"))
+                             mobility=mobility)
 
 
 def draw_records(records, count, device, *, completion=None, executed=None,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: sbatch hpc/sb_pusht_ablations/completion_eval.sbatch CHECKPOINT_ROOT METHOD [best.pt]
-# Compare three completion modes without retraining. Metrics/videos are local,
+# Compare this checkpoint's trained completion modes. Metrics/videos are local,
 # not W&B runs. CHECKPOINT_ROOT contains METHOD/best.pt (or another filename).
 #SBATCH --job-name=pusht_ablation_completion
 #SBATCH --partition=gpuq
@@ -53,7 +53,22 @@ PY
 
 output="$checkpoint_root/completion_eval/$method-$(date -u +%Y%m%dT%H%M%S%NZ)"
 mkdir -p "$output"
-for completion in repeat fixed_damped learned_dissipative; do
+# These are our own checkpoints; torch.load is deliberately trusted here.
+modes=$("$python" - "$checkpoint" <<'PY_MODES'
+import sys
+import torch
+from action_bridge.plan_revision.completion import COMPLETION_NAMES
+
+checkpoint = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+modes = checkpoint["config"].get("training_completion_modes", [0, 1, 2])
+if (not modes or len(set(modes)) != len(modes)
+        or any(type(mode) is not int or not 0 <= mode < len(COMPLETION_NAMES) for mode in modes)):
+    raise SystemExit("Checkpoint has invalid training_completion_modes")
+print("\n".join(COMPLETION_NAMES[mode] for mode in modes))
+PY_MODES
+)
+mapfile -t completions <<< "$modes"
+for completion in "${completions[@]}"; do
   "$python" -m "action_bridge.scripts.eval_pusht_$method" \
     --checkpoint "$checkpoint" \
     --completion "$completion" \
