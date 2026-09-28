@@ -20,6 +20,8 @@ VARIANTS = {
     "long600k", "wide18m_long600k", "deep18m", "temperature001", "temperature020",
     "damping05", "damping8", "self_sources_all", "expert_sources_only",
     "scarcity50", "scarcity25", "scarcity10", "direct_mlp", "brownian", "isotropic_ou",
+    "completion_last_pair", "completion_uniform", "completion_linear",
+    "completion_exp_half", "completion_exp_quarter",
 }
 
 
@@ -145,6 +147,75 @@ def test_configurations_cover_ready_experiments_and_valid_training_budgets():
         "training_completion_modes": [0, 1, 3], "completion_id": 3, "direct_tail_updates": 20000}
     assert configs["brownian"] == {"reference_kind": "brownian"}
     assert configs["isotropic_ou"] == {"reference_kind": "isotropic_ou"}
+    for weighting in ("last_pair", "uniform", "linear", "exp_half", "exp_quarter"):
+        assert configs[f"completion_{weighting}"] == {"completion_velocity_weighting": weighting}
+
+
+@pytest.mark.parametrize("weighting", ["last_pair", "uniform", "linear", "exp_half", "exp_quarter"])
+def test_standalone_completion_jobs_prepare_fit_and_train_independently(launch, weighting):
+    variant = f"completion_{weighting}"
+    script = variant + ".sbatch"
+    text = (JOBS / script).read_text()
+    for directive in ("--partition=gpuq", "--gres=gpu:1", "--cpus-per-task=8",
+                      "--mem=64G", "--time=10:00:00"):
+        assert f"#SBATCH {directive}" in text
+
+    result = launch.run(script)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = launch.rows("python")
+    assert calls[0]["args"] == ["-"]  # Check CUDA and the allocated H200.
+    commands = [call["args"] for call in calls[1:]]
+    assert len(commands) == 3
+    assert [command[:3] for command in commands] == [
+        ["-m", "action_bridge.scripts.sb_pusht", stage]
+        for stage in ("prepare", "reference", "sb_ou")]
+    root = launch.campaign / variant
+    snapshot = root / "config.json"
+    assert json.loads(snapshot.read_text()) == {"completion_velocity_weighting": weighting}
+    for command, device in zip(commands, ("cpu", "cuda", "cuda")):
+        assert option(command, "--run-root") == str(root)
+        assert option(command, "--config") == str(snapshot)
+        assert option(command, "--dataset") == str(launch.dataset)
+        assert option(command, "--device") == device
+    for command in commands[1:]:
+        assert "--wandb" in command
+        assert option(command, "--wandb-project") == "sb-pusht-ablations"
+        assert option(command, "--wandb-mode") == "offline"
+    training = commands[-1]
+    assert option(training, "--eval-every") == "10000"
+    assert option(training, "--eval-episodes") == "20"
+    assert option(training, "--eval-device") == "cpu"
+    assert option(training, "--eval-threads") == "2"
+    assert {"--sim-eval", "--eval-videos"}.issubset(training)
+    assert all(call["cuda"] == "7" for call in calls)
+    assert not launch.rows("sbatch")  # All three stages share this allocation.
+
+    # A duplicate must not overwrite its snapshot or start more training.
+    frozen = snapshot.read_bytes()
+    duplicate = launch.run(script)
+    assert duplicate.returncode != 0
+    assert snapshot.read_bytes() == frozen
+    assert [call for call in launch.rows("python") if call["args"] != ["-"]] == calls[1:]
+
+
+@pytest.mark.parametrize("weighting", ["last_pair", "uniform", "linear", "exp_half", "exp_quarter"])
+def test_completion_velocity_presets_default_to_two_sb_jobs(launch, weighting):
+    variant = f"completion_{weighting}"
+    result = launch.run("submit.sh", variant)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = launch.rows("sbatch")
+    assert len(calls) == 4  # prepare, reference, OU-SB, kinetic-SB
+    train = [row for row in calls if any(arg.endswith("train.sbatch") for arg in row["args"])]
+    assert {row["args"][-1] for row in train} == {"sb_ou", "sb_kinetic"}
+    snapshot = launch.campaign / variant / "config.json"
+    assert json.loads(snapshot.read_text()) == {"completion_velocity_weighting": weighting}
+
+
+@pytest.mark.parametrize("script", ["submit.sh", "train.sbatch"])
+def test_completion_velocity_presets_reject_irrelevant_ddim_jobs(launch, script):
+    result = launch.run(script, "completion_exp_half", "ddim")
+    assert result.returncode != 0 and "no completion mechanism" in result.stderr
+    assert not launch.rows("sbatch")
 
 
 @pytest.mark.parametrize("method", METHODS)

@@ -10,11 +10,11 @@ from pathlib import Path
 
 import torch
 
-from action_bridge.eval.revision_pusht import evaluate
+from action_bridge.eval.revision_pusht import configure_completion_velocity_weighting, evaluate
 from action_bridge.eval.revision_pusht_parallel import evaluate_parallel
 from action_bridge.eval.revision_pusht_gaps import diagnose_offline_sources
 from action_bridge.plan_revision import checkpoints
-from action_bridge.plan_revision.completion import COMPLETION_NAMES
+from action_bridge.plan_revision.completion import COMPLETION_NAMES, COMPLETION_VELOCITY_WEIGHTINGS
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -52,6 +52,8 @@ def main(method, argv=None):
     if method != "ddim":
         parser.add_argument("--completion", choices=COMPLETION_NAMES,
                             help="Old-plan tail completion; defaults to checkpoint setting")
+        parser.add_argument("--completion-velocity-weighting", choices=COMPLETION_VELOCITY_WEIGHTINGS,
+                            help="Learned completion velocity initialization; defaults to checkpoint setting")
     args = parser.parse_args(argv)
     for name in ("episodes", "execute", "max_steps", "threads", "workers",
                  "source_gap_episodes", "source_gap_replans"):
@@ -104,6 +106,11 @@ def main(method, argv=None):
     mode = getattr(args, "completion", None)
     completion_id = COMPLETION_NAMES.index(mode) if mode is not None else config.get("completion_id", 2)
     config["completion_id"] = completion_id
+    try:
+        velocity_identity = configure_completion_velocity_weighting(
+            config, completion_id, getattr(args, "completion_velocity_weighting", None))
+    except ValueError as error:
+        parser.error(str(error))
     seeds = args.seeds if args.seeds is not None else list(range(args.seed, args.seed + args.episodes))
     args.workers = min(args.workers, len(seeds))
     config["evaluation_seeds"] = seeds
@@ -130,7 +137,7 @@ def main(method, argv=None):
                     workers=args.workers, threads=args.threads,
                     save_videos=args.save_videos, save_gifs=args.save_gifs,
                     progress=args.progress,
-                    completion_id=completion_id)
+                    completion_id=completion_id, **velocity_identity)
     (output / "evaluation.json").write_text(json.dumps(identity, indent=2) + "\n")
     print(f"Evaluating {method}, checkpoint step {state['step']}, "
           f"H={config['horizon']}, execute={config['execute']}, episodes={len(seeds)}, "

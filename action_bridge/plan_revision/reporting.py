@@ -98,6 +98,8 @@ def common_source_probe(policies, windows_by_split, configs, dependencies, devic
             raise ValueError("Legacy source laws cannot enter the replacement probe")
     if len({config.get("completion_id", 2) for config in configs.values()}) != 1:
         raise ValueError("A common-source probe requires the same completion mode across revisers")
+    if len({config.get("completion_velocity_weighting", "last_pair") for config in configs.values()}) != 1:
+        raise ValueError("A common-source probe requires the same completion velocity weighting across revisers")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if any(config["execute"] == config["horizon"] for config in configs.values()):

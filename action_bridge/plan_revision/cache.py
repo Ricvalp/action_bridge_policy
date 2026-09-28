@@ -62,7 +62,7 @@ def reference_for(batch, config):
 
 
 def draw_records(records, count, device, *, completion=None, executed=None,
-                 source_std=0.01, endpoint_std=0.001):
+                 source_std=0.01, endpoint_std=0.001, velocity_weighting="last_pair"):
     """Sample the prescribed source population; only targets receive new noise.
 
     Sequence replay already selected the mode, completed the old plan and
@@ -81,7 +81,8 @@ def draw_records(records, count, device, *, completion=None, executed=None,
         with torch.no_grad():
             source = complete_plan(batch["old_actions"], executed, batch["obs_hist"],
                                    batch["act_hist"], batch["completion_id"], completion,
-                                   robot_dt=completion.robot_dt if completion is not None else 1.)
+                                   robot_dt=completion.robot_dt if completion is not None else 1.,
+                                   velocity_weighting=velocity_weighting)
         batch["source_actions"] = source + source_std * torch.randn_like(source)
     else:
         batch.setdefault("completion_id", torch.zeros(count, dtype=torch.long, device=device))
@@ -102,7 +103,8 @@ def refresh_coupling(records, count, device, config, completion, snapshot, direc
     for offset in range(0, count, config["batch_size"]):
         batch = draw_records(records, min(config["batch_size"], count - offset), device,
                              completion=completion, executed=config["execute"],
-                             source_std=config["source_std"], endpoint_std=config["endpoint_std"])
+                             source_std=config["source_std"], endpoint_std=config["endpoint_std"],
+                             velocity_weighting=config.get("completion_velocity_weighting", "last_pair"))
         reference = reference_for(batch, config)
         x0 = reference.augment(batch["source_actions"].flatten(1))
         x1 = reference.augment(batch["future_actions"].flatten(1))

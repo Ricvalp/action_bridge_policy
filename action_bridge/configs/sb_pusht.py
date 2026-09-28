@@ -22,6 +22,7 @@ def get_config(method="ddim"):
                 reference_hidden_dim=64, innovation_floor=1e-3,
                 direct_tail_updates=20_000, direct_tail_hidden_dim=64,
                 training_completion_modes=[0, 1, 2], reference_kind="learned",
+                completion_velocity_weighting="linear",
                 robot_dt=1., temperature=.05, revision_gamma=2.,
                 prior_ridge=.05, max_rate=4., mobility_smoothing=0.,
                 source_std=.01, endpoint_std=.001, time_cutoff=.01,

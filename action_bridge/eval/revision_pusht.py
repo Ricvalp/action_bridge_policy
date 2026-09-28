@@ -19,7 +19,9 @@ from action_bridge.eval.pusht_sim import (
 )
 from action_bridge.eval.revision_pusht_gaps import gap_record, summarize_gaps
 from action_bridge.plan_revision.cache import reference_for, reference_kind_for
-from action_bridge.plan_revision.completion import COMPLETION_NAMES, complete_plan
+from action_bridge.plan_revision.completion import (
+    COMPLETION_NAMES, COMPLETION_VELOCITY_WEIGHTINGS, complete_plan,
+)
 from action_bridge.plan_revision.contracts import ActionCodec, PlanCache
 from action_bridge.plan_revision.training import restore_completion
 
@@ -96,6 +98,24 @@ def validate_evaluation_completion(config, completion_id):
     trained = config.get("training_completion_modes", (0, 1, 2))
     if config["method"] != "ddim" and completion_id not in trained:
         raise ValueError(f"completion {COMPLETION_NAMES[completion_id]} was not a trained completion mode")
+
+
+def configure_completion_velocity_weighting(config, completion_id, override=None):
+    """Apply an explicit evaluation ablation without disguising its trained setting."""
+    trained = config.get("completion_velocity_weighting", "last_pair")
+    effective = trained if override is None else override
+    if effective not in COMPLETION_VELOCITY_WEIGHTINGS:
+        raise ValueError(f"Unknown completion velocity weighting: {effective!r}")
+    if override is not None and completion_id != 2:
+        raise ValueError("--completion-velocity-weighting requires learned_dissipative completion")
+    identity = dict(
+        trained_completion_velocity_weighting=trained,
+        completion_velocity_weighting=effective,
+        completion_velocity_weighting_override=override,
+    )
+    if override is not None:
+        config.update(identity)
+    return identity
 
 
 @torch.no_grad()
@@ -204,7 +224,8 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                         completed = act_tensor[:, -1:].expand(-1, horizon, -1).clone()
                     else:
                         completed = complete_plan(cache.plan, cache.executed, obs_tensor, act_tensor,
-                                                  completion_id, completion, robot_dt=config["robot_dt"])
+                                                  completion_id, completion, robot_dt=config["robot_dt"],
+                                                  velocity_weighting=config.get("completion_velocity_weighting", "last_pair"))
                         # Include the last two old targets so tail acceleration
                         # measures the boundary as well as later continuation.
                         tail_commands = np.concatenate([_array(codec.decode(cache.plan)[0, -2:]),
@@ -255,6 +276,7 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                 if trace_generation or len(traces) < 3:
                     trace = {"step": len(actions), "startup": startup,
                              "has_previous_plan": has_previous_plan, "completion_id": completion_id,
+                             "completion_velocity_weighting": config.get("completion_velocity_weighting", "last_pair"),
                              "aligned_old_raw": aligned_raw, "completed_raw": completed_raw,
                              "perturbed_source_raw": None if source is None else _array(codec.decode(source)[0]),
                              "final_raw": raw, "nfe": nfes[-1]}
@@ -362,6 +384,10 @@ def summarize_episodes(episodes, config, metadata, completion_id=2, seeds=None):
                    episodes=len(episodes), protocol=config.get("protocol", "ordinary_ddim"),
                    external_bootstrap=False, completion_id=int(completion_id),
                    completion=COMPLETION_NAMES[completion_id], method=config["method"], seeds=seeds,
+                   completion_velocity_weighting=config.get("completion_velocity_weighting", "last_pair"),
+                   trained_completion_velocity_weighting=config.get("trained_completion_velocity_weighting",
+                       config.get("completion_velocity_weighting", "last_pair")),
+                   completion_velocity_weighting_override=config.get("completion_velocity_weighting_override"),
                    reference_kind=config.get("reference_kind", "learned"),
                    horizon=int(config["horizon"]), execute=int(config["execute"]),
                    command_units=metadata["codec"]["units"], robot_dt=config["robot_dt"],

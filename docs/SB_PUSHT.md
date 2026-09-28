@@ -279,6 +279,48 @@ auxiliary velocities. Frozen reference coefficients depend only on observed
 context. This is a succession of changing-boundary bridge problems, not a
 claim of fixed-boundary convergence.
 
+### Whole-chunk initialization for learned completion
+
+New runs initialize **learned dissipative completion** with a weighted line fit
+to all `H-K` retained targets versus action time. Its slope replaces the noisy
+last-pair velocity. The continuation still starts at the exact final old target;
+retained targets, learned forces, reference fitting and the SB reference process
+are unchanged. Repeat, fixed damping and direct-MLP completion are also unchanged.
+
+Choose `--completion-velocity-weighting NAME` in the training command, or set
+`completion_velocity_weighting` in its JSON configuration:
+
+| Name | Weights, oldest to newest |
+| --- | --- |
+| `linear` (new default) | `1, 2, ..., H-K` |
+| `uniform` | Equal weight for every retained target |
+| `exp_half` | Exponential increase; oldest has 1/4 the newest weight |
+| `exp_quarter` | Stronger exponential increase; oldest has 1/16 the newest weight |
+| `last_pair` | Original two-target velocity, for the baseline |
+
+The exponential half-lives are half/quarter of the retained time span, so their
+endpoint weight ratios do not change with H. With only one retained target the
+fits return zero velocity; with two they equal the last-pair estimate. The fit
+has a free intercept, but its fitted position is **not** used as the tail anchor.
+
+Use a fresh run root and the same setting for prepare/reference/policy stages.
+Changing it while resuming is rejected because it changes the training sources.
+Existing checkpoints without this setting retain `last_pair` automatically.
+To explicitly probe a pretrained OU-SB checkpoint without modifying its weights:
+
+```bash
+uv run --frozen --no-sync python -m action_bridge.scripts.eval_pusht_sb_ou \
+  --checkpoint "$checkpoint" --device cpu --episodes 20 --workers 4 \
+  --completion learned_dissipative --completion-velocity-weighting exp_half
+```
+
+The same flags work with rollout/candidate visualization and source-gap
+diagnostics. Evaluation records the trained setting and explicit override;
+this is an inference-only ablation, not a substitute for training with the new
+source construction. Symmetric synthetic probes use fixed damping and therefore
+do not accept this learned-completion override. For matched HPC training runs,
+see the `completion_*` presets in the [ablation instructions](../hpc/sb_pusht_ablations/README.md#completion-velocity-ablations).
+
 ## Logging and asynchronous evaluation
 
 All five policy trainers evaluate every **10k updates** in a separate process
@@ -482,6 +524,66 @@ playback, and `--no-progress` hides rollout progress. CPU/two threads are the
 defaults. The command collects a fresh full trace: older evaluation JSON files
 contain only the first three coarse traces and cannot reconstruct full FM/SB
 generation histories.
+
+### Many candidate revisions at one state
+
+Generate 200 alternatives from one **learner-reached** decision, without a dataset:
+
+```bash
+uv run --frozen --no-sync python -m action_bridge.scripts.visualize_pusht_candidates \
+  --checkpoint "$run_root/sb_ou/best.pt" --device cpu \
+  --candidates 200 --seed 1234 --replan 6 --candidate-seed 42
+```
+
+`--seed` changes the simulator reset and policy warm-up. `--replan` selects the
+zero-based decision: at H16/K8, decision 6 follows 48 executed commands.
+`--candidate-seed` changes only the alternative draws at that same decision.
+The observation history, actual executed-command history, old plan, and completed
+source are shared across candidates. No candidate is scored or executed.
+
+Default `--source-noise fixed` shares the original decision's perturbed source;
+diversity comes from SB sampling (also fresh auxiliary velocities for kinetic SB).
+`--source-noise independent` perturbs the same completed plan separately per draw;
+`--source-noise none` removes source noise, not SB process noise. FM is deterministic
+for a fixed source: use `independent` to inspect FM's source-induced diversity.
+`--batch-size 32` bounds memory. Keep it fixed for reproducible candidate draws.
+
+Outputs go to a new timestamped `workspace/sb_pusht/candidate_batches/` directory:
+`candidate_overlay.png` / `.svg` (all draws, full view and next-K zoom),
+`candidate_grid.png` (up to 16 evenly spaced, unranked draws), `candidates.npz`
+(all raw command arrays and policy context), and `candidates.json` (seeds,
+checkpoint identity and spread statistics). Curves are **unclipped command
+targets, not simulated physical paths**. This does not yet implement simulator
+cloning, candidate-outcome evaluation, or MPC; the saved observation is not a
+complete physics snapshot. Existing rollout/checkpoint files are unchanged.
+
+For a **synthetic symmetric wrong-side probe**, use:
+
+```bash
+uv run --frozen --no-sync python -m action_bridge.scripts.visualize_pusht_candidates \
+  --checkpoint "$run_root/sb_ou/best.pt" --device cpu \
+  --scene symmetric --candidates 1000 --candidate-seed 42
+```
+
+The T and goal share their symmetry axis; the pusher starts on the goal-facing
+side and must go around the T to push toward the goal. The hand-built previous
+chunk retreats along that axis. Histories assume ideal command tracking, not
+simulated motion. This mode defaults to `fixed_damped` completion and no source
+perturbation, keeping the whole starting chunk symmetric; SB sampling remains
+stochastic, and its learned reference is unchanged. `--seed` and `--replan` do
+not apply here. The additional `candidate_lateral.png` shows signed offsets of
+commands K and H from the symmetry axis—not measured go-around success.
+
+To probe source sensitivity, add `--source-variant right_tilt_15`,
+`--source-variant right_turn_90`, or `--source-variant right_route` to that command
+(`axial` is the default). The first two rotate the unexecuted old suffix 15° or
+90° toward the opposite side of the T; they retain its short length. The last
+uses a longer right-side go-around template designed for H16/K8. Each source is
+completed with the selected completion mode. The scene, observation/action
+histories, executed old prefix and learned reference stay fixed. Keep the same
+candidate seed and batch size to use paired generation noise across conditions.
+“Right” is positive lateral displacement from the T's symmetry axis, not screen
+horizontal. These hand-built sources do not establish simulated feasibility.
 
 ## Another dataset
 

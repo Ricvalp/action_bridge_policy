@@ -196,7 +196,8 @@ def fit_completion(records, validation, config, output, metadata, device, *, enc
     start = time.perf_counter()
     for step in tqdm(range(first, config["reference_updates"]), desc="reference", initial=first,
                      total=config["reference_updates"]):
-        batch = draw_records(records, config["batch_size"], device, endpoint_std=0.)
+        batch = draw_records(records, config["batch_size"], device, endpoint_std=0.,
+                             velocity_weighting=config.get("completion_velocity_weighting", "last_pair"))
         loss = model.loss(batch)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -504,7 +505,8 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
             else:
                 batch = draw_records(source_records, config["batch_size"], device, completion=completion,
                                      executed=config["execute"], source_std=config["source_std"],
-                                     endpoint_std=config["endpoint_std"])
+                                     endpoint_std=config["endpoint_std"],
+                                     velocity_weighting=config.get("completion_velocity_weighting", "last_pair"))
                 pairing_metrics = {}
                 if pairer is not None:
                     batch, pairing_metrics = pairer(batch, completion, device)

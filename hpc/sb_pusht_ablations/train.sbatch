@@ -30,6 +30,8 @@ case "$1:$method" in
     echo "DDIM has no completion mechanism; use an FM/SB method for direct_mlp." >&2; exit 2 ;;
   expert_sources_only:ddim)
     echo "DDIM has no previous-plan source; use an FM/SB method for expert_sources_only." >&2; exit 2 ;;
+  completion_*:ddim)
+    echo "DDIM has no completion mechanism; use an FM/SB method for completion velocity ablations." >&2; exit 2 ;;
 esac
 cd "${SLURM_SUBMIT_DIR:?Submit from the action_bridge_policy directory.}"
 source hpc/sb_pusht_ablations/common.sh "$1"

@@ -161,7 +161,8 @@ def make_action_chunk_plotter(records, config, metadata, output, device, *,
                     completed[available] = complete_plan(
                         previous["old_actions"], config["execute"], previous["obs_hist"],
                         previous["act_hist"], previous["completion_id"], completion,
-                        robot_dt=config["robot_dt"])
+                        robot_dt=config["robot_dt"],
+                        velocity_weighting=config.get("completion_velocity_weighting", "last_pair"))
                     old_pixels = codec.decode(previous["old_actions"]).detach().cpu().numpy()
                     for index, old in zip(available.tolist(), old_pixels):
                         retained_pixels[index] = old[config["execute"]:]

@@ -84,6 +84,7 @@ def build_self_sources(windows, snapshot, completion, innovation_variance, confi
     start = time.perf_counter()
     diagnostics = {"protocol": "self_source_v1", "block": int(block), "seed": int(seed),
                    "p_self": float(p_self), "numerical_failures": 0,
+                   "completion_velocity_weighting": config.get("completion_velocity_weighting", "last_pair"),
                    "startup_records": 0, "expert_records": 0, "self_records": 0,
                    "replay_episodes": len(sequences) * len(modes)}
 
@@ -125,7 +126,8 @@ def build_self_sources(windows, snapshot, completion, innovation_variance, confi
                         old[teacher_rows] = windows["future_actions"][previous_rows].to(device)
                     origin = torch.where(self_choice, 2, 1)
                     source = complete_plan(old, executed, batch["obs_hist"], batch["act_hist"],
-                                           mode_ids, completion, robot_dt=config["robot_dt"])
+                                           mode_ids, completion, robot_dt=config["robot_dt"],
+                                           velocity_weighting=config.get("completion_velocity_weighting", "last_pair"))
                 source = source + config["source_std"] * torch.randn(
                     source.shape, device=device, dtype=source.dtype, generator=generator)
                 check_finite(source, "source", indices)

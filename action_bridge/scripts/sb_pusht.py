@@ -15,6 +15,7 @@ from action_bridge.configs.sb_pusht import COMPLETIONS, METHODS, PROTOCOL, get_c
 from action_bridge.data.revision_pusht import load_windows, make_local_pairer, neighbor_blocks
 from action_bridge.plan_revision import checkpoints
 from action_bridge.plan_revision.cache import reference_kind_for
+from action_bridge.plan_revision.completion import COMPLETION_VELOCITY_WEIGHTINGS
 from action_bridge.plan_revision.tracking import Tracker, TrackingOptions
 from action_bridge.plan_revision.training import direct_tail_config, fit_completion, fit_direct_tail, train
 
@@ -128,6 +129,8 @@ def experiment_methods(config):
 
 
 def completion_modes(config):
+    if config.get("completion_velocity_weighting", "last_pair") not in COMPLETION_VELOCITY_WEIGHTINGS:
+        raise ValueError(f"completion_velocity_weighting must be one of {COMPLETION_VELOCITY_WEIGHTINGS}")
     modes = config.get("training_completion_modes", [0, 1, 2])
     if not modes or len(set(modes)) != len(modes) or any(mode not in range(len(COMPLETIONS)) for mode in modes):
         raise ValueError("training_completion_modes must contain distinct supported completion IDs")
@@ -173,7 +176,7 @@ def validate_evaluation(state, metadata, config):
     if state["config"]["updates"] != config["updates"]:
         raise ValueError("Comparison checkpoints must have the configured optimizer budget")
     for key, default in (("reference_kind", "learned"), ("training_completion_modes", [0, 1, 2]),
-                         ("completion_id", 2)):
+                         ("completion_id", 2), ("completion_velocity_weighting", "last_pair")):
         if state["config"].get(key, default) != config.get(key, default):
             raise ValueError(f"Evaluation checkpoint uses another {key}")
     if "proposal_state" in state["dependencies"]:
@@ -372,6 +375,8 @@ def main(argv=None):
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--config", type=Path, help="Optional JSON overrides, recorded in every checkpoint")
+    parser.add_argument("--completion-velocity-weighting", choices=COMPLETION_VELOCITY_WEIGHTINGS,
+                        help="Velocity initialization for learned dissipative tails (new runs: linear)")
     parser.add_argument("--dry-run", action="store_true", help="Print the active manifest without training or writing files")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--eval-every", type=int,
@@ -407,6 +412,8 @@ def main(argv=None):
                                image_count=args.wandb_image_count)
     torch.set_num_threads(args.threads)
     overrides = json.loads(args.config.read_text()) if args.config else {}
+    if args.completion_velocity_weighting is not None:
+        overrides["completion_velocity_weighting"] = args.completion_velocity_weighting
     if args.eval_every is not None:
         overrides["validation_every"] = args.eval_every
     if args.dry_run:

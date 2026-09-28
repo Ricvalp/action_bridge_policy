@@ -95,11 +95,67 @@ when resuming jobs, but never change a configuration inside an existing run.
 
 ## Choose comparisons individually
 
+### Completion velocity ablations
+
+`completion_last_pair`, `completion_uniform`, `completion_linear`,
+`completion_exp_half`, and `completion_exp_quarter` change only the **initial
+velocity of learned dissipative tails**. The four fits use every retained target;
+linear weights are `1..H-K`, and the exponential options use half-lives of half
+and a quarter of the retained time span. New default configurations use `linear`;
+use `last_pair` to reproduce the earlier initialization. The learned reference
+fit, SB prior and other completion modes are unchanged.
+
+For five independent **OU-SB** jobs, run from the repository root on Peano after
+pulling the changes:
+
+```bash
+mkdir -p hpc/logs
+export PUSHT_DATASET="$PWD/workspace/datasets/pusht/pusht_cchi_v7_replay.zarr"
+export SB_PUSHT_CAMPAIGN_ROOT="$PWD/workspace/sb_pusht/completion-$(date -u +%Y%m%dT%H%M%S%NZ)"
+
+sbatch hpc/sb_pusht_ablations/completion_last_pair.sbatch
+sbatch hpc/sb_pusht_ablations/completion_uniform.sbatch
+sbatch hpc/sb_pusht_ablations/completion_linear.sbatch
+sbatch hpc/sb_pusht_ablations/completion_exp_half.sbatch
+sbatch hpc/sb_pusht_ablations/completion_exp_quarter.sbatch
+```
+
+Each file runs preparation, 20k reference updates, then 300k OU-SB updates
+inside **one H200 job with a total ten-hour limit**, eight CPUs and 64 GB RAM.
+No prerequisite jobs need submitting. The five jobs can run independently;
+each snapshots its preset and refuses an existing variant directory. All use
+H16/K8 and seed 0. Training still mixes repeat, fixed-damped and learned
+completion; evaluation uses learned completion with the chosen initializer.
+W&B uses `sb-pusht-ablations`; asynchronous CPU evaluation runs every 10k policy
+updates on 20 episodes, saving selected videos locally (busy intervals skip).
+Outputs are `$SB_PUSHT_CAMPAIGN_ROOT/completion_<weighting>/sb_ou/`.
+
+If a job times out, keep the same campaign path and resume only its unfinished
+stage using `prepare.sbatch`, `reference.sbatch` or `train.sbatch`, for example
+`sbatch hpc/sb_pusht_ablations/train.sbatch completion_linear sb_ou` once reference
+fitting is complete. Do not rerun the fresh-run script on an existing directory.
+
+Alternatively, to use separate prerequisite jobs and compare both SB methods,
+start with a fresh variant directory and run:
+
+```bash
+bash hpc/sb_pusht_ablations/submit.sh completion_exp_half sb_ou sb_kinetic
+```
+
+Replace `completion_exp_half` with any of the five presets. These presets default
+to OU-SB and kinetic-SB when methods are omitted. Each gets its own preparation,
+reference fit and source caches; H16/K8, seed and budgets are identical. No jobs
+are added automatically to either existing batch launcher. Do not change an
+existing run's weighting or reuse its source cache.
+
+### Other comparisons
+
 `submit.sh VARIANT [METHOD ...]` submits preparation, the reference when needed,
 and just the requested policies. With no methods it uses `ddim fm_paired sb_ou
 sb_kinetic`. `fm_local_ot` is also supported. The exceptions are `direct_mlp`,
 which defaults to its three revisers, and `brownian`/`isotropic_ou`/
-`expert_sources_only`, which default to `sb_ou` only.
+`expert_sources_only`, which default to `sb_ou` only; `completion_*` defaults to
+`sb_ou sb_kinetic`.
 
 ```bash
 # Four core methods, one new variant.

@@ -10,8 +10,9 @@ from pathlib import Path
 import torch
 
 from action_bridge.eval.revision_pusht_gaps import diagnose_offline_sources
+from action_bridge.eval.revision_pusht import configure_completion_velocity_weighting
 from action_bridge.plan_revision import checkpoints
-from action_bridge.plan_revision.completion import COMPLETION_NAMES
+from action_bridge.plan_revision.completion import COMPLETION_NAMES, COMPLETION_VELOCITY_WEIGHTINGS
 
 
 def main(argv=None):
@@ -24,6 +25,8 @@ def main(argv=None):
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--completion", choices=COMPLETION_NAMES)
+    parser.add_argument("--completion-velocity-weighting", choices=COMPLETION_VELOCITY_WEIGHTINGS,
+                        help="Learned completion velocity initialization; defaults to checkpoint setting")
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args(argv)
     if args.episodes < 1 or args.replans < 2 or args.threads < 1 or args.seed < 0:
@@ -34,12 +37,16 @@ def main(argv=None):
         state = checkpoints.load(stream)
         stream.seek(0)
         checkpoint_hash = hashlib.file_digest(stream, "sha256").hexdigest()
-    config = state["config"]
+    config = dict(state["config"])
     if config["method"] not in ("fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic"):
         parser.error("Use an FM/SB policy checkpoint")
     if config.get("protocol") != "self_source_v1":
         parser.error("Use a self_source_v1 checkpoint")
     mode = config.get("completion_id", 2) if args.completion is None else COMPLETION_NAMES.index(args.completion)
+    try:
+        velocity_identity = configure_completion_velocity_weighting(config, mode, args.completion_velocity_weighting)
+    except ValueError as error:
+        parser.error(str(error))
     with args.windows.open("rb") as stream:
         windows = checkpoints.load(stream)
         stream.seek(0)
@@ -57,6 +64,7 @@ def main(argv=None):
                           "checkpoint_step": state["step"], "weights": "ema.forward" if config["method"].startswith("sb_") else "ema",
                           "training_direction": state.get("training_direction", state.get("direction")),
                           "device": args.device, "threads": args.threads,
+                          **velocity_identity,
                           "config": config, "checkpoint_runtime": state.get("runtime"),
                           "diagnostic_runtime": checkpoints.runtime_identity()}
     (output / "source_gaps.json").write_text(json.dumps(report, indent=2) + "\n")

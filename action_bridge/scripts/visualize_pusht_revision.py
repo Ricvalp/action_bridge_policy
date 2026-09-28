@@ -12,10 +12,12 @@ from pathlib import Path
 
 import torch
 
-from action_bridge.eval.revision_pusht import evaluate, validate_evaluation_completion
+from action_bridge.eval.revision_pusht import (
+    configure_completion_velocity_weighting, evaluate, validate_evaluation_completion,
+)
 from action_bridge.eval.revision_pusht_visualization import render_revision_process
 from action_bridge.plan_revision import checkpoints
-from action_bridge.plan_revision.completion import COMPLETION_NAMES
+from action_bridge.plan_revision.completion import COMPLETION_NAMES, COMPLETION_VELOCITY_WEIGHTINGS
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -34,6 +36,8 @@ def main(argv=None):
     parser.add_argument("--execute", type=int, help="Actions before replanning; inherits checkpoint setting")
     parser.add_argument("--completion", choices=COMPLETION_NAMES,
                         help="Old-plan tail completion; inherits checkpoint setting")
+    parser.add_argument("--completion-velocity-weighting", choices=COMPLETION_VELOCITY_WEIGHTINGS,
+                        help="Learned completion velocity initialization; inherits checkpoint setting")
     parser.add_argument("--start-replan", type=int, default=1,
                         help="First displayed zero-based decision (0 is startup; default: 1)")
     parser.add_argument("--replans", type=int, default=3,
@@ -91,6 +95,8 @@ def main(argv=None):
         parser.error(f"Checkpoint completion_id must be in [0, {len(COMPLETION_NAMES) - 1}]")
     try:
         validate_evaluation_completion(config, completion_id)
+        velocity_identity = configure_completion_velocity_weighting(
+            config, completion_id, args.completion_velocity_weighting)
     except ValueError as error:
         parser.error(str(error))
     if completion_id == 3 and config["execute"] != state["config"]["execute"]:
@@ -141,7 +147,7 @@ def main(argv=None):
         checkpoint_runtime=state.get("runtime"), visualization_runtime=checkpoints.runtime_identity(),
         versions=versions, config=config, metadata=state["metadata"],
         seed=args.seed, device=args.device, threads=args.threads,
-        completion=COMPLETION_NAMES[completion_id], completion_id=completion_id,
+        completion=COMPLETION_NAMES[completion_id], completion_id=completion_id, **velocity_identity,
         horizon=config["horizon"], execute=config["execute"],
         start_replan=args.start_replan, replans=args.replans,
         fps=args.fps, save_gif=args.save_gif, progress=args.progress,
