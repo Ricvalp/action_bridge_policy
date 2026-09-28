@@ -148,6 +148,35 @@ reference fit and source caches; H16/K8, seed and budgets are identical. No jobs
 are added automatically to either existing batch launcher. Do not change an
 existing run's weighting or reuse its source cache.
 
+#### Execute 2 or 4 actions with H=16
+
+The following six OU-SB jobs repeat `linear`, `exp_half`, and `exp_quarter`
+with K=2 and K=4 instead of K=8. Each preset changes only `execute` relative to
+its original completion preset; H=16 and all other settings remain unchanged.
+K applies to both training source construction and closed-loop evaluation.
+
+From the repository root, using the same environment and `PUSHT_DATASET`:
+
+```bash
+mkdir -p hpc/logs
+export SB_PUSHT_CAMPAIGN_ROOT="$PWD/workspace/sb_pusht/completion-k-$(date -u +%Y%m%dT%H%M%S%NZ)"
+
+sbatch hpc/sb_pusht_ablations/completion_linear_k2.sbatch
+sbatch hpc/sb_pusht_ablations/completion_exp_half_k2.sbatch
+sbatch hpc/sb_pusht_ablations/completion_exp_quarter_k2.sbatch
+sbatch hpc/sb_pusht_ablations/completion_linear_k4.sbatch
+sbatch hpc/sb_pusht_ablations/completion_exp_half_k4.sbatch
+sbatch hpc/sb_pusht_ablations/completion_exp_quarter_k4.sbatch
+```
+
+Each job still includes preparation and reference fitting, with independent
+windows, references and source caches under `completion_<weighting>_k<K>/`.
+The H200 allocation, ten-hour total limit, 300k policy updates, W&B project,
+asynchronous evaluation and local videos are the same as above. Smaller K
+requires more replans per rollout, so evaluation can take longer.
+To resume policy training, use the matching preset, e.g.
+`sbatch hpc/sb_pusht_ablations/train.sbatch completion_linear_k2 sb_ou`.
+
 ### Other comparisons
 
 `submit.sh VARIANT [METHOD ...]` submits preparation, the reference when needed,

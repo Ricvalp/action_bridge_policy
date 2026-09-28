@@ -1,0 +1,4 @@
+{
+  "completion_velocity_weighting": "exp_half",
+  "execute": 2
+}

@@ -22,7 +22,19 @@ VARIANTS = {
     "scarcity50", "scarcity25", "scarcity10", "direct_mlp", "brownian", "isotropic_ou",
     "completion_last_pair", "completion_uniform", "completion_linear",
     "completion_exp_half", "completion_exp_quarter",
+    "completion_linear_k2", "completion_linear_k4",
+    "completion_exp_half_k2", "completion_exp_half_k4",
+    "completion_exp_quarter_k2", "completion_exp_quarter_k4",
 }
+
+COMPLETION_CASES = [
+    (weighting, 8)
+    for weighting in ("last_pair", "uniform", "linear", "exp_half", "exp_quarter")
+] + [
+    (weighting, execute)
+    for weighting in ("linear", "exp_half", "exp_quarter")
+    for execute in (2, 4)
+]
 
 
 def option(arguments, name):
@@ -149,13 +161,24 @@ def test_configurations_cover_ready_experiments_and_valid_training_budgets():
     assert configs["isotropic_ou"] == {"reference_kind": "isotropic_ou"}
     for weighting in ("last_pair", "uniform", "linear", "exp_half", "exp_quarter"):
         assert configs[f"completion_{weighting}"] == {"completion_velocity_weighting": weighting}
+    for weighting in ("linear", "exp_half", "exp_quarter"):
+        original = base | configs[f"completion_{weighting}"]
+        for execute in (2, 4):
+            overrides = configs[f"completion_{weighting}_k{execute}"]
+            assert overrides == {
+                "completion_velocity_weighting": weighting, "execute": execute}
+            assert base | overrides == original | {"execute": execute}
+            assert (base | overrides)["horizon"] == 16
 
 
-@pytest.mark.parametrize("weighting", ["last_pair", "uniform", "linear", "exp_half", "exp_quarter"])
-def test_standalone_completion_jobs_prepare_fit_and_train_independently(launch, weighting):
-    variant = f"completion_{weighting}"
+@pytest.mark.parametrize("weighting, execute", COMPLETION_CASES)
+def test_standalone_completion_jobs_prepare_fit_and_train_independently(launch, weighting, execute):
+    variant = f"completion_{weighting}" + (f"_k{execute}" if execute != 8 else "")
     script = variant + ".sbatch"
     text = (JOBS / script).read_text()
+    if execute != 8:
+        original = (JOBS / f"completion_{weighting}.sbatch").read_text()
+        assert text == original.replace(f"completion_{weighting}", variant)
     for directive in ("--partition=gpuq", "--gres=gpu:1", "--cpus-per-task=8",
                       "--mem=64G", "--time=10:00:00"):
         assert f"#SBATCH {directive}" in text
@@ -171,7 +194,10 @@ def test_standalone_completion_jobs_prepare_fit_and_train_independently(launch, 
         for stage in ("prepare", "reference", "sb_ou")]
     root = launch.campaign / variant
     snapshot = root / "config.json"
-    assert json.loads(snapshot.read_text()) == {"completion_velocity_weighting": weighting}
+    overrides = {"completion_velocity_weighting": weighting}
+    if execute != 8:
+        overrides["execute"] = execute
+    assert json.loads(snapshot.read_text()) == overrides
     for command, device in zip(commands, ("cpu", "cuda", "cuda")):
         assert option(command, "--run-root") == str(root)
         assert option(command, "--config") == str(snapshot)
