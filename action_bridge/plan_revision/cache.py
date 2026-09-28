@@ -61,14 +61,32 @@ def reference_for(batch, config):
                              mobility=mobility)
 
 
+def sample_indices(records, count, *, startup_fraction=None):
+    """Keep curriculum startup sampling independent of the replay-grid density."""
+    if startup_fraction is None:
+        return torch.randint(len(records["future_actions"]), (count,))
+    if not 0 <= startup_fraction <= 1 or "has_previous_plan" not in records:
+        raise ValueError("Startup stratification needs a fraction in [0,1] and source records")
+    previous = records["has_previous_plan"].cpu().bool()
+    groups = ((~previous).nonzero(as_tuple=True)[0], previous.nonzero(as_tuple=True)[0])
+    if not len(groups[0]) or not len(groups[1]):
+        raise ValueError("Startup stratification requires both startup and ordinary source records")
+    startup = torch.rand(count) < startup_fraction
+    indices = torch.empty(count, dtype=torch.long)
+    for mask, rows in ((startup, groups[0]), (~startup, groups[1])):
+        indices[mask] = rows[torch.randint(len(rows), (int(mask.sum()),))]
+    return indices
+
+
 def draw_records(records, count, device, *, completion=None, executed=None,
-                 source_std=0.01, endpoint_std=0.001, velocity_weighting="last_pair"):
+                 source_std=0.01, endpoint_std=0.001, velocity_weighting="last_pair",
+                 startup_fraction=None):
     """Sample the prescribed source population; only targets receive new noise.
 
     Sequence replay already selected the mode, completed the old plan and
     perturbed the source. Redrawing any of these changes the prescribed law.
     """
-    indices = torch.randint(len(records["future_actions"]), (count,))
+    indices = sample_indices(records, count, startup_fraction=startup_fraction)
     batch = take(records, indices, device)
     batch["record_id"] = indices.to(device)
     if "source_actions" in batch:
@@ -98,13 +116,17 @@ def refresh_coupling(records, count, device, config, completion, snapshot, direc
     snapshot includes its history encoder and is frozen for the entire phase.
     Context/record/completion identifiers stay attached to both endpoints.
     """
+    from action_bridge.plan_revision.curriculum import is_curriculum, replay_k
+
     start = time.perf_counter()
     pieces = []
     for offset in range(0, count, config["batch_size"]):
         batch = draw_records(records, min(config["batch_size"], count - offset), device,
-                             completion=completion, executed=config["execute"],
+                             completion=completion, executed=replay_k(config),
                              source_std=config["source_std"], endpoint_std=config["endpoint_std"],
-                             velocity_weighting=config.get("completion_velocity_weighting", "last_pair"))
+                             velocity_weighting=config.get("completion_velocity_weighting", "last_pair"),
+                             startup_fraction=config.get("startup_sampling_fraction", .1)
+                             if is_curriculum(config) else None)
         reference = reference_for(batch, config)
         x0 = reference.augment(batch["source_actions"].flatten(1))
         x1 = reference.augment(batch["future_actions"].flatten(1))
@@ -115,7 +137,9 @@ def refresh_coupling(records, count, device, config, completion, snapshot, direc
                                             reference, reverse=reverse,
                                             steps=config["coupling_steps"],
                                             **({"has_previous_plan": batch["has_previous_plan"]}
-                                               if "has_previous_plan" in batch else {}))
+                                               if "has_previous_plan" in batch else {}),
+                                            **({"execution_k": batch["execution_k"]}
+                                               if config.get("condition_on_k", False) else {}))
             if reverse:
                 x0 = generated
             else:

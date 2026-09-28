@@ -147,6 +147,7 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
     if trace_generation and config["method"] not in ("fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic"):
         raise ValueError("Generation tracing requires an FM or SB reviser")
     horizon, executed = int(config["horizon"]), int(config["execute"])
+    curriculum = config.get("protocol") == "self_source_k_curriculum_v1"
     if not 1 <= executed <= horizon:
         raise ValueError("execute must satisfy 1 <= K <= H")
     if config["max_episode_steps"] < 1:
@@ -199,12 +200,12 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                 obs_tensor = torch.as_tensor(normalize_observations_np(obs_hist, stats)[None],
                                              device=device, dtype=torch.float32)
                 act_tensor = codec.encode(torch.as_tensor(act_hist[None], device=device, dtype=torch.float32))
-                has_previous_plan = cache.plan is not None and cache.executed < horizon
+                has_previous_plan = cache.plan is not None and (cache.executed < horizon or curriculum)
                 startup = reviser and not has_previous_plan
                 aligned = completed = source = reference = None
                 aligned_raw = completed_raw = None
                 prior = None
-                if has_previous_plan and cache.executed > 0:
+                if has_previous_plan and 0 < cache.executed < horizon:
                     plan_gaps.append({"robot_step": len(actions), **gap_record(
                         state[:2], act_hist[-1], _array(codec.decode(cache.plan)[0]),
                         cache.executed,
@@ -225,7 +226,8 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                     else:
                         completed = complete_plan(cache.plan, cache.executed, obs_tensor, act_tensor,
                                                   completion_id, completion, robot_dt=config["robot_dt"],
-                                                  velocity_weighting=config.get("completion_velocity_weighting", "last_pair"))
+                                                  velocity_weighting=config.get("completion_velocity_weighting", "last_pair"),
+                                                  allow_full_completion=curriculum)
                         # Include the last two old targets so tail acceleration
                         # measures the boundary as well as later continuation.
                         tail_commands = np.concatenate([_array(codec.decode(cache.plan)[0, -2:]),
@@ -256,6 +258,8 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                     generated, diagnostics = policy.sample(obs_tensor, act_tensor, completion_id,
                         source_actions=source, reference=reference, generator=generator,
                         has_previous_plan=torch.tensor([has_previous_plan], device=device),
+                        **({"execution_k": torch.tensor([executed], device=device)}
+                           if config.get("condition_on_k", False) else {}),
                         **({"trace": True} if trace_generation else {}))
                     if startup:
                         startups += 1
@@ -267,7 +271,7 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                 if generated.shape != (1, horizon, 2) or not bool(generated.isfinite().all()):
                     raise ValueError("Policy produced a nonfinite or incorrectly shaped action chunk")
                 raw = _array(codec.decode(generated)[0])
-                if aligned is not None:
+                if aligned is not None and aligned.shape[1]:
                     overlap = raw[:aligned.shape[1]] - aligned_raw
                     revisions.append(float(np.sqrt(np.mean(np.sum(overlap**2, axis=-1)))))
                 nfes.append(int(diagnostics.get("nfe", 0)))
@@ -276,6 +280,8 @@ def evaluate(policy, config, metadata, dependencies, device, output=None,
                 if trace_generation or len(traces) < 3:
                     trace = {"step": len(actions), "startup": startup,
                              "has_previous_plan": has_previous_plan, "completion_id": completion_id,
+                             "elapsed_count": int(cache.executed), "execution_k": executed,
+                             "overlap_length": horizon - cache.executed if has_previous_plan else 0,
                              "completion_velocity_weighting": config.get("completion_velocity_weighting", "last_pair"),
                              "aligned_old_raw": aligned_raw, "completed_raw": completed_raw,
                              "perturbed_source_raw": None if source is None else _array(codec.decode(source)[0]),
@@ -390,6 +396,8 @@ def summarize_episodes(episodes, config, metadata, completion_id=2, seeds=None):
                    completion_velocity_weighting_override=config.get("completion_velocity_weighting_override"),
                    reference_kind=config.get("reference_kind", "learned"),
                    horizon=int(config["horizon"]), execute=int(config["execute"]),
+                   execution_k=int(config["execute"]),
+                   training_active_k=config.get("active_k", config["execute"]),
                    command_units=metadata["codec"]["units"], robot_dt=config["robot_dt"],
                    success_definition="legacy wrapper: terminated OR info success OR max reward >= 0.95")
     metrics.update(summarize_gaps([row for episode in episodes for row in episode.get("plan_gaps", [])]))

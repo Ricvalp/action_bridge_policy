@@ -204,6 +204,8 @@ def sample_candidate_revisions(policy, config, metadata, dependencies, context, 
                 obs.expand(count, -1, -1), actions.expand(count, -1, -1), completion_id,
                 source_actions=source, reference=reference, generator=generator,
                 has_previous_plan=torch.full((count,), context["has_previous_plan"], device=device, dtype=torch.bool),
+                **({"execution_k": torch.full((count,), config["execute"], device=device, dtype=torch.long)}
+                   if config.get("condition_on_k", False) else {}),
             )
             if generated.shape != (count, config["horizon"], 2) or not torch.isfinite(generated).all():
                 raise ValueError("Candidate sampler returned nonfinite or incorrectly shaped targets")

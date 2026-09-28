@@ -54,8 +54,8 @@ def main(argv=None):
         stream.seek(0)
         checkpoint_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     config = dict(state["config"])
-    if config.get("protocol") != "self_source_v1" or config["method"] not in ("fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic"):
-        parser.error("Use a self_source_v1 FM or SB reviser checkpoint")
+    if config.get("protocol") not in ("self_source_v1", "self_source_k_curriculum_v1") or config["method"] not in ("fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic"):
+        parser.error("Use a self-source FM or SB reviser checkpoint")
     if (config["obs_dim"], config["action_dim"]) != (5, 2):
         parser.error("This visualization uses the Push-T 5-state/2-target interface")
     if config["method"].startswith("sb_") and state.get("direction") != "forward":

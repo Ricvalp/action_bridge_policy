@@ -11,11 +11,12 @@ import subprocess
 
 import torch
 
-from action_bridge.configs.sb_pusht import COMPLETIONS, METHODS, PROTOCOL, get_config
+from action_bridge.configs.sb_pusht import COMPLETIONS, METHODS, PROTOCOL, get_config, get_k_curriculum_config
 from action_bridge.data.revision_pusht import load_windows, make_local_pairer, neighbor_blocks
 from action_bridge.plan_revision import checkpoints
 from action_bridge.plan_revision.cache import reference_kind_for
 from action_bridge.plan_revision.completion import COMPLETION_VELOCITY_WEIGHTINGS
+from action_bridge.plan_revision.curriculum import CURRICULUM_PROTOCOL, is_curriculum, validate_curriculum
 from action_bridge.plan_revision.tracking import Tracker, TrackingOptions
 from action_bridge.plan_revision.training import direct_tail_config, fit_completion, fit_direct_tail, train
 
@@ -72,7 +73,7 @@ def discover_implementations(checkout):
     return sorted(paths)
 
 
-def audit(root, dataset=None):
+def audit(root, dataset=None, *, protocol=PROTOCOL):
     checkout = Path(__file__).resolve().parents[2]
     def git(*args):
         return subprocess.check_output(["git", "-C", str(checkout), *args], text=True).strip()
@@ -96,7 +97,7 @@ def audit(root, dataset=None):
                   discovered_checkpoint_paths=checkpoints_found,
                   reused=["action_bridge/models/diffusion_policy.py", "action_bridge/models/encoders.py",
                           "action_bridge/data/pusht_adapter.py", "action_bridge/eval/pusht_sim.py"],
-                  protocol=PROTOCOL,
+                  protocol=protocol,
                   artifact_reuse="No automatic reuse of legacy checkpoints; discovered paths are not compatibility checks.",
                   dataset_path=None if dataset is None else str(dataset.resolve()),
                   dataset_exists=dataset is not None and dataset.exists(),
@@ -116,6 +117,9 @@ def window_spec(config):
     # Include them so that cached pixel-scale annotations cannot become stale.
     keys = ("protocol", "horizon", "execute", "obs_history", "action_history", "source_std", "endpoint_std")
     spec = {key: config[key] for key in keys}
+    if is_curriculum(config):
+        spec.update(window_grid="dense_robot_steps_v1", k_values_by_block=config["k_values_by_block"],
+                    condition_on_k=config["condition_on_k"], model_schema=config["model_schema"])
     if config.get("train_episode_fraction", 1.) != 1.:
         spec.update(train_episode_fraction=config["train_episode_fraction"],
                     subset_seed=config.get("subset_seed", 0))
@@ -154,11 +158,12 @@ def validate_reference(reference_state, metadata, config):
 
 def experiment_manifest(config):
     """Describe this variant without introducing an external proposal policy."""
+    validate_curriculum(config)
     methods, modes = experiment_methods(config), completion_modes(config)
     auxiliary = {"reference": "shared frozen supervised fit"}
     if 3 in modes:
         auxiliary["direct_tail"] = "frozen supervised MLP tail predictor; fitted by the reference stage"
-    return {"protocol": PROTOCOL, "config": config,
+    result = {"protocol": config.get("protocol", PROTOCOL), "config": config,
             "jobs": {method: "pending" for method in methods},
             "auxiliary": auxiliary,
             "dependencies": {method: ([] if method == "ddim" else list(auxiliary)) for method in methods},
@@ -166,11 +171,24 @@ def experiment_manifest(config):
             "completion_evaluations": [f"sb_kinetic/{COMPLETIONS[mode]}" for mode in modes
                                        if mode != config["completion_id"] and "sb_kinetic" in methods],
             "main_completion": COMPLETIONS[config["completion_id"]], "artifact_reuse": []}
+    if is_curriculum(config):
+        result["k_curriculum"] = dict(values_by_block=config["k_values_by_block"],
+                optimizer_updates_per_block=config["updates"] // config["training_blocks"],
+                deployment_k=config["execute"], transition="complete_training_block",
+                model_schema=config["model_schema"], startup_sampling_fraction=config["startup_sampling_fraction"],
+                mismatch_probe="unavailable: dataset lacks validated complete simulator snapshots",
+                interpretation="offline recorded histories, not physically on-policy",
+                reference_support="shared frozen coefficient head supervised at all H indices")
+    return result
 
 
 def validate_evaluation(state, metadata, config):
-    if state["config"].get("protocol") != PROTOCOL:
-        raise ValueError("Legacy results are not part of self_source_v1; use a new run root")
+    if state["config"].get("protocol") != config.get("protocol", PROTOCOL):
+        raise ValueError("Legacy results or another source protocol cannot enter this comparison")
+    if is_curriculum(config):
+        for key in ("k_values_by_block", "condition_on_k", "model_schema", "execute", "horizon"):
+            if state["config"].get(key) != config[key]:
+                raise ValueError(f"Evaluation checkpoint uses another curriculum {key}")
     if state["metadata"] != metadata:
         raise ValueError("Evaluation checkpoint belongs to another dataset or normalizer")
     if state["config"]["updates"] != config["updates"]:
@@ -220,8 +238,9 @@ def stage_evaluation(output, config, options):
 
 
 def run_stage(stage, root, dataset, config, device, *, tracking=None, evaluation=None):
-    if config.get("protocol") != PROTOCOL:
-        raise ValueError("Only self_source_v1 is active; legacy runs remain untouched")
+    if config.get("protocol") not in {PROTOCOL, CURRICULUM_PROTOCOL}:
+        raise ValueError("Only self_source_v1 or self_source_k_curriculum_v1 is supported; legacy runs remain untouched")
+    validate_curriculum(config)
     if stage == "sources":
         raise ValueError("The shared sources stage is retired; each reviser builds its own block sources")
     methods, modes = experiment_methods(config), completion_modes(config)
@@ -231,7 +250,7 @@ def run_stage(stage, root, dataset, config, device, *, tracking=None, evaluation
             raise ValueError(f"This reference ablation supports only {methods}")
     root.mkdir(parents=True, exist_ok=True)
     if stage == "audit":
-        return audit(root, dataset)
+        return audit(root, dataset, protocol=config["protocol"])
     if stage == "report":
         from action_bridge.plan_revision.reporting import report
         return report(root)
@@ -263,7 +282,7 @@ def run_stage(stage, root, dataset, config, device, *, tracking=None, evaluation
             for mode in eval_modes:
                 output = root / "evaluation" / f"{method}-{COMPLETIONS[mode]}"
                 result_path = output / "result.json"
-                identity = {"protocol": PROTOCOL, "checkpoint_sha256": checkpoint_hash,
+                identity = {"protocol": config["protocol"], "checkpoint_sha256": checkpoint_hash,
                             "completion_id": mode, "seeds": config["evaluation_seeds"],
                             "normalizer_id": state["metadata"]["normalizer_id"],
                             "max_episode_steps": state["config"]["max_episode_steps"],
@@ -291,7 +310,7 @@ def run_stage(stage, root, dataset, config, device, *, tracking=None, evaluation
     windows_path = root / "windows.pt"
     data_spec = window_spec(config)
     if not windows_path.exists():
-        audit_report = audit(root, dataset)
+        audit_report = audit(root, dataset, protocol=config["protocol"]) if is_curriculum(config) else audit(root, dataset)
         windows, metadata = load_windows(dataset.resolve(), config)
         metadata.update(dataset_sha256=dataset_digest(dataset), policy_commit=audit_report["commit"],
                         lock_sha256=audit_report["lock_sha256"],
@@ -375,6 +394,8 @@ def main(argv=None):
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--config", type=Path, help="Optional JSON overrides, recorded in every checkpoint")
+    parser.add_argument("--k-curriculum", type=int, nargs="+", metavar="K",
+                        help="New-run scheduled training K values; execute remains deployment K (default 8)")
     parser.add_argument("--completion-velocity-weighting", choices=COMPLETION_VELOCITY_WEIGHTINGS,
                         help="Velocity initialization for learned dissipative tails (new runs: linear)")
     parser.add_argument("--dry-run", action="store_true", help="Print the active manifest without training or writing files")
@@ -412,18 +433,26 @@ def main(argv=None):
                                image_count=args.wandb_image_count)
     torch.set_num_threads(args.threads)
     overrides = json.loads(args.config.read_text()) if args.config else {}
+    if args.k_curriculum is not None:
+        overrides.update(protocol=CURRICULUM_PROTOCOL, k_values_by_block=args.k_curriculum)
     if args.completion_velocity_weighting is not None:
         overrides["completion_velocity_weighting"] = args.completion_velocity_weighting
     if args.eval_every is not None:
         overrides["validation_every"] = args.eval_every
+    def resolved(method):
+        base = get_k_curriculum_config(method) if overrides.get("protocol") == CURRICULUM_PROTOCOL else get_config(method)
+        config = base | overrides | {"method": method}
+        validate_curriculum(config)
+        return config
+
+    selected = resolved(args.stage if args.stage in METHODS else "ddim")
     if args.dry_run:
-        print(json.dumps(experiment_manifest(get_config() | overrides), indent=2))
+        print(json.dumps(experiment_manifest(selected), indent=2))
         return 0
-    methods = experiment_methods(get_config() | overrides)
+    methods = experiment_methods(selected)
     stages = ("prepare", "reference", *methods, "evaluate", "report") if args.stage == "all" else (args.stage,)
     for stage in stages:
-        config = get_config(stage if stage in METHODS else "ddim") | overrides
-        config["method"] = stage if stage in METHODS else "ddim"
+        config = resolved(stage if stage in METHODS else "ddim")
         output = args.run_root.resolve()
         print(f"Stage: {stage}; artifacts: {output}", flush=True)
         run_stage(stage, output, args.dataset, config, args.device, tracking=tracking, evaluation=evaluation)

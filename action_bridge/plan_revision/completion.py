@@ -29,7 +29,7 @@ def _absolute_targets(semantics: str) -> None:
 
 
 def completion_velocity(old: torch.Tensor, executed: int, *, robot_dt: float = 1.,
-                        weighting: str = "linear") -> torch.Tensor:
+                        weighting: str = "linear", allow_full_completion: bool = False) -> torch.Tensor:
     """Fit target-versus-time slope to the entire unexecuted chunk.
 
     This is weighted least squares with a free intercept, not an average of
@@ -38,19 +38,22 @@ def completion_velocity(old: torch.Tensor, executed: int, *, robot_dt: float = 1
     span half or a quarter of the retained time interval, giving oldest:newest
     weights 1:4 or 1:16. All retained targets receive positive weight.
 
-    One remaining target cannot define a slope: return zero. ``last_pair`` is
-    the explicit baseline and can use the penultimate old target even if that
-    target has already been executed. No observation or future label is read.
+    One remaining target cannot define a fitted slope: the legacy path returns
+    zero. The explicit curriculum ``allow_full_completion`` convention instead
+    falls back to the full old plan's last pair for zero/one retained targets.
+    ``last_pair`` always uses that pair, even if already executed. No observation
+    or future label is read.
     """
     if weighting not in COMPLETION_VELOCITY_WEIGHTINGS:
         raise ValueError(f"Unknown completion velocity weighting: {weighting}")
     if old.ndim != 3 or old.shape[1] < 2 or not old.is_floating_point():
         raise ValueError("old must be a floating tensor [batch, horizon >= 2, action_dim]")
-    if not isinstance(executed, int) or not 0 <= executed < old.shape[1]:
+    if not isinstance(executed, int) or not 0 <= executed <= old.shape[1] or (
+            executed == old.shape[1] and not allow_full_completion):
         raise ValueError("velocity estimation requires a nonempty retained chunk")
     if not 0 < robot_dt < float("inf"):
         raise ValueError("robot_dt must be finite and positive")
-    if weighting == "last_pair":
+    if weighting == "last_pair" or (allow_full_completion and old.shape[1] - executed < 2):
         return (old[:, -1] - old[:, -2]) / robot_dt
     retained = old[:, executed:]
     length = retained.shape[1]
@@ -88,13 +91,15 @@ def complete_plan(
     robot_dt: float = 1.0,
     action_semantics: str = "absolute_target",
     velocity_weighting: str = "last_pair",
+    allow_full_completion: bool = False,
 ) -> torch.Tensor:
     """Align ``old[executed:]`` exactly and append the chosen causal tail.
 
     Mode IDs are 0=repeat, 1=fixed damping (0.8), 2=learned damping,
     3=direct learned tail. The direct predictor is fitted for a fixed K.
-    A fully executed plan requires an external bootstrap: there is no retained
-    tail to initialize here. Mixed mode IDs are supported in one batch.
+    ``allow_full_completion`` enables curriculum K=H: continue from the full
+    old plan's last pair even with no retained suffix. The legacy path rejects
+    K=H and its wrapper retains the old observed-anchor reset convention.
     ``velocity_weighting`` changes only the initial velocity for learned mode 2;
     its coefficients and the other completion modes are unchanged.
     """
@@ -102,7 +107,8 @@ def complete_plan(
     if old.ndim != 3 or old.shape[1] < 2:
         raise ValueError("old must have shape [batch, horizon >= 2, action_dim]")
     batch, horizon, _ = old.shape
-    if not isinstance(executed, int) or not 0 <= executed < horizon:
+    if not isinstance(executed, int) or not 0 <= executed <= horizon or (
+            executed == horizon and not allow_full_completion):
         raise ValueError("executed must satisfy 0 <= executed < horizon; K=H requires bootstrap")
     if robot_dt <= 0:
         raise ValueError("robot_dt must be positive")
@@ -140,7 +146,8 @@ def complete_plan(
     q = old[:, -1]
     p = (old[:, -1] - old[:, -2]) / robot_dt
     if use_learned:
-        fitted = completion_velocity(old, executed, robot_dt=robot_dt, weighting=velocity_weighting)
+        fitted = completion_velocity(old, executed, robot_dt=robot_dt, weighting=velocity_weighting,
+                                     allow_full_completion=allow_full_completion)
         p = torch.where((modes == 2)[:, None], fitted, p)
     tail = []
     for index in range(horizon - executed, horizon):
@@ -332,10 +339,12 @@ class LearnedCompletion(nn.Module):
         """Mean squared next-target error under teacher-observed transitions."""
         return (self.robot_dt * self.residuals(batch)).square().mean()
 
-    def complete(self, old, executed, obs_hist, act_hist, mode, *, velocity_weighting="last_pair"):
+    def complete(self, old, executed, obs_hist, act_hist, mode, *, velocity_weighting="last_pair",
+                 allow_full_completion=False):
         return complete_plan(old, executed, obs_hist, act_hist, mode, self,
                              robot_dt=self.robot_dt, action_semantics=self.action_semantics,
-                             velocity_weighting=velocity_weighting)
+                             velocity_weighting=velocity_weighting,
+                             allow_full_completion=allow_full_completion)
 
     @torch.no_grad()
     def diagnostics(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:

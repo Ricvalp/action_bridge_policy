@@ -89,10 +89,14 @@ def main(method, argv=None):
         stream.seek(0)
         checkpoint_hash = hashlib.file_digest(stream, "sha256").hexdigest()
     config = dict(state["config"])
+    if state.get("curriculum"):
+        # This is labeling only. execute remains deployment K, and the sampler
+        # is explicitly conditioned on actual evaluation K below.
+        config["active_k"] = state["curriculum"]["active_k"]
     if config["method"] != method:
         parser.error(f"Expected {method}, but checkpoint contains {config['method']}")
-    if method != "ddim" and config.get("protocol") != "self_source_v1":
-        parser.error("This command evaluates self_source_v1 revisers only; fixed-DDIM-source checkpoints are retired")
+    if method != "ddim" and config.get("protocol") not in ("self_source_v1", "self_source_k_curriculum_v1"):
+        parser.error("This command evaluates self-source revisers only; fixed-DDIM-source checkpoints are retired")
     if "ema" not in state:
         parser.error("Checkpoint has no EMA policy weights; a reference checkpoint is not a policy")
     if method.startswith("sb_") and state.get("direction") != "forward":
@@ -129,6 +133,10 @@ def main(method, argv=None):
     identity = dict(checkpoint=str(checkpoint), checkpoint_sha256=checkpoint_hash,
                     checkpoint_step=state["step"], weights="ema", method=method,
                     policy_direction=state.get("direction"),
+                    training_active_k=config.get("active_k", state["config"]["execute"]),
+                    deployment_k=state["config"]["execute"], execution_k=config["execute"],
+                    evaluation_panel=(f"deployment_k_{config['execute']}" if config["execute"] == state["config"]["execute"]
+                                      else f"diagnostic_k_{config['execute']}"),
                     training_direction=state.get("training_direction", state.get("direction")),
                     forward_updates=state.get("forward_updates"),
                     config=config, metadata=state["metadata"],

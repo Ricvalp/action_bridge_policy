@@ -40,8 +40,8 @@ def main(argv=None):
     config = dict(state["config"])
     if config["method"] not in ("fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic"):
         parser.error("Use an FM/SB policy checkpoint")
-    if config.get("protocol") != "self_source_v1":
-        parser.error("Use a self_source_v1 checkpoint")
+    if config.get("protocol") not in ("self_source_v1", "self_source_k_curriculum_v1"):
+        parser.error("Use a self-source checkpoint")
     mode = config.get("completion_id", 2) if args.completion is None else COMPLETION_NAMES.index(args.completion)
     try:
         velocity_identity = configure_completion_velocity_weighting(config, mode, args.completion_velocity_weighting)

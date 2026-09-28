@@ -97,6 +97,10 @@ class Tracker:
         self.run.define_metric("*", step_metric="train_step")
         self.run.define_metric("sim_eval/checkpoint_step")
         self.run.define_metric("sim_eval/*", step_metric="sim_eval/checkpoint_step")
+        if self.config.get("protocol") == "self_source_k_curriculum_v1":
+            panel = f"closed_loop/deployment_k_{self.config['execute']}"
+            self.run.define_metric(f"{panel}/checkpoint_step")
+            self.run.define_metric(f"{panel}/*", step_metric=f"{panel}/checkpoint_step")
         if options.mode == "online":
             record_path.write_text(json.dumps({**identity, "id": self.run.id}, indent=2) + "\n")
 
@@ -126,8 +130,13 @@ class Tracker:
             return
         with preserve_rng():
             self._start()
-            self.run.log({"sim_eval/checkpoint_step": int(step),
-                          **{f"sim_eval/{key}": value for key, value in metrics.items()}})
+            row = {"sim_eval/checkpoint_step": int(step),
+                   **{f"sim_eval/{key}": value for key, value in metrics.items()}}
+            if self.config.get("protocol") == "self_source_k_curriculum_v1":
+                panel = f"closed_loop/deployment_k_{self.config['execute']}"
+                row.update({f"{panel}/checkpoint_step": int(step),
+                            **{f"{panel}/{key}": value for key, value in metrics.items()}})
+            self.run.log(row)
 
     def images_due(self, step, final=False):
         return bool(self.options.enabled and self.options.image_count

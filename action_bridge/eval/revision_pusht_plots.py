@@ -10,6 +10,7 @@ import torch
 from action_bridge.eval.visualization import _draw_tee, _import_pyplot
 from action_bridge.plan_revision.completion import complete_plan, direct_tail_records
 from action_bridge.plan_revision.contracts import ActionCodec, take
+from action_bridge.plan_revision.curriculum import is_curriculum, replay_k, stage_config
 from action_bridge.plan_revision.data import build_self_sources, immutable_snapshot
 from action_bridge.plan_revision.training import restore_completion
 
@@ -26,13 +27,21 @@ def _example_indices(records, count):
                         dtype=torch.long)
 
 
-def _preview_replays(records, count, replans=3):
+def _preview_replays(records, count, replans=3, *, dense_execute=None):
     """A few short episode prefixes, including startup, keep logging cheap."""
     episodes = records["episode_id"].unique(sorted=True).tolist()[:count]
     indices, selected = [], []
     for episode in episodes:
         candidates = (records["episode_id"] == episode).nonzero().flatten()
-        candidates = candidates[records["time_index"][candidates].argsort()][:replans]
+        candidates = candidates[records["time_index"][candidates].argsort()]
+        if dense_execute is None:
+            candidates = candidates[:replans]
+        else:
+            # Preserve intermediate recorded windows for the stage replay;
+            # choose a plotted endpoint actually present on the stage's K grid.
+            last = min((replans - 1) * dense_execute,
+                       ((len(candidates) - 1) // dense_execute) * dense_execute)
+            candidates = candidates[:last + 1]
         indices.extend(candidates.tolist())
         selected.append(len(indices) - 1)
     return take(records, torch.tensor(indices, dtype=torch.long)), torch.tensor(selected, dtype=torch.long)
@@ -68,7 +77,7 @@ def _plot_chunk(path, state, expert, predicted, *, source=None, retained=None,
         if completed is not None:
             if retained is not None:
                 # Include the junction so the appended tail connects to the overlap.
-                tail = completed[len(retained) - 1:]
+                tail = completed[max(0, len(retained) - 1):]
                 ax.plot(*tail.T, "s--", color="tab:purple", markersize=4,
                         linewidth=1.5, label="Appended completion tail")
             else:
@@ -126,6 +135,19 @@ def make_action_chunk_plotter(records, config, metadata, output, device, *,
 
     @torch.no_grad()
     def plot(model, step):
+        nonlocal replay_windows, indices, batch, states, expert
+        block = 0
+        preview_config = config
+        if reviser and is_curriculum(config):
+            # At an exact boundary the just-finished block is being logged.
+            block = min(config["training_blocks"] - 1,
+                        max(0, step - 1) // (config["updates"] // config["training_blocks"]))
+            preview_config = stage_config(config, block)
+            replay_windows, indices = _preview_replays(records, count, dense_execute=replay_k(preview_config))
+            batch = take(replay_windows, indices, device)
+            state = batch["obs_hist"][:, -1]
+            states = (state * state.new_tensor(stats["obs_std"]) + state.new_tensor(stats["obs_mean"])).cpu().numpy()
+            expert = codec.decode(batch["future_actions"]).cpu().numpy()
         training_states = [(module, module.training) for module in model.modules()]
         model.eval()
         try:
@@ -141,7 +163,7 @@ def make_action_chunk_plotter(records, config, metadata, output, device, *,
                 replay, _ = build_self_sources(
                     replay_windows, immutable_snapshot(model), completion,
                     torch.as_tensor(dependencies["innovation_variance"], device=device),
-                    config, device, block=0, seed=int(config["seed"]) + 7301,
+                    preview_config, device, block=block, seed=int(config["seed"]) + 7301,
                     p_self=1., modes=(config.get("completion_id", 2),))
                 positions = []
                 for episode, timestamp in zip(batch["episode_id"].tolist(), batch["time_index"].tolist()):
@@ -159,13 +181,14 @@ def make_action_chunk_plotter(records, config, metadata, output, device, *,
                 if len(available):
                     previous = take(selected, available, device)
                     completed[available] = complete_plan(
-                        previous["old_actions"], config["execute"], previous["obs_hist"],
+                        previous["old_actions"], replay_k(preview_config), previous["obs_hist"],
                         previous["act_hist"], previous["completion_id"], completion,
                         robot_dt=config["robot_dt"],
-                        velocity_weighting=config.get("completion_velocity_weighting", "last_pair"))
+                        velocity_weighting=config.get("completion_velocity_weighting", "last_pair"),
+                        allow_full_completion=is_curriculum(config))
                     old_pixels = codec.decode(previous["old_actions"]).detach().cpu().numpy()
                     for index, old in zip(available.tolist(), old_pixels):
-                        retained_pixels[index] = old[config["execute"]:]
+                        retained_pixels[index] = old[replay_k(preview_config):]
             else:
                 prediction, _ = model.sample(batch["obs_hist"], batch["act_hist"], config.get("completion_id", 2),
                                              source_actions=None, reference=None, generator=generator)
@@ -181,7 +204,7 @@ def make_action_chunk_plotter(records, config, metadata, output, device, *,
                             source=None if source_pixels is None else source_pixels[index],
                             retained=retained_pixels[index],
                             completed=None if completed_pixels is None else completed_pixels[index],
-                            title=f"{method} | step {step:,}\nValidation episode {episode}, t={time_index}")
+                            title=f"{method} | step {step:,} | K={replay_k(preview_config)}\nValidation episode {episode}, t={time_index}")
                 paths.append(path)
             return paths
         finally:

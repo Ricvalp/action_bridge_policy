@@ -6,6 +6,7 @@ import torch
 
 from action_bridge.plan_revision.contracts import ActionCodec, take
 from action_bridge.plan_revision.completion import COMPLETION_NAMES
+from action_bridge.plan_revision.curriculum import is_curriculum
 from action_bridge.plan_revision.data import build_self_sources, immutable_snapshot
 from action_bridge.plan_revision.tracking import preserve_rng
 from action_bridge.plan_revision.training import restore_completion
@@ -64,6 +65,8 @@ def _validation_prefixes(payload, config, metadata, episodes, replans, seed):
             raise ValueError(f"Window cache and checkpoint differ in {key}")
     spec = payload.get("data_spec", {})
     for key in ("horizon", "execute", "obs_history", "action_history"):
+        if key == "execute" and is_curriculum(config):
+            continue  # Dense windows support every diagnostic/deployment K.
         if key in spec and spec[key] != config[key]:
             raise ValueError(f"Window cache and evaluation differ in {key}")
     records = payload["records"]["val"]
@@ -77,9 +80,11 @@ def _validation_prefixes(payload, config, metadata, episodes, replans, seed):
     indices = []
     for episode in selected:
         rows = (records["episode_id"] == episode).nonzero().flatten()
-        rows = rows[records["time_index"][rows].argsort()][:replans]
+        count = (replans - 1) * config["execute"] + 1 if is_curriculum(config) else replans
+        rows = rows[records["time_index"][rows].argsort()][:count]
         times = records["time_index"][rows]
-        if int(times[0]) != 0 or bool(((times[1:] - times[:-1]) != config["execute"]).any()):
+        spacing = 1 if is_curriculum(config) else config["execute"]
+        if int(times[0]) != 0 or bool(((times[1:] - times[:-1]) != spacing).any()):
             raise ValueError("Validation prefixes must start at episode time zero on the checkpoint's execute grid")
         indices.extend(rows.tolist())
     if not indices:
@@ -123,12 +128,17 @@ def diagnose_offline_sources(policy, config, metadata, dependencies, windows_pay
         raise ValueError("The requested completion mode was not trained in this checkpoint")
     with preserve_rng():
         windows, selected = _validation_prefixes(windows_payload, config, metadata, episodes, replans, seed)
+        replay_config = dict(config)
+        if is_curriculum(config):
+            # Diagnostic replay follows actual evaluation K, not the training
+            # block saved in an early checkpoint. No training config is mutated.
+            replay_config["k_values_by_block"] = [config["execute"]] * config["training_blocks"]
         rows = {"self": [], "expert": []}
         if config["execute"] < config["horizon"]:
             completion = restore_completion(dependencies, device)
             replay, _ = build_self_sources(
                 windows, immutable_snapshot(policy).to(device), completion,
-                torch.as_tensor(dependencies["innovation_variance"]), config, device,
+                torch.as_tensor(dependencies["innovation_variance"]), replay_config, device,
                 block=0, seed=seed, p_self=1., modes=(completion_id,),
             )
             codec = ActionCodec(**metadata["codec"])

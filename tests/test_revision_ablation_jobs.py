@@ -10,7 +10,9 @@ import sys
 import pytest
 import torch
 
-from action_bridge.configs.sb_pusht import METHODS, get_config
+from action_bridge.configs.sb_pusht import (
+    K_CURRICULUM_PROTOCOL, METHODS, get_config, get_k_curriculum_config,
+)
 
 
 JOBS = Path(__file__).resolve().parents[1] / "hpc/sb_pusht_ablations"
@@ -25,6 +27,8 @@ VARIANTS = {
     "completion_linear_k2", "completion_linear_k4",
     "completion_exp_half_k2", "completion_exp_half_k4",
     "completion_exp_quarter_k2", "completion_exp_quarter_k4",
+    "k_curriculum_sb_ou", "k_fixed8_sb_ou",
+    "k_curriculum_sb_kinetic", "k_fixed8_sb_kinetic",
 }
 
 COMPLETION_CASES = [
@@ -129,7 +133,7 @@ def test_configurations_cover_ready_experiments_and_valid_training_budgets():
     assert set(configs) == VARIANTS
     base = get_config()
     for variant, overrides in configs.items():
-        assert not set(overrides).difference(base), variant
+        assert not set(overrides).difference(get_k_curriculum_config()), variant
         config = base | overrides
         assert config["updates"] == 2 * config["rounds"] * config["phase_updates"]
         assert config["updates"] % config["training_blocks"] == 0
@@ -137,7 +141,11 @@ def test_configurations_cover_ready_experiments_and_valid_training_budgets():
         assert len(config["source_self_probabilities"]) == config["training_blocks"]
         assert all(0 <= probability <= 1 for probability in config["source_self_probabilities"])
         assert 1 <= config["execute"] <= config["horizon"]
-        assert config["protocol"] == "self_source_v1"
+        if variant.startswith(("k_curriculum_", "k_fixed8_")):
+            expected = get_k_curriculum_config(fixed_k=variant.startswith("k_fixed8_"))
+            assert config == expected | {"method": "ddim"}
+        else:
+            assert config["protocol"] == "self_source_v1"
         assert not config["external_bootstrap"]
         if variant.startswith("h"):
             horizon, execute = variant.split("_")
@@ -169,6 +177,87 @@ def test_configurations_cover_ready_experiments_and_valid_training_budgets():
                 "completion_velocity_weighting": weighting, "execute": execute}
             assert base | overrides == original | {"execute": execute}
             assert (base | overrides)["horizon"] == 16
+
+
+@pytest.mark.parametrize("method", ["sb_ou", "sb_kinetic"])
+@pytest.mark.parametrize("fixed_k", [False, True])
+def test_curriculum_jobs_prepare_fit_and_train_with_matched_controls(launch, method, fixed_k):
+    variant = ("k_fixed8_" if fixed_k else "k_curriculum_") + method
+    script = variant + ".sbatch"
+    content = (JOBS / script).read_text()
+    for directive in ("--partition=gpuq", "--gres=gpu:1", "--cpus-per-task=8",
+                      "--mem=64G", "--time=10:00:00"):
+        assert f"#SBATCH {directive}" in content
+    result = launch.run(script)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = launch.rows("python")
+    assert calls[0]["args"] == ["-"]
+    commands = [call["args"] for call in calls[1:]]
+    assert [command[:3] for command in commands] == [
+        ["-m", "action_bridge.scripts.sb_pusht", stage]
+        for stage in ("prepare", "reference", method)]
+    root = launch.campaign / variant
+    snapshot = root / "config.json"
+    config = get_config(method) | json.loads(snapshot.read_text())
+    assert config == get_k_curriculum_config(method, fixed_k=fixed_k)
+    assert config["protocol"] == K_CURRICULUM_PROTOCOL
+    assert config["horizon"] == 16 and config["execute"] == 8
+    assert config["condition_on_k"] and config["completion_id"] == 2
+    assert config["training_completion_modes"] == [0, 1, 2]
+    assert config["completion_velocity_weighting"] == "last_pair"
+    for command, device in zip(commands, ("cpu", "cuda", "cuda")):
+        assert option(command, "--run-root") == str(root)
+        assert option(command, "--config") == str(snapshot)
+        assert option(command, "--device") == device
+    for command in commands[1:]:
+        assert "--wandb" in command
+        assert option(command, "--wandb-project") == "sb-pusht-ablations"
+    training = commands[-1]
+    assert option(training, "--eval-every") == "10000"
+    assert option(training, "--eval-episodes") == "20"
+    assert option(training, "--eval-device") == "cpu"
+    assert option(training, "--eval-threads") == "2"
+    assert {"--sim-eval", "--eval-videos"}.issubset(training)
+    assert all(call["cuda"] == "7" for call in calls)
+    assert not launch.rows("sbatch")
+    frozen = snapshot.read_bytes()
+    assert launch.run(script).returncode != 0
+    assert snapshot.read_bytes() == frozen
+    assert [call for call in launch.rows("python") if call["args"] != ["-"]] == calls[1:]
+
+
+def test_curriculum_config_is_explicit_and_leaves_fixed_defaults_unchanged():
+    fixed = get_config("sb_ou")
+    assert fixed["protocol"] == "self_source_v1"
+    assert "condition_on_k" not in fixed and "k_values_by_block" not in fixed
+    curriculum = get_k_curriculum_config()
+    control = get_k_curriculum_config(fixed_k=True)
+    assert curriculum["k_values_by_block"] == [1, 2, 4, 8]
+    assert control == curriculum | {"k_values_by_block": [8, 8, 8, 8]}
+    assert curriculum["updates"] == 300000
+    assert curriculum["reference_updates"] == 20000
+    assert curriculum["startup_sampling_fraction"] == .1
+    assert get_config("sb_ou") == fixed
+
+
+@pytest.mark.parametrize("method", ["sb_ou", "sb_kinetic"])
+@pytest.mark.parametrize("prefix", ["k_curriculum_", "k_fixed8_"])
+def test_curriculum_named_presets_submit_only_their_named_method(launch, method, prefix):
+    result = launch.run("submit.sh", prefix + method)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = launch.rows("sbatch")
+    assert len(calls) == 3
+    assert calls[-1]["args"][-1] == method
+
+
+def test_documented_curriculum_smoke_covers_all_four_stages():
+    path = JOBS.parents[1] / "docs/configs/sb_pusht_k_curriculum_smoke.json"
+    config = get_config("sb_ou") | json.loads(path.read_text())
+    assert config["k_values_by_block"] == [1, 2, 4, 8]
+    assert config["training_blocks"] == config["rounds"] == 4
+    assert config["updates"] == 2 * config["rounds"] * config["phase_updates"] == 8
+    assert config["execute"] == 8 and config["horizon"] == 16
+    assert config["reference_updates"] == 2
 
 
 @pytest.mark.parametrize("weighting, execute", COMPLETION_CASES)

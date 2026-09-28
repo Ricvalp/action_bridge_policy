@@ -77,8 +77,8 @@ def main(argv=None):
         parser.error(f"Unsupported revision method: {method!r}; expected one of {METHODS}")
     if (config.get("obs_dim"), config.get("action_dim")) != (5, 2):
         parser.error("Visualization requires the Push-T 5-state/2-target adapter")
-    if config.get("protocol") != "self_source_v1":
-        parser.error("Visualization requires a self_source_v1 reviser checkpoint")
+    if config.get("protocol") not in ("self_source_v1", "self_source_k_curriculum_v1"):
+        parser.error("Visualization requires a self_source_v1 or self_source_k_curriculum_v1 reviser checkpoint")
     if "ema" not in state:
         parser.error("Checkpoint has no EMA policy weights; a reference checkpoint is not a policy")
     if method.startswith("sb_") and state.get("direction") != "forward":

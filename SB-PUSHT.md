@@ -1,5 +1,14 @@
 # SB-PUSHT: conditional Schrödinger-bridge revision of Push-T action chunks
 
+**Active protocol note:** [Addendum A](SB-PUSHT-ADDENDUM.md) defines the
+`self_source_v1` fixed-K implementation and overrides the original source-policy
+instructions below. Opting into `self_source_k_curriculum_v1` additionally applies
+[Addendum B](CODEX_K_CURRICULUM_ADDENDUM.md): training K changes by complete block
+(`1 → 2 → 4 → 8`), H stays 16, and headline deployment evaluation stays K=8.
+It adds explicit K conditioning and new cache/model identity; old checkpoints
+remain fixed-K runs. Neither protocol is launched automatically. Commands and
+matched fixed-K controls are in [the implementation guide](docs/SB_PUSHT.md#k-curriculum-addendum-b).
+
 ## 0. Assignment and scope
 
 Implement **one substantive, closed-loop, low-dimensional Push-T experiment** in the existing `action_bridge_policy` repository. Implement its policies and training algorithms as reusable, dataset-independent components; Push-T is the first configuration, not the boundary of their implementation. The mandatory portability contract is in Section 1.1.

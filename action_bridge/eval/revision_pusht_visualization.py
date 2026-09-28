@@ -80,7 +80,8 @@ def _prepare(episode, config, start_replan, replans):
         trace["old_executed"] = consumed
         aligned = trace.get("aligned_old_raw")
         trace["aligned_old_raw"] = (None if aligned is None else
-                                    _array(aligned, (horizon - consumed, 2), "aligned_old_raw"))
+                                    _array(np.asarray(aligned).reshape(-1, 2),
+                                           (horizon - consumed, 2), "aligned_old_raw"))
         startup = bool(trace.get("startup", False)) or not bool(trace.get("has_previous_plan", False))
         trace["startup"] = startup
         if not startup and aligned is None:

@@ -71,6 +71,7 @@ class FieldNet(nn.Module):
         self.n = self.horizon * self.action_dim
         self.kinetic = kinetic
         self.state_dim = self.n * (2 if kinetic else 1)
+        self.condition_on_k = bool(config.get("condition_on_k", False))
         history_dim = int(config.get("history_dim", 256))
         time_dim = int(config.get("time_dim", 64))
         mode_dim = int(config.get("mode_dim", 16))
@@ -78,6 +79,10 @@ class FieldNet(nn.Module):
         if not channels or any(x < 8 or x % 8 for x in channels):
             raise ValueError("channels must be nonempty positive multiples of eight")
         self.history_encoder = _history_encoder(config, encoder)
+        if self.condition_on_k:
+            # One fixed-width branch for the whole run, never rebuilt at a K
+            # boundary. The normalized planned interval is not revision time.
+            self.k_embedding = nn.Sequential(nn.Linear(1, 16), nn.SiLU(), nn.Linear(16, history_dim))
         self.time_embedding = nn.Sequential(
             SinusoidalTimeEmbedding(time_dim), nn.Linear(time_dim, 4 * time_dim),
             nn.SiLU(), nn.Linear(4 * time_dim, time_dim),
@@ -95,8 +100,20 @@ class FieldNet(nn.Module):
             history_dim + time_dim + mode_dim + 1, output_dim=self.action_dim,
         )
 
-    def conditioning(self, obs_hist, act_hist, mode, has_previous_plan=None):
+    def conditioning(self, obs_hist, act_hist, mode, has_previous_plan=None, execution_k=None):
         history = self.history_encoder(obs_hist, act_hist)
+        if self.condition_on_k:
+            if execution_k is None:
+                raise ValueError("K-conditioned revisers require the actual execution_k")
+            interval = torch.as_tensor(execution_k, device=history.device)
+            if interval.ndim > 1 or interval.numel() not in (1, history.shape[0]):
+                raise ValueError("execution_k must be an integer scalar or [batch]")
+            if interval.dtype == torch.bool or not bool((interval == interval.round()).all()):
+                raise ValueError("execution_k must contain integers")
+            if not bool(((interval >= 1) & (interval <= self.horizon)).all()):
+                raise ValueError("execution_k must satisfy 1 <= K <= H")
+            interval = interval.to(history.dtype).expand(history.shape[0])
+            history = history + self.k_embedding(interval[:, None] / self.horizon)
         mode = torch.as_tensor(mode, device=history.device, dtype=torch.long).expand(history.shape[0])
         if bool(((mode < 0) | (mode >= self.mode_embedding.num_embeddings)).any()):
             raise ValueError("completion_id is not supported by this policy's mode embedding")
@@ -122,8 +139,9 @@ class FieldNet(nn.Module):
         condition = torch.cat((conditioning, self.time_embedding(100 * tau)), dim=-1)
         return self.unet(chunk, condition).reshape(-1, self.n)
 
-    def forward(self, state, tau, obs_hist, act_hist, mode, has_previous_plan=None):
-        return self.conditioned(state, tau, self.conditioning(obs_hist, act_hist, mode, has_previous_plan))
+    def forward(self, state, tau, obs_hist, act_hist, mode, has_previous_plan=None, execution_k=None):
+        return self.conditioned(state, tau, self.conditioning(
+            obs_hist, act_hist, mode, has_previous_plan, execution_k))
 
 
 class DDIMChunkPolicy(nn.Module):
@@ -167,8 +185,8 @@ class DDIMChunkPolicy(nn.Module):
 
     @torch.no_grad()
     def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None,
-               generator=None, has_previous_plan=None):
-        del mode, source_actions, reference, has_previous_plan
+               generator=None, has_previous_plan=None, execution_k=None):
+        del mode, source_actions, reference, has_previous_plan, execution_k
         actions = self.policy.generate(obs_hist, act_hist, generator=generator)
         return actions, {"nfe": self.policy.num_inference_steps}
 
@@ -192,13 +210,13 @@ class FlowMatchingPolicy(nn.Module):
         tau = torch.rand(len(target), device=target.device, dtype=target.dtype, generator=generator)
         state = torch.lerp(source, target, tau[:, None, None])
         prediction = self.field(state.flatten(1), tau, batch["obs_hist"], batch["act_hist"],
-                                get_completion_ids(batch), batch.get("has_previous_plan"))
+                                get_completion_ids(batch), batch.get("has_previous_plan"), batch.get("execution_k"))
         loss = F.mse_loss(prediction, (target - source).flatten(1))
         return {"loss": loss, "velocity_mse": loss.detach()}
 
     @torch.no_grad()
     def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None,
-               generator=None, has_previous_plan=None, trace=False):
+               generator=None, has_previous_plan=None, trace=False, execution_k=None):
         """Integrate the plan field with two NFEs per accepted midpoint step.
 
         With ``trace=True``, diagnostics include the initial source and every
@@ -209,7 +227,7 @@ class FlowMatchingPolicy(nn.Module):
         del reference, generator
         if source_actions is None or source_actions.shape[1:] != (self.horizon, self.action_dim):
             raise ValueError("FM requires an aligned/completed source_actions chunk")
-        conditioning = self.field.conditioning(obs_hist, act_hist, mode, has_previous_plan)
+        conditioning = self.field.conditioning(obs_hist, act_hist, mode, has_previous_plan, execution_k)
         state = source_actions.flatten(1)
         steps = self.num_inference_steps // 2
         dt = 1.0 / steps
@@ -277,7 +295,7 @@ class BridgePolicy(nn.Module):
             weights = distance.pow(3 if self.kinetic else 1)
         field = self.forward_field if direction == "forward" else self.reverse_field
         prediction = field(state, tau, batch["obs_hist"], batch["act_hist"],
-                           get_completion_ids(batch), batch.get("has_previous_plan"))
+                           get_completion_ids(batch), batch.get("has_previous_plan"), batch.get("execution_k"))
         error = (prediction - regression_target).square().mean(-1)
         loss = (weights * error).mean()
         return {"loss": loss, "control_mse": error.mean().detach(),
@@ -285,7 +303,7 @@ class BridgePolicy(nn.Module):
 
     @torch.no_grad()
     def rollout(self, state, obs_hist, act_hist, mode, reference, *, reverse=False,
-                generator=None, steps=None, has_previous_plan=None, trace=False):
+                generator=None, steps=None, has_previous_plan=None, trace=False, execution_k=None):
         """Reverse time is increasing clock s; the field still receives tau=1-s.
 
         ``trace=True`` records the initial positions and the positions after
@@ -299,7 +317,7 @@ class BridgePolicy(nn.Module):
         if count < 1:
             raise ValueError("rollout steps must be positive")
         field = self.reverse_field if reverse else self.forward_field
-        conditioning = field.conditioning(obs_hist, act_hist, mode, has_previous_plan)
+        conditioning = field.conditioning(obs_hist, act_hist, mode, has_previous_plan, execution_k)
         grid = .5 - .5 * torch.cos(torch.linspace(0, math.pi, count + 1, device=state.device, dtype=state.dtype))
         energy = torch.zeros(len(state), device=state.device, dtype=state.dtype)
         # Candidate plans in revision time, not physical trajectories.
@@ -322,7 +340,7 @@ class BridgePolicy(nn.Module):
 
     @torch.no_grad()
     def sample(self, obs_hist, act_hist, mode=None, *, source_actions=None, reference=None,
-               generator=None, has_previous_plan=None, trace=False):
+               generator=None, has_previous_plan=None, trace=False, execution_k=None):
         """Sample a revised plan, optionally tracing every rollout position."""
         if source_actions is None or source_actions.shape[1:] != (self.horizon, self.action_dim):
             raise ValueError("SB requires an aligned/completed source_actions chunk")
@@ -331,7 +349,7 @@ class BridgePolicy(nn.Module):
         state = reference.augment(source_actions.flatten(1), generator=generator)
         state, metrics = self.rollout(state, obs_hist, act_hist, mode, reference,
                                       generator=generator, has_previous_plan=has_previous_plan,
-                                      trace=trace)
+                                      trace=trace, execution_k=execution_k)
         return reference.positions(state).reshape_as(source_actions), metrics
 
 
@@ -339,6 +357,13 @@ def build_policy(config: Mapping, *, encoder: nn.Module | None = None) -> nn.Mod
     """Rebuild a generator from its saved shape/config, without data or simulation."""
     from action_bridge.plan_revision.cache import reference_kind_for
     reference_kind_for(config)
+    conditioned = bool(config.get("condition_on_k", False))
+    schema = config.get("model_schema", "fixed_k_v1")
+    if schema != ("k_conditioned_v1" if conditioned else "fixed_k_v1"):
+        raise ValueError("model_schema and condition_on_k disagree; checkpoint migration must be explicit")
+    if (config.get("protocol") == "self_source_k_curriculum_v1"
+            and config["method"] != "ddim" and not conditioned):
+        raise ValueError("The K curriculum requires condition_on_k with model_schema=k_conditioned_v1")
     encoder_spec = config.get("encoder_spec", {"kind": "HistoryEncoder", "observations": "flat_tensor"})
     if encoder is None and (
         not isinstance(encoder_spec, Mapping)

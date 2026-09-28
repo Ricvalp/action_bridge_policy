@@ -2,6 +2,7 @@
 METHODS = ("ddim", "fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic")
 COMPLETIONS = ("repeat", "fixed_damped", "learned_dissipative", "direct_mlp")
 PROTOCOL = "self_source_v1"
+K_CURRICULUM_PROTOCOL = "self_source_k_curriculum_v1"
 
 
 def get_config(method="ddim"):
@@ -34,3 +35,18 @@ def get_config(method="ddim"):
                 max_episode_steps=300, completion_id=2,
                 encoder_spec={"kind": "HistoryEncoder", "observations": "flat_tensor"},
                 sampler_spec={"ddim": "eta=0", "fm": "midpoint16", "sb": "exact_linear_cosine32"})
+
+
+def get_k_curriculum_config(method="sb_ou", *, fixed_k=False):
+    """Opt-in Addendum B, or its K-conditioned fixed-K matched control.
+
+    ``execute`` remains the deployment interval. Training replay uses one
+    ``k_values_by_block`` entry per existing source block / complete SB round.
+    Legacy ``get_config()`` deliberately keeps its original dictionary.
+    """
+    return get_config(method) | dict(
+        protocol=K_CURRICULUM_PROTOCOL,
+        k_values_by_block=[8, 8, 8, 8] if fixed_k else [1, 2, 4, 8],
+        condition_on_k=True, model_schema="k_conditioned_v1",
+        startup_sampling_fraction=.1, completion_velocity_weighting="last_pair",
+    )

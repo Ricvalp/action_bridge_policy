@@ -1,11 +1,108 @@
 # Whole-plan revision on Push-T
 
-The active experiment is **self_source_v1**, defined in
+The default experiment is **self_source_v1**, defined in
 [SB-PUSHT-ADDENDUM.md](../SB-PUSHT-ADDENDUM.md). It replaces the fixed-DDIM-source
 protocol; old runs remain untouched and are not rows in this comparison.
 The [edited plan](../SB-PUSHT_EDIT.md) describes the reusable interfaces and
 OU/kinetic mathematics. This is offline behavior cloning, separate from the
 existing Action Bridge loss.
+
+## K curriculum (Addendum B)
+
+Opt into **`self_source_k_curriculum_v1`** to train with K=1,2,4,8 in four
+75k-update blocks, keeping H=16. Each SB block is a complete 37.5k reverse /
+37.5k forward round. The expert/self mixture stays unchanged. At boundaries,
+the current forward EMA is frozen for a fresh sequence replay on the new K grid;
+old-K source and coupling samples are not relabeled or reused.
+
+The main evaluation always executes **K=8**, including checkpoints trained so
+far only at smaller K. It measures deployment-K transfer, not performance at
+the current training K. K conditioning is a fixed-width input to all revisers;
+the model is not rebuilt between stages. DDIM training itself is unchanged.
+
+The learned completer/reference is fitted once, then frozen. The supplied
+curriculum presets follow Addendum B's **last-pair initialization** from the
+full previous plan, including when K=H has no retained overlap. The existing
+whole-suffix weighting choices remain available as separate overrides.
+The three completion modes are still balanced in training; the main evaluation
+uses learned dissipative completion. Startup sampling is explicitly held at
+10% instead of varying accidentally with the number of replay decisions.
+
+This is still **offline imitation**: observation and executed-command histories
+come from demonstrations, not execution of generated plans. The curriculum does
+not make replay on-policy or supply recovery labels for unseen physical states.
+Smaller K also requires more source-generation calls; equal optimization budgets
+are not equal total compute. Source/curriculum logs report this separately.
+The optional simulator-mismatch probe and gated advancement are not implemented:
+the replay observations alone are not exact restorable simulator snapshots.
+
+### Short wiring smoke
+
+From the repository root with the existing environment and replay dataset:
+
+```bash
+export PUSHT_DATASET="$PWD/workspace/datasets/pusht/pusht_cchi_v7_replay.zarr"
+run_root="$PWD/workspace/sb_pusht/k-smoke-$(date -u +%Y%m%dT%H%M%S%NZ)"
+config="$PWD/docs/configs/sb_pusht_k_curriculum_smoke.json"
+
+for stage in prepare reference sb_ou; do
+  .venv-sb-pusht/bin/python -m action_bridge.scripts.sb_pusht "$stage" \
+    --dataset "$PUSHT_DATASET" --run-root "$run_root" --config "$config" \
+    --device cpu --threads 2 --no-sim-eval
+done
+```
+
+This fits a tiny model for eight updates across all four stages (plus two
+reference updates), using 1% of the training episodes. It tests wiring, not
+learning quality. Replay still traverses the selected episodes; it is not eight
+simulator steps. `sb_kinetic` can be run in the same smoke root after the reference.
+
+### Substantive run, resume, and evaluation
+
+For the H200 scripts and matched fixed-K controls, see
+[the curriculum jobs](../hpc/sb_pusht_ablations/README.md#k-curriculum-and-matched-fixed-k-controls).
+The equivalent direct OU-SB run is:
+
+```bash
+run_root="$PWD/workspace/sb_pusht/k-curriculum-$(date -u +%Y%m%dT%H%M%S%NZ)"
+config="$PWD/hpc/sb_pusht_ablations/configs/k_curriculum_sb_ou.json"
+for stage in prepare reference sb_ou; do
+  .venv-sb-pusht/bin/python -m action_bridge.scripts.sb_pusht "$stage" \
+    --dataset "$PUSHT_DATASET" --run-root "$run_root" --config "$config" \
+    --device cuda --wandb --wandb-project sb-pusht-ablations \
+    --eval-every 10000 --eval-episodes 20 --eval-device cpu --eval-videos
+done
+
+# Resume an interrupted policy: use the SAME run_root and config, not a new date.
+.venv-sb-pusht/bin/python -m action_bridge.scripts.sb_pusht sb_ou \
+  --dataset "$PUSHT_DATASET" --run-root "$run_root" --config "$config" \
+  --device cuda --wandb --wandb-project sb-pusht-ablations \
+  --eval-every 10000 --eval-episodes 20 --eval-device cpu --eval-videos
+
+# Standalone held-out evaluation: actual execution and K conditioning both use 8.
+.venv-sb-pusht/bin/python -m action_bridge.scripts.eval_pusht_sb_ou \
+  --checkpoint "$run_root/sb_ou/best.pt" --execute 8 \
+  --completion learned_dissipative --device cpu --workers 4 --threads 1 \
+  --episodes 50 --seed 1000000 --save-videos
+```
+
+Do not change the schedule or initialization inside an existing run. Resumption
+restores the active source snapshot, stage, direction, optimizer and RNG state.
+Keep the run's `sources/` artifacts with its checkpoint when transferring a
+resumable training run; an evaluation-only checkpoint is self-contained.
+
+For an isolated curriculum comparison, repeat the substantive command in a
+**fresh root** with `configs/k_fixed8_sb_ou.json` instead: the K-conditioned model,
+source-mixture schedule, startup sampling, learned components and update budget
+match, but every block uses K=8. Use the analogous `sb_kinetic` files/module to
+repeat both conditions for kinetic-SB. Existing fixed-K results without the new
+conditioning branch are a broader comparison, not this matched control.
+
+For the unchanged legacy fixed-K protocol, use a separate fresh root and
+`--config hpc/sb_pusht_ablations/configs/baseline_seed0.json` in the same
+prepare/reference/train commands. Existing legacy runs continue to resume with
+their original saved configuration. There is no automatic checkpoint migration
+or cross-protocol cache reuse; select the curriculum for a new run explicitly.
 
 ## HPC (Peano)
 

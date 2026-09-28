@@ -10,6 +10,7 @@ import torch
 from action_bridge.plan_revision.cache import reference_for
 from action_bridge.plan_revision import checkpoints
 from action_bridge.plan_revision.contracts import take, tree_map
+from action_bridge.plan_revision.curriculum import is_curriculum
 from action_bridge.plan_revision.data import build_self_sources, immutable_snapshot
 from action_bridge.plan_revision.training import restore_completion
 
@@ -17,7 +18,7 @@ from action_bridge.plan_revision.training import restore_completion
 REVISERS = ("fm_paired", "fm_local_ot", "sb_ou", "sb_kinetic")
 
 
-def _probe_windows(windows, count):
+def _probe_windows(windows, count, *, execute=None):
     """Fixed early histories with their complete recorded replay prefixes."""
     indices, ordinary = [], 0
     for episode in windows["episode_id"].unique(sorted=True):
@@ -25,7 +26,7 @@ def _probe_windows(windows, count):
         rows = rows[windows["time_index"][rows].argsort()]
         for offset, index in enumerate(rows.tolist()):
             indices.append(index)
-            ordinary += int(offset > 0)
+            ordinary += int(offset > 0 and (execute is None or int(windows["time_index"][index]) % execute == 0))
             if ordinary >= count:
                 return take(windows, torch.tensor(indices))
     if ordinary < count:
@@ -58,13 +59,18 @@ def _probe_metrics(initial, final, target, threshold, split):
 def _build_probe_pools(policies, windows_by_split, configs, dependencies, completion, device, count):
     pools, replay_info = {}, {}
     for split, seed in (("validation", 73001), ("test", 73002)):
-        windows = _probe_windows(windows_by_split[split], count)
+        first = next(iter(configs.values()))
+        windows = _probe_windows(windows_by_split[split], count,
+                                execute=first["execute"] if is_curriculum(first) else None)
         batches, expected_keys = [], None
         for origin, method in enumerate(REVISERS):
+            config = dict(configs[method])
+            if is_curriculum(config):
+                config["k_values_by_block"] = [config["execute"]] * config["training_blocks"]
             records, info = build_self_sources(
                 windows, immutable_snapshot(policies[method]), completion,
                 torch.as_tensor(dependencies["innovation_variance"], device=device),
-                configs[method], device, block=3, seed=seed + origin, p_self=1.,
+                config, device, block=3, seed=seed + origin, p_self=1.,
                 modes=(configs[method].get("completion_id", 2),))
             indices = records["has_previous_plan"].nonzero().flatten()[:count]
             if len(indices) != count:
@@ -94,8 +100,12 @@ def common_source_probe(policies, windows_by_split, configs, dependencies, devic
     if count < 1:
         raise ValueError("Probe count must be positive")
     for config in configs.values():
-        if config.get("protocol") != "self_source_v1":
+        if config.get("protocol") not in ("self_source_v1", "self_source_k_curriculum_v1"):
             raise ValueError("Legacy source laws cannot enter the replacement probe")
+    protocols = {config["protocol"] for config in configs.values()}
+    if len(protocols) != 1 or len({config["execute"] for config in configs.values()}) != 1:
+        raise ValueError("A common-source probe requires matching protocols and actual execution K")
+    protocol = next(iter(protocols))
     if len({config.get("completion_id", 2) for config in configs.values()}) != 1:
         raise ValueError("A common-source probe requires the same completion mode across revisers")
     if len({config.get("completion_velocity_weighting", "last_pair") for config in configs.values()}) != 1:
@@ -103,7 +113,7 @@ def common_source_probe(policies, windows_by_split, configs, dependencies, devic
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if any(config["execute"] == config["horizon"] for config in configs.values()):
-        result = {"protocol": "self_source_v1", "status": "not_applicable",
+        result = {"protocol": protocol, "status": "not_applicable",
                   "reason": "K=H exhausts every plan; there are no retained old-plan overlaps to probe."}
         (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         return result
@@ -119,7 +129,7 @@ def common_source_probe(policies, windows_by_split, configs, dependencies, devic
     if artifact.exists():
         saved = torch.load(artifact, map_location="cpu", weights_only=False)
         if (saved["provenance"] != provenance or saved["count_per_origin"] != count
-                or saved["protocol"] != "self_source_v1"):
+                or saved["protocol"] != protocol):
             raise ValueError("Existing frozen common-source probe has different data, models or settings")
         pools, threshold = saved["pools"], saved["threshold_from_validation_mse"]
     else:
@@ -127,12 +137,12 @@ def common_source_probe(policies, windows_by_split, configs, dependencies, devic
                                                completion, device, count)
         validation = pools["validation"]
         threshold = float((validation["source_actions"] - validation["future_actions"]).square().mean((1, 2)).median())
-        torch.save({"protocol": "self_source_v1", "pools": tree_map(lambda x: x.detach().cpu(), pools),
+        torch.save({"protocol": protocol, "pools": tree_map(lambda x: x.detach().cpu(), pools),
                     "origin_methods": REVISERS, "count_per_origin": count,
                     "threshold_from_validation_mse": threshold, "replay": replay_info,
                     "provenance": provenance}, artifact)
     batch = take(pools["test"], slice(None), device)
-    result = {"protocol": "self_source_v1", "source_artifact": artifact.name,
+    result = {"protocol": protocol, "source_artifact": artifact.name,
               "source_sha256": checkpoints.digest(artifact), "records": len(batch["source_actions"]),
               "count_per_origin": count, "origin_methods": list(REVISERS),
               "threshold_from_validation_mse": threshold, "coordinate_units": "normalized action units",
@@ -146,7 +156,8 @@ def common_source_probe(policies, windows_by_split, configs, dependencies, devic
         final, _ = model.sample(batch["obs_hist"], batch["act_hist"], batch["completion_id"],
             source_actions=batch["source_actions"], reference=reference,
             generator=torch.Generator(device=device).manual_seed(73003),
-            has_previous_plan=batch["has_previous_plan"])
+            has_previous_plan=batch["has_previous_plan"],
+            **({"execution_k": batch["execution_k"]} if config.get("condition_on_k", False) else {}))
         if not bool(final.isfinite().all()):
             raise ValueError(f"Nonfinite common-source predictions from {method}")
         result["methods"][method] = _probe_metrics(batch["source_actions"], final,
@@ -167,9 +178,9 @@ def report(root):
         item = json.loads(path.read_text())
         protocol = item.get("protocol", item.get("identity", {}).get("protocol",
                             item.get("metrics", {}).get("protocol")))
-        if protocol != "self_source_v1":
+        if protocol not in ("self_source_v1", "self_source_k_curriculum_v1"):
             continue
-        row = {"name": path.parent.name, "training_seconds": item["training_seconds"],
+        row = {"name": path.parent.name, "protocol": protocol, "training_seconds": item["training_seconds"],
                "cache_seconds": item["cache_seconds"], "parameters": item["parameters"],
                "source_cache_seconds": item.get("source_cache_seconds", 0.),
                "optimizer_updates": item.get("optimizer_updates"),
@@ -194,7 +205,8 @@ def report(root):
         figure.tight_layout()
         figure.savefig(root / "success.png")
         plt.close(figure)
-    lines = ["# Whole-plan Push-T experiment — self_source_v1", "",
+    protocol = manifest.get("config", {}).get("protocol", "self_source_v1")
+    lines = [f"# Whole-plan Push-T experiment — {protocol}", "",
              f"Completed evaluation rows: {len(rows)}.", "",
              "One training seed; these results do not establish seed robustness or exact SB optimality.",
              "Each reviser learns from its own frozen EMA replay with early expert-old-plan mixing; "
@@ -226,9 +238,13 @@ def report(root):
         if path.exists():
             from action_bridge.plan_revision.checkpoints import load
             state = load(path)
-            if state["config"].get("protocol") != "self_source_v1":
+            if state["config"].get("protocol") not in ("self_source_v1", "self_source_k_curriculum_v1"):
                 continue
             lines.append(f"\n{stage}: {state['step']} updates; complete={state.get('complete', False)}; "
                          f"reported training time {state.get('training_seconds', 0):.1f}s.")
+            if is_curriculum(state["config"]):
+                active = (state.get("curriculum") or {}).get("active_k", state["config"].get("active_k"))
+                lines.append(f"Active training K={active}; "
+                             f"deployment K={state['config']['execute']}. Offline replay is not physically on-policy.")
     (root / "REPORT.md").write_text("\n".join(lines) + "\n")
     return rows

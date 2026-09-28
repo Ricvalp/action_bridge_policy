@@ -19,6 +19,9 @@ from action_bridge.plan_revision import checkpoints
 from action_bridge.plan_revision.cache import draw_records, reference_for, refresh_coupling
 from action_bridge.plan_revision.completion import DirectTailPredictor, LearnedCompletion, direct_tail_records
 from action_bridge.plan_revision.contracts import take
+from action_bridge.plan_revision.curriculum import (
+    is_curriculum, replay_k, scheduled_k, stage_config, stage_windows, validate_curriculum,
+)
 from action_bridge.plan_revision.models import build_policy
 from action_bridge.plan_revision.tracking import preserve_rng
 
@@ -91,7 +94,7 @@ def _block_sources(windows, ema, completion, dependencies, config, metadata,
     seed = config.get("source_seed", 17) + block
     probability = config["source_self_probabilities"][block]
     identity = {
-        "protocol": "self_source_v1", "method": config["method"], "block": block,
+        "protocol": config.get("protocol", "self_source_v1"), "method": config["method"], "block": block,
         "seed": seed, "p_self": probability,
         "normalizer_schema_sha256": checkpoints.content_digest(metadata),
         "completion_sha256": checkpoints.content_digest(dependencies["completion_state"]),
@@ -100,6 +103,12 @@ def _block_sources(windows, ema, completion, dependencies, config, metadata,
         "config_sha256": checkpoints.content_digest({key: value for key, value in config.items()
                                            if key != "validation_every"}),
     }
+    replay_config = stage_config(config, block) if is_curriculum(config) else config
+    if is_curriculum(config):
+        identity.update(active_k=replay_k(replay_config), deployment_k=config["execute"],
+                        schedule=config["k_values_by_block"], model_schema=config["model_schema"],
+                        elapsed_convention="zero_at_startup_else_elapsed_robot_steps",
+                        overlap_convention="retained_true_completed_false_startup_all_false")
     if "direct_tail_state" in dependencies:
         identity["direct_tail_sha256"] = checkpoints.content_digest(dependencies["direct_tail_state"])
     folder = Path(output) / "sources" / f"block_{block:03d}"
@@ -139,6 +148,8 @@ def _block_sources(windows, ema, completion, dependencies, config, metadata,
             records_sha256 = checkpoints.content_digest(records)
             if records_sha256 != artifact["records_sha256"]:
                 raise ValueError("Source cache content hash mismatch")
+            if is_curriculum(config):
+                diagnostics["source_cache_bytes"] = cache_path.stat().st_size
         else:
             if str(device) != replay_device:
                 raise ValueError(f"Rebuild this missing source cache on its original device ({replay_device}), "
@@ -148,7 +159,7 @@ def _block_sources(windows, ema, completion, dependencies, config, metadata,
             try:
                 records, diagnostics = build_self_sources(
                     windows, producer, completion, dependencies["innovation_variance"],
-                    config, device, block=block, seed=seed, p_self=probability,
+                    replay_config, device, block=block, seed=seed, p_self=probability,
                     modes=config.get("training_completion_modes", (0, 1, 2)))
             except SourceReplayError as error:
                 log(Path(output) / "source_replay.jsonl", {**provenance, **error.diagnostics,
@@ -162,6 +173,8 @@ def _block_sources(windows, ema, completion, dependencies, config, metadata,
             torch.save(dict(records=records, diagnostics=diagnostics, provenance=provenance,
                             records_sha256=records_sha256), temporary)
             temporary.replace(cache_path)
+            if is_curriculum(config):
+                diagnostics["source_cache_bytes"] = cache_path.stat().st_size
             log(Path(output) / "source_replay.jsonl", {**provenance, **diagnostics,
                  "records_sha256": records_sha256, "source_cache_seconds": replay_seconds,
                  "rebuilt": saved is not None})
@@ -171,6 +184,58 @@ def _block_sources(windows, ema, completion, dependencies, config, metadata,
             raise ValueError("self_source_v1 requires fixed completed sources, modes and startup masks")
     provenance["records_sha256"] = records_sha256
     return records, provenance, replay_seconds, diagnostics
+
+
+def _curriculum_state(config, block, step):
+    """The checkpoint describes the last trained block, including pending promotion."""
+    if not is_curriculum(config):
+        return None
+    width = config["updates"] // config["training_blocks"]
+    active = scheduled_k(config, max(block, 0))
+    return dict(protocol=config["protocol"], block=block, active_k=active,
+                deployment_k=config["execute"], values_by_block=config["k_values_by_block"],
+                model_schema=config["model_schema"], updates_in_block=step - max(block, 0) * width,
+                pending_transition=0 < step < config["updates"] and step % width == 0,
+                final_k_reached=block == config["training_blocks"] - 1)
+
+
+def _validate_curriculum_cache(cache, provenance, source, phase, active):
+    """Never resume old-K endpoint pairs under a newly prescribed source law."""
+    if cache is None:
+        return
+    if (provenance is None or provenance.get("active_k") != active
+            or provenance.get("source_hash") != source["version"]
+            or provenance.get("source_block") != source["block"]
+            or provenance.get("phase") != phase):
+        raise ValueError("Curriculum coupling cache has stale K/source/phase provenance")
+    if "execution_k" not in cache or not bool((cache["execution_k"] == active).all()):
+        raise ValueError("Curriculum coupling records have stale or missing K conditioning")
+
+
+@torch.no_grad()
+def _region_diagnostics(policy, records, config, device):
+    """Per-coordinate errors in encoded command space; not physical recovery scores."""
+    with preserve_rng():
+        indices = torch.randperm(len(records["future_actions"]))[:16]
+        batch = take(records, indices, device)
+        reference = reference_for(batch, config) if config["method"].startswith("sb_") else None
+        revised, _ = policy.sample(batch["obs_hist"], batch["act_hist"], batch["completion_id"],
+                                   source_actions=batch["source_actions"], reference=reference,
+                                   has_previous_plan=batch["has_previous_plan"],
+                                   execution_k=batch["execution_k"])
+        ordinary = batch["has_previous_plan"][:, None]
+        result = {}
+        for name, mask in (("overlap", batch["overlap_mask"] & ordinary),
+                           ("tail", ~batch["overlap_mask"] & ordinary)):
+            result[f"{name}_available"] = int(bool(mask.any()))
+            if not bool(mask.any()):
+                continue
+            source, target = batch["source_actions"], batch["future_actions"]
+            for metric, error in (("source_error", source - target),
+                                  ("revised_error", revised - target),
+                                  ("revision_magnitude", revised - source)):
+                result[f"{metric}_{name}"] = float(error[mask].square().mean())
+        return result
 
 
 def fit_completion(records, validation, config, output, metadata, device, *, encoder=None,
@@ -322,11 +387,16 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
         raise ValueError("Choose either synchronous validation or an asynchronous evaluation worker")
     if config["validation_every"] < 1:
         raise ValueError("validation_every must be positive")
+    validate_curriculum(config)
+    if is_curriculum(config) and config["method"] == "ddim":
+        # Its supervised training population and network do not follow the K schedule.
+        records = stage_windows(records, config)
     seed_all(config["seed"])
     policy = build_policy(config, encoder=encoder).to(device)
     ema = checkpoints.frozen_copy(policy)
     bridge = config["method"].startswith("sb_")
-    self_sources = config.get("protocol") == "self_source_v1" and config["method"] != "ddim"
+    curriculum = is_curriculum(config) and config["method"] != "ddim"
+    self_sources = (config.get("protocol") == "self_source_v1" or is_curriculum(config)) and config["method"] != "ddim"
     if bridge and config["updates"] != 2 * config["rounds"] * config["phase_updates"]:
         raise ValueError("DSBM total updates must equal rounds * 2 * phase_updates")
     if self_sources:
@@ -374,6 +444,8 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
             source_block = state["source_block"]
             source_provenance = state["source_provenance"]
             source_cache_seconds = state["source_cache_seconds"]
+        if curriculum and state.get("curriculum") != _curriculum_state(config, source_block, step):
+            raise ValueError("Checkpoint curriculum stage/K/pending transition does not match its update count")
         # The saved dependency weights/statistics are authoritative after the
         # config and provenance hashes match; do not silently substitute a
         # caller's new completer into an existing coupling cache.
@@ -398,6 +470,10 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
         if pairer_factory is not None:
             with preserve_rng():
                 pairer = pairer_factory(source_records)
+    active_config = stage_config(config, max(source_block, 0)) if curriculum else config
+    if curriculum and cache is not None:
+        _validate_curriculum_cache(cache, cache_provenance, source_provenance,
+                                   current_phase, replay_k(active_config))
     start = time.perf_counter()
 
     def payload(complete=False):
@@ -410,6 +486,7 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
                     coupling_cache=cache, cache_provenance=cache_provenance,
                     source_block=source_block, source_provenance=source_provenance,
                     source_cache_seconds=source_cache_seconds,
+                    curriculum=_curriculum_state(config, source_block, step) if curriculum else None,
                     opposite_snapshot=None if snapshot is None else snapshot.state_dict(),
                     best_validation=best, training_seconds=elapsed + time.perf_counter() - start,
                     cache_seconds=cache_seconds, complete=complete,
@@ -429,7 +506,7 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
         keys = ("config", "metadata", "dependencies", "ema", "step", "phase", "outer_round",
                 "direction", "training_seconds", "cache_seconds", "complete", "scheduler",
                 "diffusers_version", "parameters", "source_block", "source_provenance",
-                "source_cache_seconds")
+                "source_cache_seconds", "curriculum")
         candidate = {key: state[key] for key in keys}
         # SB deploys its forward field even when the reverse field is training.
         candidate.update(training_direction=state["direction"], direction="forward",
@@ -467,14 +544,20 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
         while step < config["updates"]:
             if self_sources and step // block_updates != source_block:
                 source_block = step // block_updates
+                active_config = stage_config(config, source_block) if curriculum else config
                 source_records, source_provenance, seconds, diagnostics = _block_sources(
                     records, ema, completion, dependencies, config, metadata, output,
                     device, source_block)
                 source_cache_seconds += seconds
                 cache = None
+                cache_provenance = None
                 track_metrics(tracker, step, {**diagnostics, "block": source_block,
                               "self_probability": config["source_self_probabilities"][source_block],
                               "cache_seconds": seconds}, "source")
+                if curriculum and tracker is not None:
+                    with preserve_rng():
+                        tracker.log(step, {"source/version": source_provenance["version"],
+                                           "source/snapshot_id": source_provenance["snapshot_sha256"]})
                 if pairer_factory is not None:
                     with preserve_rng():
                         pairer = pairer_factory(source_records)
@@ -487,26 +570,31 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
             if bridge:
                 if cache is None or step % config["coupling_refresh_every"] == 0:
                     cache, cache_provenance = refresh_coupling(source_records, config["coupling_records"], device,
-                                                              config, completion, snapshot, direction)
+                                                              active_config, completion, snapshot, direction)
                     cache_provenance.update(phase=phase, refresh_step=step,
                                             source_hash=(source_provenance["version"] if self_sources
                                                          else metadata["source_hash"]),
                                             snapshot_phase=phase - 1 if snapshot is not None else None)
                     if self_sources:
-                        cache_provenance.update(protocol="self_source_v1", source_block=source_block,
+                        cache_provenance.update(protocol=config["protocol"], source_block=source_block,
                                                 direction=direction,
                                                 snapshot_sha256=None if snapshot is None else
                                                 checkpoints.content_digest(snapshot.state_dict()))
+                    if curriculum:
+                        cache_provenance.update(active_k=replay_k(active_config),
+                                                coupling_source_version=source_provenance["version"])
                     cache_seconds += cache_provenance["cache_seconds"]
                 indices = torch.randint(len(cache["x0"]), (config["batch_size"],), device="cpu")
                 batch = take(cache, indices, device)
-                losses = policy.loss(batch, reference_for(batch, config), direction=direction,
+                losses = policy.loss(batch, reference_for(batch, active_config), direction=direction,
                                      x0=batch["x0"], x1=batch["x1"])
             else:
                 batch = draw_records(source_records, config["batch_size"], device, completion=completion,
-                                     executed=config["execute"], source_std=config["source_std"],
+                                     executed=replay_k(active_config), source_std=config["source_std"],
                                      endpoint_std=config["endpoint_std"],
-                                     velocity_weighting=config.get("completion_velocity_weighting", "last_pair"))
+                                     velocity_weighting=config.get("completion_velocity_weighting", "last_pair"),
+                                     startup_fraction=config.get("startup_sampling_fraction", .1)
+                                     if curriculum else None)
                 pairing_metrics = {}
                 if pairer is not None:
                     batch, pairing_metrics = pairer(batch, completion, device)
@@ -534,13 +622,32 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
                 if self_sources:
                     row.update(source_block=source_block,
                                self_probability=config["source_self_probabilities"][source_block])
+                if curriculum:
+                    active = replay_k(active_config)
+                    details = dict(block=source_block, active_k=active, deployment_k=config["execute"],
+                                   overlap_length=config["horizon"] - active, completion_length=active,
+                                   updates_in_block=step - source_block * block_updates, global_updates=step,
+                                   dsbm_round=current_phase // 2 if bridge else 0,
+                                   dsbm_direction=int(direction == "forward"),
+                                   startup_fraction=float((~batch["has_previous_plan"]).float().mean()),
+                                   self_probability=config["source_self_probabilities"][source_block])
+                    ordinary = batch["has_previous_plan"]
+                    if bool(ordinary.any()):
+                        details["empirical_self_fraction"] = float((batch["source_origin"][ordinary] == 2).float().mean())
+                    if direction == "forward":
+                        details.update(_region_diagnostics(ema, source_records, active_config, device))
+                    row.update(details)
+                    row["coupling_source_version"] = None if cache_provenance is None else cache_provenance.get("source_hash")
+                    track_metrics(tracker, step, details, "curriculum")
                 log(output / "train.jsonl", row)
                 track_metrics(tracker, step, row, "train")
                 progress.set_postfix(loss=f"{row['loss']:.4g}", phase=current_phase)
             if direction == "forward":
                 final = step == config["updates"] or (bridge and step % config["phase_updates"] == 0)
                 track_images(tracker, visualize, ema, step, final=final)
-            milestone = step % config["validation_every"] == 0 or step == config["updates"]
+            boundary = self_sources and step % block_updates == 0
+            milestone = (step % config["validation_every"] == 0 or step == config["updates"]
+                         or (curriculum and boundary))
             if evaluator is not None:
                 with preserve_rng():
                     if milestone or step % min(100, config["log_every"]) == 0:
@@ -562,7 +669,7 @@ def train(records, config, output, metadata, dependencies, device, *, pairer=Non
                         best = score
                         checkpoints.save(output / "best.pt", payload())
             stopping = stop_after is not None and step >= stop_after
-            if step % config["checkpoint_every"] == 0 or milestone or stopping:
+            if step % config["checkpoint_every"] == 0 or milestone or stopping or boundary:
                 checkpoints.save(latest, payload(complete=step == config["updates"] and evaluator is None))
             if stopping:
                 break

@@ -9,6 +9,7 @@ import torch
 from action_bridge.plan_revision.cache import reference_for
 from action_bridge.plan_revision.completion import COMPLETION_NAMES, complete_plan
 from action_bridge.plan_revision.contracts import take, tree_map
+from action_bridge.plan_revision.curriculum import is_curriculum, replay_k, stage_config, stage_windows
 
 
 def immutable_snapshot(model):
@@ -44,6 +45,9 @@ def build_self_sources(windows, snapshot, completion, innovation_variance, confi
     """
     if config["method"] == "ddim":
         raise ValueError("DDIM is an independent baseline, not a self-source reviser")
+    config = stage_config(config, block)
+    dense_record_count = len(windows["future_actions"])
+    windows = stage_windows(windows, config)
     if snapshot.training or any(parameter.requires_grad for parameter in snapshot.parameters()):
         raise ValueError("source producer must be an immutable, frozen eval snapshot")
     if completion.training or any(parameter.requires_grad for parameter in completion.parameters()):
@@ -56,6 +60,8 @@ def build_self_sources(windows, snapshot, completion, innovation_variance, confi
         raise ValueError("modes must be distinct supported completion IDs")
     if 3 in modes and getattr(completion, "direct_tail", None) is None:
         raise ValueError("direct_mlp replay requires the frozen direct-tail predictor")
+    if is_curriculum(config) and 3 in modes:
+        raise ValueError("direct_mlp is not supported by the variable-K curriculum")
     required = {"episode_id", "time_index", "obs_hist", "act_hist", "future_actions",
                 "valid_mask", "startup_actions"}
     if required - windows.keys():
@@ -65,7 +71,7 @@ def build_self_sources(windows, snapshot, completion, innovation_variance, confi
     if windows["startup_actions"].shape != windows["future_actions"].shape:
         raise ValueError("startup_actions must match future_actions shape")
     horizon, action_dim = windows["future_actions"].shape[1:]
-    executed = config["execute"]
+    executed = replay_k(config)
     if not 0 < executed <= horizon:
         raise ValueError("self-source replay requires 0 < execute <= horizon")
 
@@ -87,6 +93,17 @@ def build_self_sources(windows, snapshot, completion, innovation_variance, confi
                    "completion_velocity_weighting": config.get("completion_velocity_weighting", "last_pair"),
                    "startup_records": 0, "expert_records": 0, "self_records": 0,
                    "replay_episodes": len(sequences) * len(modes)}
+    if is_curriculum(config):
+        diagnostics.update(protocol=config["protocol"], active_k=executed,
+                           deployment_k=config["execute"], curriculum_stage=block,
+                           overlap_length=horizon - executed, completion_length=executed,
+                           eligible_dense_records=dense_record_count,
+                           eligible_grid_records=len(windows["future_actions"]),
+                           source_replay_calls=0, source_replay_examples=0,
+                           startup_sampling_fraction=config.get("startup_sampling_fraction", .1),
+                           coefficient_support=list(range(horizon)),
+                           queried_tail_coefficients=list(range(horizon - executed, horizon)),
+                           coefficient_support_note="shared residual loss supervises every horizon index")
 
     def check_finite(values, stage, indices):
         failed = ~torch.isfinite(values).flatten(1).all(1)
@@ -105,9 +122,9 @@ def build_self_sources(windows, snapshot, completion, innovation_variance, confi
                 batch = take(windows, indices, device)
                 count = len(indices)
                 mode_ids = torch.full((count,), mode, dtype=torch.long, device=device)
-                # K=H exhausts the old plan. Reinitialize from the adapter's
-                # current observed command anchor, not an external generator.
-                available = position > 0 and executed < horizon
+                # Fixed-K legacy resets at K=H. The curriculum instead retains
+                # that full old plan as history and completes all H commands.
+                available = position > 0 and (executed < horizon or is_curriculum(config))
                 has_previous = torch.full((count,), available, dtype=torch.bool, device=device)
                 if not available:
                     old = batch["startup_actions"].clone()
@@ -127,7 +144,8 @@ def build_self_sources(windows, snapshot, completion, innovation_variance, confi
                     origin = torch.where(self_choice, 2, 1)
                     source = complete_plan(old, executed, batch["obs_hist"], batch["act_hist"],
                                            mode_ids, completion, robot_dt=config["robot_dt"],
-                                           velocity_weighting=config.get("completion_velocity_weighting", "last_pair"))
+                                           velocity_weighting=config.get("completion_velocity_weighting", "last_pair"),
+                                           allow_full_completion=is_curriculum(config))
                 source = source + config["source_std"] * torch.randn(
                     source.shape, device=device, dtype=source.dtype, generator=generator)
                 check_finite(source, "source", indices)
@@ -141,13 +159,27 @@ def build_self_sources(windows, snapshot, completion, innovation_variance, confi
                              p_self=torch.full((count,), p_self, dtype=source.dtype, device=device),
                              block=torch.full((count,), block, dtype=torch.long, device=device),
                              precision=prior["precision"], prior_mean=prior["mean"])
+                if is_curriculum(config):
+                    overlap = (torch.arange(horizon, device=device)[None] < horizon - executed)
+                    overlap = overlap & has_previous[:, None]
+                    elapsed = torch.where(has_previous, executed, 0)
+                    batch.update(execution_k=torch.full((count,), executed, device=device, dtype=torch.long),
+                                 elapsed_count=elapsed, alignment_shift=elapsed.clone(),
+                                 overlap_mask=overlap, overlap_length=overlap.sum(1),
+                                 completion_length=horizon - overlap.sum(1),
+                                 curriculum_stage=torch.full((count,), block, device=device, dtype=torch.long))
                 if config["mobility_smoothing"]:
                     batch["mobility"] = prior["mobility"].expand(count, -1, -1).clone()
                 reference = reference_for(batch, config) if config["method"].startswith("sb_") else None
+                conditioning = {"execution_k": torch.full((count,), executed, device=device, dtype=torch.long)} if config.get("condition_on_k") else {}
                 generated, _ = snapshot.sample(
                     batch["obs_hist"], batch["act_hist"], mode_ids, source_actions=source,
                     reference=reference, generator=generator, has_previous_plan=has_previous,
+                    **conditioning,
                 )
+                if is_curriculum(config):
+                    diagnostics["source_replay_calls"] += 1
+                    diagnostics["source_replay_examples"] += count
                 if generated.shape != (count, horizon, action_dim):
                     raise ValueError("source snapshot returned a chunk with the wrong shape")
                 check_finite(generated, "generated plan", indices)
@@ -161,4 +193,9 @@ def build_self_sources(windows, snapshot, completion, innovation_variance, confi
     diagnostics.update(source_seconds=time.perf_counter() - start,
                        source_records=sum(len(piece["future_actions"]) for piece in pieces),
                        completion_modes=list(modes))
+    if is_curriculum(config):
+        diagnostics.update(source_build_seconds=diagnostics["source_seconds"],
+                           startup_fraction=diagnostics["startup_records"] / diagnostics["source_records"],
+                           empirical_self_fraction=diagnostics["self_records"] / max(
+                               1, diagnostics["self_records"] + diagnostics["expert_records"]))
     return _concatenate(pieces), diagnostics

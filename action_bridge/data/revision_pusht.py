@@ -6,11 +6,13 @@ import torch
 from action_bridge.data.pusht_adapter import PushTLowDimDataset
 from action_bridge.plan_revision.checkpoints import object_digest
 from action_bridge.plan_revision.contracts import ActionCodec
+from action_bridge.plan_revision.curriculum import is_curriculum
 
 
 def load_windows(path, config):
     """Split complete episodes before any fitted quantity or eligible window."""
     result, split_ids = {}, {}
+    stride = 1 if is_curriculum(config) else config["execute"]
     stats = None
     for split in ("train", "val", "test"):
         dataset = PushTLowDimDataset(
@@ -25,7 +27,7 @@ def load_windows(path, config):
         split_ids[split] = dataset.episode_ids
         records = []
         for episode, t in dataset.indices:
-            if t % config["execute"]:
+            if t % stride:
                 continue
             now = dataset.item_from_episode_time(episode, t)
             records.append({"obs_hist": now["obs_hist"], "act_hist": now["act_hist"],
@@ -48,8 +50,8 @@ def load_windows(path, config):
                 "normalizer_id": object_digest(stats), "codec": codec.specification(),
                 "observation_profile": "pusht/state/pusher_xy-block_xy-angle/v1",
                 "action_profile": "pusht/absolute_pusher_target_xy/pixels/v1",
-                "window_schema": "recorded_replan_grid_with_startup/v1",
-                "replan_grid": {"start": 0, "stride": config["execute"]},
+                "window_schema": "recorded_dense_grid_with_startup/v1" if is_curriculum(config) else "recorded_replan_grid_with_startup/v1",
+                "replan_grid": {"start": 0, "stride": stride},
                 "source_noise_pixels": [x * config["source_std"] for x in stats["action_std"]],
                 "endpoint_noise_pixels": [x * config["endpoint_std"] for x in stats["action_std"]],
                 "padding": "initial observation repeats; missing executed commands use initial pusher xy",
@@ -116,6 +118,11 @@ def make_local_pairer(records, neighborhood, config):
     blocks = torch.cat((anchors[:, None], neighbors.gather(1, order)[:, :size - 1]), dim=1)
     fields = {key: records[key] for key in
               ("source_actions", "future_actions", "completion_id", "has_previous_plan")}
+    # Source origins are deliberately NOT model features or OT restrictions.
+    # K, overlap and startup describe different conditional revision problems.
+    for key in ("execution_k", "overlap_mask"):
+        if key in records:
+            fields[key] = records[key]
 
     @torch.no_grad()
     def pair(batch, completion, device):
@@ -134,6 +141,12 @@ def make_local_pairer(records, neighborhood, config):
         distances = torch.cdist(features, features) / features.shape[-1] ** .5
         compatible = ((distances <= neighborhood["radius"]) &
                       (has_previous[:, :, None] == has_previous[:, None, :]))
+        if "execution_k" in block:
+            execution_k = block["execution_k"].reshape(count, size)
+            compatible &= execution_k[:, :, None] == execution_k[:, None, :]
+        if "overlap_mask" in block:
+            overlap = block["overlap_mask"].reshape(count, size, -1)
+            compatible &= (overlap[:, :, None] == overlap[:, None, :]).all(-1)
         selected, _, metrics = batched_local_ot_pair(
             source, targets, distances, compatible,
             completion_ids=mode, radius=neighborhood["radius"],

@@ -95,6 +95,50 @@ when resuming jobs, but never change a configuration inside an existing run.
 
 ## Choose comparisons individually
 
+### K curriculum and matched fixed-K controls
+
+Four independent jobs compare K=1→2→4→8 against fixed K=8 for OU-SB and
+kinetic-SB. H stays 16; **all headline evaluation uses K=8**, even during early
+training stages. Both conditions use the new K-conditioned model, the same
+expert/self mixture and 10% startup sampling, so only the training K schedule
+differs. Existing older fixed-K runs do not have this conditioning branch.
+
+```bash
+mkdir -p hpc/logs
+export PUSHT_DATASET="$PWD/workspace/datasets/pusht/pusht_cchi_v7_replay.zarr"
+export SB_PUSHT_CAMPAIGN_ROOT="$PWD/workspace/sb_pusht/k-curriculum-$(date -u +%Y%m%dT%H%M%S%NZ)"
+
+sbatch hpc/sb_pusht_ablations/k_curriculum_sb_ou.sbatch
+sbatch hpc/sb_pusht_ablations/k_fixed8_sb_ou.sbatch
+sbatch hpc/sb_pusht_ablations/k_curriculum_sb_kinetic.sbatch
+sbatch hpc/sb_pusht_ablations/k_fixed8_sb_kinetic.sbatch
+```
+
+Each file includes preparation, a 20k-update learned reference/completer fit,
+then 300k policy updates, on one H200 (`gpuq`), eight CPUs and 64 GB RAM for
+up to ten hours total. Learned dissipative continuation is the primary evaluation
+mode; training retains the balanced three-mode mixture. These presets deliberately
+use **last-pair velocity initialization**, as specified in Addendum B; they are
+not the earlier weighted-whole-suffix completion experiment.
+
+Every 75k policy updates the curriculum advances at a complete reverse/forward
+round boundary, rebuilding sources on the new K grid without resetting weights
+or learning rates. Smaller K increases sequence-replay cost, so the ten-hour
+request is not a completion guarantee. Each job has its own immutable preset and
+fresh output directory `$SB_PUSHT_CAMPAIGN_ROOT/<variant>/<method>/`.
+
+Logging stays in W&B **`sb-pusht-ablations`**, with action-chunk images. Async CPU
+evaluation runs every 10k updates on 20 episodes and saves selected MP4s locally.
+After a timeout, retain the same campaign root and resume only the unfinished
+stage, e.g. `sbatch hpc/sb_pusht_ablations/train.sbatch k_curriculum_sb_ou sb_ou`
+after reference fitting is complete. Do not rerun a fresh-run file over its output.
+No existing campaign launcher submits these jobs automatically.
+
+For a short smoke, direct training/resume commands and fixed-K compatibility,
+see [the curriculum guide](../../docs/SB_PUSHT.md#k-curriculum-addendum-b).
+This remains offline replay, not on-policy simulation; the optional simulator
+mismatch probe and metric-gated promotion are not enabled.
+
 ### Completion velocity ablations
 
 `completion_last_pair`, `completion_uniform`, `completion_linear`,
