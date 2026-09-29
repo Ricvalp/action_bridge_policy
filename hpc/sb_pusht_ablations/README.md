@@ -139,6 +139,65 @@ see [the curriculum guide](../../docs/SB_PUSHT.md#k-curriculum-addendum-b).
 This remains offline replay, not on-policy simulation; the optional simulator
 mismatch probe and metric-gated promotion are not enabled.
 
+### 10% and 5% demos with K curriculum
+
+These six **independent** jobs rerun both SB methods with the curriculum above,
+plus a matched DDIM baseline, at each dataset size. From the repository root on
+Peano, using the existing `.venv-sb-pusht` environment and dataset:
+
+```bash
+mkdir -p hpc/logs
+export PUSHT_DATASET="$PWD/workspace/datasets/pusht/pusht_cchi_v7_replay.zarr"
+export SB_PUSHT_CAMPAIGN_ROOT="$PWD/workspace/sb_pusht/scarcity-curriculum-$(date -u +%Y%m%dT%H%M%S%NZ)"
+
+sbatch hpc/sb_pusht_ablations/scarcity10_k_curriculum_sb_ou.sbatch
+sbatch hpc/sb_pusht_ablations/scarcity10_k_curriculum_sb_kinetic.sbatch
+sbatch hpc/sb_pusht_ablations/scarcity10_ddim.sbatch
+sbatch hpc/sb_pusht_ablations/scarcity5_k_curriculum_sb_ou.sbatch
+sbatch hpc/sb_pusht_ablations/scarcity5_k_curriculum_sb_kinetic.sbatch
+sbatch hpc/sb_pusht_ablations/scarcity5_ddim.sbatch
+```
+
+The fraction applies to **whole training demonstrations**, not windows or the
+validation/test split: 16 demos at 10%, 8 at 5% for the standard 164-demo training
+split (rounding down). All use `subset_seed=0` and training seed 0, so methods at
+the same fraction see the same episode IDs; the 5% subset is nested in the 10%
+subset. Validation/test IDs stay unchanged. Each job prepares its own data and
+normalization; each SB job also fits its own reference/completer using only its
+scarce training split. Do not copy full-data caches or references into these runs.
+
+H16, deployment K8, model size, 300k policy updates, and other budgets match the
+existing presets. SB uses K1→2→4→8, learned dissipative evaluation completion with
+last-pair initialization, and the usual three-mode training mixture. DDIM has no
+previous-plan completion or K curriculum; it predicts H16 and executes K8.
+This matches demonstrations, not training-window exposure: the curriculum starts
+on a dense K1 grid, whereas DDIM keeps its standard K8 grid. SB's 300k updates
+comprise 150k forward and 150k reverse updates; DDIM has 300k denoiser updates.
+
+Each file includes all required stages on one H200 (`gpuq`), eight CPUs, 64 GB
+RAM and a total ten-hour limit. No dependency jobs need submitting. Logging goes
+to **`sb-pusht-ablations`**. Async CPU evaluation runs every 10k policy updates on
+20 episodes, with selected videos saved locally. Outputs are under
+`$SB_PUSHT_CAMPAIGN_ROOT/<variant>/<method>/`. These remain single-seed comparisons.
+W&B also logs `examples/symmetric_probe` (1,000 samples) at the 5k image cadence
+during forward-EMA phases and at forward-phase ends, using the same synthetic
+symmetric scene and deployment K8. PNGs and numeric samples are saved in
+`<method>/symmetric_probe/`. The SB probe deliberately uses a clean fixed-damped
+source, not learned continuation; DDIM has no source. See
+[logging details](../../docs/SB_PUSHT.md#logging-and-asynchronous-evaluation).
+
+Keep the printed campaign path. If a job times out, resume only its unfinished
+stage, for example, after reference fitting has finished:
+
+```bash
+sbatch hpc/sb_pusht_ablations/train.sbatch scarcity10_k_curriculum_sb_ou sb_ou
+sbatch hpc/sb_pusht_ablations/train.sbatch scarcity5_ddim ddim
+```
+
+Use `prepare.sbatch <variant>` or `reference.sbatch <variant>` if that earlier
+stage was interrupted. Do not rerun the fresh-run file over its existing output.
+The older `scarcity10` preset is unchanged; it does not enable the K curriculum.
+
 ### Completion velocity ablations
 
 `completion_last_pair`, `completion_uniform`, `completion_linear`,

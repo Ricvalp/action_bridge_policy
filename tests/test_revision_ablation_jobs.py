@@ -29,7 +29,17 @@ VARIANTS = {
     "completion_exp_quarter_k2", "completion_exp_quarter_k4",
     "k_curriculum_sb_ou", "k_fixed8_sb_ou",
     "k_curriculum_sb_kinetic", "k_fixed8_sb_kinetic",
+    "scarcity10_k_curriculum_sb_ou", "scarcity10_k_curriculum_sb_kinetic",
+    "scarcity10_ddim", "scarcity5_k_curriculum_sb_ou",
+    "scarcity5_k_curriculum_sb_kinetic", "scarcity5_ddim",
 }
+
+SCARCITY_CURRICULUM_CASES = [
+    (fraction, method, f"scarcity{percent}_" +
+     ("ddim" if method == "ddim" else f"k_curriculum_{method}"))
+    for percent, fraction in ((10, .1), (5, .05))
+    for method in ("sb_ou", "sb_kinetic", "ddim")
+]
 
 COMPLETION_CASES = [
     (weighting, 8)
@@ -144,6 +154,12 @@ def test_configurations_cover_ready_experiments_and_valid_training_budgets():
         if variant.startswith(("k_curriculum_", "k_fixed8_")):
             expected = get_k_curriculum_config(fixed_k=variant.startswith("k_fixed8_"))
             assert config == expected | {"method": "ddim"}
+        elif "_k_curriculum_" in variant:
+            expected = get_k_curriculum_config("ddim")
+            assert config == expected | {
+                "train_episode_fraction": .1 if variant.startswith("scarcity10_") else .05,
+                "subset_seed": 0,
+            }
         else:
             assert config["protocol"] == "self_source_v1"
         assert not config["external_bootstrap"]
@@ -258,6 +274,86 @@ def test_documented_curriculum_smoke_covers_all_four_stages():
     assert config["updates"] == 2 * config["rounds"] * config["phase_updates"] == 8
     assert config["execute"] == 8 and config["horizon"] == 16
     assert config["reference_updates"] == 2
+
+
+@pytest.mark.parametrize("fraction,method,variant", SCARCITY_CURRICULUM_CASES)
+def test_scarcity_curriculum_jobs_prepare_only_their_own_subset_and_required_stages(
+        launch, fraction, method, variant):
+    script = variant + ".sbatch"
+    content = (JOBS / script).read_text()
+    for directive in ("--partition=gpuq", "--gres=gpu:1", "--cpus-per-task=8",
+                      "--mem=64G", "--time=10:00:00"):
+        assert f"#SBATCH {directive}" in content
+    result = launch.run(script)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = launch.rows("python")
+    assert calls[0]["args"] == ["-"]
+    commands = [call["args"] for call in calls[1:]]
+    stages = ("prepare", "ddim") if method == "ddim" else ("prepare", "reference", method)
+    assert [command[:3] for command in commands] == [
+        ["-m", "action_bridge.scripts.sb_pusht", stage] for stage in stages]
+
+    root = launch.campaign / variant
+    snapshot = root / "config.json"
+    config = get_config(method) | json.loads(snapshot.read_text())
+    expected = get_config(method) if method == "ddim" else get_k_curriculum_config(method)
+    assert config == expected | {"train_episode_fraction": fraction, "subset_seed": 0}
+    assert config["seed"] == config["subset_seed"] == 0
+    assert (config["horizon"], config["execute"], config["updates"]) == (16, 8, 300000)
+    if method == "ddim":
+        assert "k_values_by_block" not in config
+    else:
+        assert config["k_values_by_block"] == [1, 2, 4, 8]
+        assert config["completion_velocity_weighting"] == "last_pair"
+        assert config["completion_id"] == 2
+    for index, command in enumerate(commands):
+        assert option(command, "--run-root") == str(root)
+        assert option(command, "--config") == str(snapshot)
+        assert option(command, "--dataset") == str(launch.dataset)
+        assert option(command, "--device") == ("cpu" if index == 0 else "cuda")
+    for command in commands[1:]:
+        assert "--wandb" in command
+        assert option(command, "--wandb-project") == "sb-pusht-ablations"
+    training = commands[-1]
+    assert option(training, "--eval-every") == "10000"
+    assert option(training, "--eval-episodes") == "20"
+    assert option(training, "--eval-device") == "cpu"
+    assert option(training, "--eval-threads") == "2"
+    assert {"--sim-eval", "--eval-videos"}.issubset(training)
+    assert all(call["cuda"] == "7" for call in calls)
+    assert not launch.rows("sbatch")
+
+    # Every preset owns its cache/reference directory and refuses duplicate runs.
+    frozen = snapshot.read_bytes()
+    assert launch.run(script).returncode != 0
+    assert snapshot.read_bytes() == frozen
+    assert [call for call in launch.rows("python") if call["args"] != ["-"]] == calls[1:]
+
+
+@pytest.mark.parametrize("fraction,method,variant", SCARCITY_CURRICULUM_CASES)
+def test_scarcity_named_presets_submit_only_the_required_method(launch, fraction, method, variant):
+    result = launch.run("submit.sh", variant)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = launch.rows("sbatch")
+    assert len(calls) == (2 if method == "ddim" else 3)
+    assert calls[-1]["args"][-1] == method
+    assert option(calls[-1]["args"], "--dependency") == (
+        "afterok:1001" if method == "ddim" else "afterok:1002")
+
+
+@pytest.mark.parametrize("fraction,method,variant", SCARCITY_CURRICULUM_CASES)
+def test_scarcity_policy_resume_uses_frozen_variant_without_repreparing(launch, fraction, method, variant):
+    root = launch.prepared(variant)
+    snapshot = root / "config.json"
+    snapshot.write_bytes((JOBS / "configs" / f"{variant}.json").read_bytes())
+    if method == "ddim":
+        (root / "reference/latest.pt").unlink()
+    result = launch.run("train.sbatch", variant, method)
+    assert result.returncode == 0, result.stdout + result.stderr
+    commands = [call["args"] for call in launch.rows("python") if call["args"] != ["-"]]
+    assert len(commands) == 1
+    assert commands[0][:3] == ["-m", "action_bridge.scripts.sb_pusht", method]
+    assert option(commands[0], "--config") == str(snapshot)
 
 
 @pytest.mark.parametrize("weighting, execute", COMPLETION_CASES)

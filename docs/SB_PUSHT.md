@@ -442,6 +442,23 @@ Reviser images distinguish unexecuted previous targets (black), appended
 completion (purple), and the actual noisy source (gray). The retained targets
 and appended tail together form the clean completed old plan.
 
+SB and DDIM also log `examples/symmetric_probe`: 1,000 chunks at the same
+hand-built symmetric wrong-side scene, plus a histogram of their lateral
+Kth/last commands. The fixed scene and sampling seed make changes over training
+comparable. This is a synthetic multimodality probe, **not a success test**.
+SB uses a clean axial source with fixed-damped completion to preserve symmetry;
+its learned reference is unchanged. DDIM uses its usual Gaussian initialization,
+not the old plan. Deployment K stays fixed even during the K curriculum, so
+early probes may use a K not yet encountered in training.
+
+The probe follows the image interval (5k by default; forward phases and forward
+phase ends for SB), using EMA weights. PNGs, samples and settings also stay in
+`<method>/symmetric_probe/`. Use `--wandb-symmetry-candidates 200` for a cheaper
+probe or `0` to disable it; `--wandb-image-count 0` disables all images. Unlike
+closed-loop evaluation, image sampling runs briefly in the training process,
+with model and training RNG unchanged. The probe is skipped when H=K or when
+fixed-damped completion was not trained.
+
 MP4s stay **local**, never on W&B: up to two successes and two failures per
 evaluation. They are enabled by default, including standalone checkpoint
 evaluation. `--no-eval-videos` disables training-evaluation video recording.
@@ -681,6 +698,59 @@ histories, executed old prefix and learned reference stay fixed. Keep the same
 candidate seed and batch size to use paired generation noise across conditions.
 “Right” is positive lateral displacement from the T's symmetry axis, not screen
 horizontal. These hand-built sources do not establish simulated feasibility.
+
+### Does the reviser actually use its source?
+
+Hold one learner-reached scene and its histories fixed, change the source, and
+pair the **same sampling noise** across all interventions:
+
+```bash
+uv run --frozen --no-sync python -m action_bridge.scripts.diagnose_pusht_source_sensitivity \
+  --checkpoint "$run_root/sb_ou/best.pt" \
+  --device cpu --threads 2 --seed 1234 --replan 6 \
+  --samples 64 --batch-size 32 --sampling-seed 42
+```
+
+This works for OU-SB, kinetic-SB, and FM, including K-conditioned curriculum
+checkpoints. It needs no dataset. The short warm-up rollout selects the context;
+the alternative chunks are **not executed or scored in the simulator**.
+
+By default it shifts the whole source along x/y and applies smooth x/y bows
+(fixed endpoints), with maximum displacements of ±5, ±15, and ±40 pixels.
+The actual noise-perturbed source at that decision is the baseline. Its existing
+source noise is held fixed, as are observations, executed-command history, K,
+completion ID, startup bit, and learned reference. No clipping or re-completion
+is applied after the intervention. For kinetic SB, auxiliary revision-velocity
+draws are paired as well as the subsequent process noise.
+
+Useful options:
+
+- `--amplitudes -10 -2 2 10` changes signed peak displacements in pixels.
+- `--region retained` or `--region tail` probes only that part of the source.
+- `--families translate_x translate_y` skips bows; use this for regions with
+  fewer than three targets. An empty retained region is rejected.
+- `--seed` / `--replan` changes the physical context; `--sampling-seed` changes
+  the paired random draws. Keep batch size fixed for reproducibility.
+
+Outputs go under `workspace/sb_pusht/source_sensitivity/` in a fresh timestamped
+directory (or `--output-dir`): source/response overlays, matched-noise individual
+chunks, response/gain curves, and a revision-time sensitivity heatmap. The
+NPZ saves every source, sample and intermediate revision; the JSON records
+checkpoint identity, settings and statistics.
+
+The main numbers are RMS **Euclidean command displacement in pixels**, output
+displacement divided by source displacement (gain), and ensemble-mean shifts.
+Two controls use the unchanged source: identical noise should reproduce exactly;
+independent noise shows ordinary sampling variability. The heatmap shows whether
+differences disappear early or late in revision. Mean curves can fall between
+modes, so inspect the paired individual chunks too.
+
+These are finite interventions under a particular noise coupling—not a formal
+test that two output distributions differ. Near-zero responses across probes
+suggest weak sensitivity at that context, but can also reflect legitimate
+bridge contraction. Large interventions may be out of distribution. Repeat at
+several scenes/seeds before concluding that source insensitivity explains low
+task success.
 
 ## Another dataset
 

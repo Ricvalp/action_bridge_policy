@@ -89,6 +89,23 @@ def test_preserve_rng_also_restores_after_errors():
     assert random_draw() == expected
 
 
+def test_named_image_groups_log_symmetry_without_replacing_action_chunks(tmp_path, sdk):
+    with preserve_rng():
+        expected = random_draw()
+    with tracker(tmp_path, enabled=True, image_count=2) as tracking:
+        tracking.images(5000, {
+            "examples/action_chunks": [tmp_path / f"chunk-{i}.png" for i in range(3)],
+            "examples/symmetric_probe": [tmp_path / "overlay.png", tmp_path / "lateral.png"],
+            "examples/empty": [],
+        })
+    row = sdk[0].rows[0]
+    assert row["train_step"] == 5000
+    assert len(row["examples/action_chunks"]) == len(row["examples/symmetric_probe"]) == 2
+    assert row["examples/symmetric_probe"][1]["caption"] == "lateral"
+    assert "examples/empty" not in row
+    assert random_draw() == expected
+
+
 def test_sdk_calls_preserve_rng(tmp_path, sdk):
     with preserve_rng():
         expected = random_draw()
@@ -155,7 +172,8 @@ def test_image_schedule_and_zero_image_count(tmp_path):
     assert not tracker(tmp_path, enabled=True, image_count=0).images_due(10, final=True)
 
 
-@pytest.mark.parametrize("kwargs", [{"image_count": -1}, {"images_every": 0}, {"mode": "bad"}])
+@pytest.mark.parametrize("kwargs", [{"image_count": -1}, {"images_every": 0}, {"mode": "bad"},
+                                   {"symmetry_candidates": -1}])
 def test_invalid_options_fail_clearly(kwargs):
     with pytest.raises(ValueError):
         TrackingOptions(**kwargs)

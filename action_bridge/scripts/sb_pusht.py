@@ -218,6 +218,17 @@ def stage_tracking(stage, root, records, config, metadata, device, options, depe
             visualize = make_action_chunk_plotter(records, config, metadata, root / stage, device,
                                                   dependencies=dependencies, count=options.image_count,
                                                   reference=stage == "reference")
+        if stage in ("ddim", "sb_ou", "sb_kinetic") and options.symmetry_candidates:
+            from action_bridge.eval.revision_pusht_symmetry import make_symmetry_plotter
+            symmetry = make_symmetry_plotter(config, metadata, root / stage, device,
+                                             dependencies=dependencies,
+                                             candidates=options.symmetry_candidates)
+            if symmetry is not None:
+                chunks = visualize
+
+                def visualize(model, step):
+                    return {"examples/action_chunks": chunks(model, step),
+                            "examples/symmetric_probe": symmetry(model, step)}
     return tracker, visualize
 
 
@@ -416,10 +427,14 @@ def main(argv=None):
     parser.add_argument("--wandb-mode", choices=("online", "offline"), default="online")
     parser.add_argument("--wandb-images-every", type=int, default=5000,
                         help="Action-chunk image interval in optimizer updates (forward phases for SB)")
-    parser.add_argument("--wandb-image-count", type=int, default=3, help="Fixed validation examples; 0 disables images")
+    parser.add_argument("--wandb-image-count", type=int, default=3, help="Fixed validation examples; 0 disables all images")
+    parser.add_argument("--wandb-symmetry-candidates", type=int, default=1000,
+                        help="SB/DDIM symmetric-scene samples at each image interval; 0 disables this probe")
     args = parser.parse_args(argv)
     if args.wandb_images_every < 1 or args.wandb_image_count < 0:
         parser.error("--wandb-images-every must be positive and --wandb-image-count nonnegative")
+    if args.wandb_symmetry_candidates < 0:
+        parser.error("--wandb-symmetry-candidates must be nonnegative")
     if args.eval_threads < 1 or (args.eval_every is not None and args.eval_every < 1):
         parser.error("--eval-threads and --eval-every must be positive")
     if args.eval_episodes is not None and args.eval_episodes < 1:
@@ -430,7 +445,8 @@ def main(argv=None):
         evaluation["episodes"] = args.eval_episodes
     tracking = TrackingOptions(enabled=args.wandb, project=args.wandb_project, entity=args.wandb_entity,
                                mode=args.wandb_mode, images_every=args.wandb_images_every,
-                               image_count=args.wandb_image_count)
+                               image_count=args.wandb_image_count,
+                               symmetry_candidates=args.wandb_symmetry_candidates)
     torch.set_num_threads(args.threads)
     overrides = json.loads(args.config.read_text()) if args.config else {}
     if args.k_curriculum is not None:

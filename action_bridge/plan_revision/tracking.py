@@ -5,6 +5,7 @@ import importlib
 import json
 import random
 import uuid
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,12 +40,15 @@ class TrackingOptions:
     mode: str = "online"
     images_every: int = 5000
     image_count: int = 3
+    symmetry_candidates: int = 1000
 
     def __post_init__(self):
         if self.mode not in {"online", "offline"}:
             raise ValueError("W&B mode must be 'online' or 'offline'")
         if self.image_count < 0 or self.images_every < 1:
             raise ValueError("image_count must be nonnegative and images_every must be positive")
+        if self.symmetry_candidates < 0:
+            raise ValueError("symmetry_candidates must be nonnegative")
 
 
 class Tracker:
@@ -114,15 +118,18 @@ class Tracker:
             self.run.log({**metrics, "train_step": int(step)})
 
     def images(self, step, paths):
+        """Log ordinary chunk paths or separately named diagnostic image groups."""
         if not self.options.enabled or not self.options.image_count:
             return
-        paths = list(paths)[:self.options.image_count]
-        if not paths:
+        groups = paths if isinstance(paths, Mapping) else {"examples/action_chunks": paths}
+        groups = {key: list(values)[:self.options.image_count] for key, values in groups.items()}
+        if not any(groups.values()):
             return
         with preserve_rng():
             self._start()
-            images = [self._wandb.Image(str(path), caption=Path(path).stem) for path in paths]
-            self.run.log({"train_step": int(step), "examples/action_chunks": images})
+            images = {key: [self._wandb.Image(str(path), caption=Path(path).stem) for path in values]
+                      for key, values in groups.items() if values}
+            self.run.log({"train_step": int(step), **images})
 
     def log_evaluation(self, step, metrics):
         """Late results use their checkpoint's step, never rewind training's axis."""

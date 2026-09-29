@@ -42,7 +42,7 @@ def dataset(path, fraction=1., subset_seed=0, **kwargs):
 
 def test_nested_episode_subsets_with_unchanged_validation_and_test(dataset_path):
     selections = []
-    for fraction, count in [(1., 164), (.5, 82), (.25, 41), (.1, 16)]:
+    for fraction, count in [(1., 164), (.5, 82), (.25, 41), (.1, 16), (.05, 8)]:
         windows, metadata = load_windows(dataset_path, config(fraction, 11))
         ids = metadata["splits"]["train"]
         assert len(ids) == count
@@ -59,7 +59,26 @@ def test_nested_episode_subsets_with_unchanged_validation_and_test(dataset_path)
                 "original_splits": {"train": list(range(164)), "val": list(range(164, 184)),
                                     "test": list(range(184, 205))},
                 "selected_train_episode_ids": ids}
-    assert selections[3] < selections[2] < selections[1] < selections[0]
+    assert selections[4] < selections[3] < selections[2] < selections[1] < selections[0]
+
+
+@pytest.mark.parametrize("fraction", [.05, .1])
+def test_curriculum_and_ddim_share_demos_and_normalization(dataset_path, fraction):
+    from action_bridge.configs.sb_pusht import get_k_curriculum_config
+
+    baseline = config(fraction)
+    curriculum = get_k_curriculum_config() | {
+        "horizon": 4, "execute": 2, "k_values_by_block": [1, 1, 2, 2],
+        "train_episode_fraction": fraction, "subset_seed": 0,
+    }
+    fixed_rows, fixed_metadata = load_windows(dataset_path, baseline)
+    dense_rows, dense_metadata = load_windows(dataset_path, curriculum)
+    for key in ("splits", "train_subset", "normalization", "codec"):
+        assert fixed_metadata[key] == dense_metadata[key]
+    for split in ("train", "val", "test"):
+        assert fixed_rows[split]["episode_id"].unique().tolist() == dense_rows[split]["episode_id"].unique().tolist()
+        # A curriculum starts from dense windows, not an identical timestamp grid.
+        assert len(dense_rows[split]["time_index"]) > len(fixed_rows[split]["time_index"])
 
 
 def test_scarcity_is_not_first_n_episodes_or_a_new_train_val_split(dataset_path):
@@ -72,8 +91,9 @@ def test_scarcity_is_not_first_n_episodes_or_a_new_train_val_split(dataset_path)
     assert first.original_split_ids == other.original_split_ids
 
 
-def test_excluded_training_episodes_cannot_affect_normalizer_or_any_windows(dataset_path, tmp_path):
-    settings = config(.25, 8)
+@pytest.mark.parametrize("fraction", [.05, .1, .25])
+def test_excluded_training_episodes_cannot_affect_normalizer_or_any_windows(dataset_path, tmp_path, fraction):
+    settings = config(fraction, 8)
     original, metadata = load_windows(dataset_path, settings)
     obs, actions = arrays()
     excluded = sorted(set(range(164)) - set(metadata["splits"]["train"]))

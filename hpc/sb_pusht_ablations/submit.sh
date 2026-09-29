@@ -22,6 +22,9 @@ if [[ ${#methods[@]} -eq 0 ]]; then
     completion_*) methods=(sb_ou sb_kinetic) ;;
     k_curriculum_sb_ou|k_fixed8_sb_ou) methods=(sb_ou) ;;
     k_curriculum_sb_kinetic|k_fixed8_sb_kinetic) methods=(sb_kinetic) ;;
+    scarcity*_k_curriculum_sb_ou) methods=(sb_ou) ;;
+    scarcity*_k_curriculum_sb_kinetic) methods=(sb_kinetic) ;;
+    scarcity*_ddim) methods=(ddim) ;;
     *) methods=(ddim fm_paired sb_ou sb_kinetic) ;;
   esac
 fi

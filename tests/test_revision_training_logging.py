@@ -179,7 +179,7 @@ def test_cli_forwards_tracking_to_every_stage_without_changing_model_config(tmp_
     assert sb_pusht.main(["all", "--run-root", str(tmp_path), "--device", "cpu", "--wandb",
                           "--wandb-project", "research", "--wandb-entity", "lab",
                           "--wandb-mode", "offline", "--wandb-images-every", "123",
-                          "--wandb-image-count", "2"]) == 0
+                          "--wandb-image-count", "2", "--wandb-symmetry-candidates", "17"]) == 0
     assert [args[0] for args, _ in calls] == ["prepare", "reference", *METHODS, "evaluate", "report"]
     for args, kwargs in calls:
         assert args[3]["validation_every"] == 10000
@@ -187,6 +187,7 @@ def test_cli_forwards_tracking_to_every_stage_without_changing_model_config(tmp_
         options = kwargs["tracking"]
         assert options.enabled and options.project == "research" and options.entity == "lab"
         assert options.mode == "offline" and options.images_every == 123 and options.image_count == 2
+        assert options.symmetry_candidates == 17
         assert not any("wandb" in key or "tracking" in key for key in args[3])
 
 
@@ -209,13 +210,17 @@ def test_cli_tracking_defaults_off_and_allows_disabling_images(tmp_path, monkeyp
     sb_pusht.main(["ddim", "--run-root", str(tmp_path), "--device", "cpu"])
     assert not calls[-1].enabled
     assert calls[-1].project == "action-bridge-policy"
+    assert calls[-1].symmetry_candidates == 1000
     sb_pusht.main(["ddim", "--run-root", str(tmp_path), "--device", "cpu", "--wandb", "--wandb-image-count", "0"])
     assert calls[-1].enabled and calls[-1].image_count == 0
+    sb_pusht.main(["ddim", "--run-root", str(tmp_path), "--device", "cpu", "--wandb",
+                   "--wandb-symmetry-candidates", "0"])
+    assert calls[-1].symmetry_candidates == 0 and calls[-1].image_count == 3
 
 
 @pytest.mark.parametrize("arguments", [["--wandb-images-every", "0"], ["--wandb-image-count", "-1"],
                                       ["--wandb-mode", "typo"], ["--eval-episodes", "0"],
-                                      ["--eval-episodes", "-1"]])
+                                      ["--eval-episodes", "-1"], ["--wandb-symmetry-candidates", "-1"]])
 def test_cli_rejects_invalid_tracking_options_before_starting(tmp_path, monkeypatch, arguments):
     def unexpected_stage(*args, **kwargs):
         pytest.fail("Invalid tracking options must not start a stage")

@@ -1,0 +1,10 @@
+{
+  "protocol": "self_source_k_curriculum_v1",
+  "k_values_by_block": [1, 2, 4, 8],
+  "condition_on_k": true,
+  "model_schema": "k_conditioned_v1",
+  "startup_sampling_fraction": 0.1,
+  "completion_velocity_weighting": "last_pair",
+  "train_episode_fraction": 0.1,
+  "subset_seed": 0
+}
